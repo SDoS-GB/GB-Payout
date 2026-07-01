@@ -12,7 +12,7 @@ import { Toaster } from "@/components/ui/toaster"
 import { Plus, X } from "lucide-react"
 
 const CONTRACTORS = {
-  Vadim: { pin: "4826", nonColorRate: 0.3, colorRate: 0.3 },
+  Vadim: { pin: "4826", nonColorRate: 0.25, colorRate: 0.25 },
   Denis: { pin: "7155", nonColorRate: 0.2, colorRate: 0.25 },
   Arthur: { pin: "5183", nonColorRate: 0.2, colorRate: 0.25 },
   Viktor: { pin: "3515", nonColorRate: 0.2, colorRate: 0.25 },
