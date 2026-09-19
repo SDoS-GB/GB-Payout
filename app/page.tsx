@@ -9,19 +9,11 @@ import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@
 import { Checkbox } from "@/components/ui/checkbox"
 import { useToast } from "@/hooks/use-toast"
 import { Toaster } from "@/components/ui/toaster"
-import { Plus, X } from "lucide-react"
-
-const CONTRACTORS = {
-  Vadim: { pin: "4826", nonColorRate: 0.25, colorRate: 0.25 },
-  Denis: { pin: "7155", nonColorRate: 0.2, colorRate: 0.25 },
-  Arthur: { pin: "5183", nonColorRate: 0.2, colorRate: 0.25 },
-  Viktor: { pin: "3515", nonColorRate: 0.2, colorRate: 0.25 },
-  Tim: { pin: "4496", nonColorRate: 0.8, colorRate: 0.8 },
-  Alex: { pin: "8254", nonColorRate: 0.2, colorRate: 0.25 },
-  Rodion: { pin: "8585", nonColorRate: 0.2, colorRate: 0.25 },
-} as const
-
-type ContractorName = keyof typeof CONTRACTORS
+import { Plus, X, History } from "lucide-react"
+import Link from "next/link"
+import { CONTRACTORS, type ContractorName } from "@/lib/payout/contractors"
+import { calcLegacyJobPayout } from "@/lib/payout/calculator"
+import { signInTechnician, signOutSession } from "@/app/actions/session"
 
 interface Job {
   id: number
@@ -116,25 +108,11 @@ export default function PayoutCalculator() {
     const rates = CONTRACTORS[contractorName as ContractorName]
     if (!rates) return { nonColorPayout: 0, colorPayout: 0, tipPayout: 0, basePayout: 0, totalPayout: 0, nonColorAmount: 0, colorAmount: 0, jobTotalNum: 0, colorSealTotalNum: 0, tipNum: 0 }
 
-    const jobTotalNum = parseNumber(job.jobTotal)
-    const colorSealTotalNum = parseNumber(job.colorSealTotal)
-    const tipNum = parseNumber(job.tip)
-    const nonColorAmount = showColorSeal ? jobTotalNum - colorSealTotalNum : jobTotalNum
-    const colorAmount = showColorSeal ? colorSealTotalNum : 0
-
-    const fee = job.isCreditCard ? 0.965 : 1
-    const nonColorPayout = nonColorAmount * fee * rates.nonColorRate
-    const colorPayout = colorAmount * fee * rates.colorRate
-
-    let tipPayout = 0
-    if (tipNum > 0) {
-      const tipDivisor = contractorName === "Tim" ? 1 : 0.5
-      tipPayout = tipNum * fee * tipDivisor
-    }
-
-    const basePayout = nonColorPayout + colorPayout
-    const totalPayout = basePayout + tipPayout
-    return { nonColorPayout, colorPayout, tipPayout, basePayout, totalPayout, nonColorAmount, colorAmount, jobTotalNum, colorSealTotalNum, tipNum }
+    // Same arithmetic as before, now shared with the Workiz payout engine.
+    return calcLegacyJobPayout(job, rates, {
+      separateColorSeal: showColorSeal,
+      tipShare: contractorName === "Tim" ? 1 : 0.5,
+    })
   }
 
   const handleReset = () => {
@@ -212,6 +190,9 @@ export default function PayoutCalculator() {
       if (stayLoggedIn) {
         localStorage.setItem("loggedInContractor", selectedContractor)
       }
+      // Establish a server-verified session so the Workiz payout history can be viewed.
+      // The calculator itself keeps working even if this fails.
+      void signInTechnician(selectedContractor, pin, stayLoggedIn).catch(() => {})
     } else {
       toast({ title: "Invalid PIN!", variant: "destructive" })
     }
@@ -222,6 +203,7 @@ export default function PayoutCalculator() {
     setPin("")
     setStayLoggedIn(false)
     localStorage.removeItem("loggedInContractor")
+    void signOutSession().catch(() => {})
     handleReset()
   }
 
@@ -315,6 +297,13 @@ export default function PayoutCalculator() {
               <div>
                 <CardTitle className="text-2xl font-bold text-balance">Payout Calculator</CardTitle>
                 <CardDescription className="text-base mt-1">Contractor: {selectedContractor}</CardDescription>
+                <Link
+                  href="/payouts"
+                  className="mt-2 inline-flex items-center gap-1.5 text-sm font-medium text-primary hover:underline"
+                >
+                  <History className="h-4 w-4" />
+                  Workiz payout history
+                </Link>
               </div>
               <div className="flex flex-col gap-2">
                 <Button variant="outline" onClick={handleLogout} className="text-sm bg-transparent">
