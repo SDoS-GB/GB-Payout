@@ -1,6 +1,6 @@
 "use server"
 
-import { and, desc, eq, inArray, sql } from "drizzle-orm"
+import { and, desc, eq, ilike, inArray, or, sql, type SQL } from "drizzle-orm"
 import { revalidatePath } from "next/cache"
 import { db } from "@/lib/db"
 import {
@@ -15,6 +15,13 @@ import {
 import { notifyPayout } from "@/lib/notifications/send"
 import { buildTemplateContext, renderTemplate } from "@/lib/notifications/template"
 import { listProfiles } from "@/lib/payout/profiles"
+import {
+  DEFAULT_BUSINESS_TIMEZONE,
+  DEFAULT_PAYOUT_QUERY,
+  PAYOUT_STATUS_FILTERS,
+  completionState,
+  type PayoutQuery,
+} from "@/lib/payout/presentation"
 import { parseMarkerTokens } from "@/lib/payout/segments"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
@@ -27,6 +34,7 @@ import {
   type NotificationSettings,
 } from "@/lib/settings"
 import { WorkizClient } from "@/lib/workiz/client"
+import { parseWorkizDate } from "@/lib/workiz/time"
 import { logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
 
 type Result<T = undefined> = { ok: true; data?: T } | { ok: false; error: string }
@@ -51,6 +59,7 @@ export async function updateWorkizSettings(form: {
   cardMethodKeywords: string
   tipKeywords: string
   reconcileLookbackDays: number
+  businessTimezone?: string
 }): Promise<Result> {
   try {
     await requireAdmin()
@@ -60,6 +69,15 @@ export async function updateWorkizSettings(form: {
       cardMethodKeywords: splitList(form.cardMethodKeywords),
       tipKeywords: splitList(form.tipKeywords),
       reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || 14))),
+    }
+    if (form.businessTimezone !== undefined) {
+      const tz = form.businessTimezone.trim() || DEFAULT_BUSINESS_TIMEZONE
+      try {
+        new Intl.DateTimeFormat("en-US", { timeZone: tz })
+      } catch {
+        return { ok: false, error: `"${tz}" is not a valid IANA timezone (example: America/New_York)` }
+      }
+      patch.businessTimezone = tz
     }
     // Blank secret fields mean "keep the existing value".
     if (form.apiToken && form.apiToken.trim()) patch.apiToken = form.apiToken.trim()
@@ -397,59 +415,213 @@ export async function changeAdminPassword(current: string, next: string): Promis
 
 // --- Read models for the admin dashboard ------------------------------------
 
+async function latestNotificationByPayout(payoutIds: number[]) {
+  const rows = payoutIds.length
+    ? await db.select().from(notifications).where(inArray(notifications.payoutId, payoutIds)).orderBy(desc(notifications.createdAt))
+    : []
+  const byPayout = new Map<number, (typeof rows)[number]>()
+  for (const n of rows) if (!byPayout.has(n.payoutId)) byPayout.set(n.payoutId, n)
+  return byPayout
+}
+
+function sanitizeQuery(input: Partial<PayoutQuery> | undefined): PayoutQuery {
+  const status = PAYOUT_STATUS_FILTERS.includes(input?.status as PayoutQuery["status"]) ? (input!.status as PayoutQuery["status"]) : "all"
+  const profileId = typeof input?.profileId === "number" && Number.isInteger(input.profileId) ? input.profileId : null
+  const search = (input?.search ?? "").trim().slice(0, 80)
+  const pageSize = Math.min(100, Math.max(5, Math.round(Number(input?.pageSize) || DEFAULT_PAYOUT_QUERY.pageSize)))
+  const page = Math.max(1, Math.round(Number(input?.page) || 1))
+  return { status, profileId, search, page, pageSize }
+}
+
+function payoutQueryWhere(q: PayoutQuery): SQL | undefined {
+  const conditions: SQL[] = []
+  if (q.status !== "all") conditions.push(eq(payouts.status, q.status))
+  if (q.profileId != null) conditions.push(eq(payouts.profileId, q.profileId))
+  if (q.search) {
+    const like = `%${q.search.replace(/[%_\\]/g, (c) => `\\${c}`)}%`
+    const bySerial = ilike(workizJobs.serialId, like)
+    const byClient = ilike(workizJobs.clientName, like)
+    const byUuid = ilike(payouts.jobUuid, like)
+    conditions.push(or(bySerial, byClient, byUuid) as SQL)
+  }
+  return conditions.length ? and(...conditions) : undefined
+}
+
+/**
+ * One page of individual job-technician payout records with everything the
+ * detail panel shows. Read-only: never touches payouts, payments or messages.
+ * The same WHERE clause drives `total`, so a summary card count and the list
+ * it opens always agree, across every page.
+ */
+export async function queryPayouts(input?: Partial<PayoutQuery>) {
+  await requireAdmin()
+  const q = sanitizeQuery(input)
+  const where = payoutQueryWhere(q)
+  const settings = await getWorkizSettings()
+
+  const [{ total }] = await db
+    .select({ total: sql<number>`count(*)`.mapWith(Number) })
+    .from(payouts)
+    .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
+    .where(where)
+
+  const rows = await db
+    .select({
+      payout: payouts,
+      profileName: technicianProfiles.name,
+      profileMarker: technicianProfiles.lineItemMarker,
+      job: {
+        uuid: workizJobs.uuid,
+        serialId: workizJobs.serialId,
+        status: workizJobs.status,
+        subStatus: workizJobs.subStatus,
+        paymentDueDate: workizJobs.paymentDueDate,
+        jobDateTime: workizJobs.jobDateTime,
+        jobEndDateTime: workizJobs.jobEndDateTime,
+        clientName: workizJobs.clientName,
+        address: workizJobs.address,
+        jobType: workizJobs.jobType,
+        jobTotal: workizJobs.jobTotal,
+        subTotal: workizJobs.subTotal,
+        taxAmount: workizJobs.taxAmount,
+        discountAmount: workizJobs.discountAmount,
+        colorSealTotal: workizJobs.colorSealTotal,
+        cardServiceAmount: workizJobs.cardServiceAmount,
+        nonCardServiceAmount: workizJobs.nonCardServiceAmount,
+        cardTipAmount: workizJobs.cardTipAmount,
+        nonCardTipAmount: workizJobs.nonCardTipAmount,
+        totalPaid: workizJobs.totalPaid,
+        fullyPaid: workizJobs.fullyPaid,
+        invoiceStatus: workizJobs.invoiceStatus,
+        teamIds: workizJobs.teamIds,
+        teamNames: workizJobs.teamNames,
+        lineItems: workizJobs.lineItems,
+        payments: workizJobs.payments,
+        lastSeenAt: workizJobs.lastSeenAt,
+        updatedAt: workizJobs.updatedAt,
+        lastStatusUpdate: sql<string | null>`${workizJobs.raw}->>'LastStatusUpdate'`,
+        amountDue: sql<string | null>`${workizJobs.raw}->>'JobAmountDue'`,
+      },
+    })
+    .from(payouts)
+    .leftJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
+    .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
+    .where(where)
+    .orderBy(desc(payouts.updatedAt), desc(payouts.id))
+    .limit(q.pageSize)
+    .offset((q.page - 1) * q.pageSize)
+
+  const notifByPayout = await latestNotificationByPayout(rows.map((r) => r.payout.id))
+
+  // Other technicians paid on the same job, so a shared job is visibly one record per technician.
+  const jobUuids = Array.from(new Set(rows.map((r) => r.payout.jobUuid)))
+  const siblings = jobUuids.length
+    ? await db
+        .select({ id: payouts.id, jobUuid: payouts.jobUuid, profileId: payouts.profileId, status: payouts.status, totalPayout: payouts.totalPayout, segmentKind: payouts.segmentKind, segmentMarker: payouts.segmentMarker, profileName: technicianProfiles.name })
+        .from(payouts)
+        .leftJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
+        .where(inArray(payouts.jobUuid, jobUuids))
+    : []
+
+  const timeZone = settings.businessTimezone || DEFAULT_BUSINESS_TIMEZONE
+  const items = rows.map((r) => {
+    const raw = r.job?.uuid ? r.job : null
+    const job = raw
+      ? {
+          ...raw,
+          lastStatusUpdate: parseWorkizDate(raw.lastStatusUpdate, timeZone),
+          amountDue: raw.amountDue === null || raw.amountDue === undefined || raw.amountDue === "" ? null : Number(raw.amountDue),
+        }
+      : null
+    return {
+      ...r.payout,
+      profileName: r.profileName ?? "Unknown",
+      profileMarker: r.profileMarker ?? null,
+      job,
+      completion: job ? completionState({ status: job.status, payableStatuses: settings.payableStatuses, lastStatusUpdate: job.lastStatusUpdate }) : null,
+      lastNotification: notifByPayout.get(r.payout.id) ?? null,
+      siblings: siblings.filter((s) => s.jobUuid === r.payout.jobUuid && s.id !== r.payout.id).map((s) => ({ ...s, profileName: s.profileName ?? "Unknown" })),
+    }
+  })
+
+  return { items, total, page: q.page, pageSize: q.pageSize, query: q }
+}
+
+export type PayoutPage = Awaited<ReturnType<typeof queryPayouts>>
+export type PayoutRecord = PayoutPage["items"][number]
+
+/** Individual payout-record counts per technician and status, over every payout ever stored. */
+async function payoutStatusCounts() {
+  return db
+    .select({
+      profileId: payouts.profileId,
+      status: payouts.status,
+      count: sql<number>`count(*)`.mapWith(Number),
+      total: sql<number>`coalesce(sum(${payouts.totalPayout}), 0)`.mapWith(Number),
+    })
+    .from(payouts)
+    .groupBy(payouts.profileId, payouts.status)
+}
+
+/** Jobs (and their customers) that reference a Workiz team id nobody has mapped yet. */
+async function unmappedTeamImpact(teamIds: string[]) {
+  if (teamIds.length === 0) return {} as Record<string, Array<{ uuid: string; serialId: string | null; clientName: string | null; status: string | null; jobDateTime: Date | null }>>
+  const rows = await db
+    .select({
+      uuid: workizJobs.uuid,
+      serialId: workizJobs.serialId,
+      clientName: workizJobs.clientName,
+      status: workizJobs.status,
+      jobDateTime: workizJobs.jobDateTime,
+      teamIds: workizJobs.teamIds,
+    })
+    .from(workizJobs)
+    .where(sql`${workizJobs.teamIds} ?| array[${sql.join(teamIds.map((id) => sql`${id}`), sql`, `)}]::text[]`)
+    .orderBy(desc(workizJobs.jobDateTime))
+  const impact: Record<string, Array<{ uuid: string; serialId: string | null; clientName: string | null; status: string | null; jobDateTime: Date | null }>> = {}
+  for (const id of teamIds) impact[id] = []
+  for (const row of rows) {
+    for (const id of row.teamIds ?? []) {
+      if (impact[id]) impact[id].push({ uuid: row.uuid, serialId: row.serialId, clientName: row.clientName, status: row.status, jobDateTime: row.jobDateTime })
+    }
+  }
+  return impact
+}
+
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, notif, events] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
     getWorkizSettings(),
     getNotificationSettings(),
     db.select().from(syncEvents).orderBy(desc(syncEvents.createdAt)).limit(40),
+    payoutStatusCounts(),
+    queryPayouts(DEFAULT_PAYOUT_QUERY),
   ])
 
-  const payoutRows = await db
+  const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
+  const unmappedImpact = await unmappedTeamImpact(unmappedIds)
+
+  // Compact recent list for the Messages tab (preview picker + delivery log).
+  const recentRows = await db
     .select({
       payout: payouts,
       profileName: technicianProfiles.name,
-      job: {
-        serialId: workizJobs.serialId,
-        clientName: workizJobs.clientName,
-        status: workizJobs.status,
-        jobDateTime: workizJobs.jobDateTime,
-        fullyPaid: workizJobs.fullyPaid,
-      },
+      job: { serialId: workizJobs.serialId, clientName: workizJobs.clientName, status: workizJobs.status, jobDateTime: workizJobs.jobDateTime, fullyPaid: workizJobs.fullyPaid },
     })
     .from(payouts)
     .leftJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
     .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
     .orderBy(desc(payouts.updatedAt))
     .limit(300)
-
-  const payoutIds = payoutRows.map((r) => r.payout.id)
-  const latestNotifications = payoutIds.length
-    ? await db
-        .select()
-        .from(notifications)
-        .where(inArray(notifications.payoutId, payoutIds))
-        .orderBy(desc(notifications.createdAt))
-    : []
-  const notifByPayout = new Map<number, (typeof latestNotifications)[number]>()
-  for (const n of latestNotifications) if (!notifByPayout.has(n.payoutId)) notifByPayout.set(n.payoutId, n)
-
-  const [counts] = await db
-    .select({
-      ready: sql<number>`count(*) filter (where ${payouts.status} = 'ready')`.mapWith(Number),
-      hold: sql<number>`count(*) filter (where ${payouts.status} = 'hold')`.mapWith(Number),
-      pending: sql<number>`count(*) filter (where ${payouts.status} = 'pending')`.mapWith(Number),
-      paid: sql<number>`count(*) filter (where ${payouts.status} = 'paid')`.mapWith(Number),
-      readyTotal: sql<number>`coalesce(sum(${payouts.totalPayout}) filter (where ${payouts.status} = 'ready'), 0)`.mapWith(Number),
-    })
-    .from(payouts)
+  const notifByPayout = await latestNotificationByPayout(recentRows.map((r) => r.payout.id))
 
   return {
     profiles: profiles.map((p) => ({ ...p, pinHash: undefined })),
     mappings,
+    unmappedImpact,
     catalog,
     workiz: {
       hasApiToken: Boolean(workiz.apiToken),
@@ -461,16 +633,18 @@ export async function loadAdminDashboard() {
       cardMethodKeywords: workiz.cardMethodKeywords,
       tipKeywords: workiz.tipKeywords,
       reconcileLookbackDays: workiz.reconcileLookbackDays,
+      businessTimezone: workiz.businessTimezone || DEFAULT_BUSINESS_TIMEZONE,
     },
     notifications: notif,
     events,
-    payouts: payoutRows.map((r) => ({
+    payouts: recentRows.map((r) => ({
       ...r.payout,
       profileName: r.profileName ?? "Unknown",
       job: r.job,
       lastNotification: notifByPayout.get(r.payout.id) ?? null,
     })),
-    counts,
+    statusCounts,
+    payoutPage,
   }
 }
 

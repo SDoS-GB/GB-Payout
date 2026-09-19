@@ -1,6 +1,8 @@
 import type { NormalizedLineItem, NormalizedPayment } from "@/lib/db/schema"
 import type { WorkizSettings } from "@/lib/settings"
+import { DEFAULT_BUSINESS_TIMEZONE } from "@/lib/payout/presentation"
 import type { WorkizRawJob } from "./client"
+import { parseWorkizDate } from "./time"
 
 /**
  * Everything the payout engine needs from a Workiz job, expressed in the same
@@ -61,12 +63,7 @@ const str = (v: unknown): string | null => {
   return s.length ? s : null
 }
 
-const date = (v: unknown): Date | null => {
-  const s = str(v)
-  if (!s) return null
-  const d = new Date(s)
-  return Number.isNaN(d.getTime()) ? null : d
-}
+const date = (v: unknown, timeZone: string): Date | null => parseWorkizDate(str(v), timeZone || DEFAULT_BUSINESS_TIMEZONE)
 
 const pick = (obj: Record<string, unknown>, ...keys: string[]): unknown => {
   for (const k of keys) {
@@ -284,9 +281,9 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
       serialId: str(pick(r, "SerialId", "serial_id", "SerialID", "JobId")),
       status: str(pick(r, "Status", "status")),
       subStatus: str(pick(r, "SubStatus", "sub_status")),
-      paymentDueDate: date(pick(r, "PaymentDueDate", "payment_due_date")),
-      jobDateTime: date(pick(r, "JobDateTime", "job_date_time")),
-      jobEndDateTime: date(pick(r, "JobEndDateTime", "job_end_date_time")),
+    paymentDueDate: date(pick(r, "PaymentDueDate", "payment_due_date"), settings.businessTimezone),
+    jobDateTime: date(pick(r, "JobDateTime", "job_date_time"), settings.businessTimezone),
+    jobEndDateTime: date(pick(r, "JobEndDateTime", "job_end_date_time"), settings.businessTimezone),
       clientId: str(pick(r, "ClientId", "client_id")),
       clientName,
       address,

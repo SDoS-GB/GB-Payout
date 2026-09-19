@@ -1,44 +1,122 @@
 "use client"
 
-import { useMemo, useState, useTransition } from "react"
+import { useEffect, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
-import { ChevronDown, ChevronRight, RefreshCw } from "lucide-react"
-import type { AdminDashboardData } from "@/app/actions/admin"
-import { bulkMarkPaid, reviewPayout, runReconcile, syncSingleJob } from "@/app/actions/admin"
+import useSWR, { SWRConfig, unstable_serialize, useSWRConfig } from "swr"
+import { ChevronLeft, ChevronRight, RefreshCw, Search, X } from "lucide-react"
+import type { PayoutPage, PayoutRecord, AdminDashboardData } from "@/app/actions/admin"
+import { bulkMarkPaid, queryPayouts, reviewPayout, runReconcile, syncSingleJob } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
+import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
-import { Textarea } from "@/components/ui/textarea"
 import { segmentLabel } from "@/lib/payout/segments"
-import { InlineMessage, StatusBadge, money, shortDate, shortDateTime } from "./shared"
+import { DEFAULT_PAYOUT_QUERY, PAYOUT_STATUS_FILTERS, paymentMethodsSummary, type PayoutQuery, type PayoutStatusFilter } from "@/lib/payout/presentation"
+import { PayoutDetailSheet } from "./payout-detail-sheet"
+import { InlineMessage, StatusBadge, money, zonedDate } from "./shared"
 
-type PayoutItem = AdminDashboardData["payouts"][number]
 type Profile = AdminDashboardData["profiles"][number]
 
-const FILTERS = ["all", "ready", "hold", "pending", "paid", "void"] as const
+const STATUS_LABELS: Record<PayoutStatusFilter, string> = {
+  all: "All statuses",
+  ready: "Ready to pay",
+  hold: "On hold",
+  pending: "Pending",
+  paid: "Paid",
+  void: "Void",
+}
 
-export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profiles: Profile[] }) {
+const payoutKey = (q: PayoutQuery) => ["payouts", q.status, q.profileId, q.search, q.page, q.pageSize] as const
+const isPayoutKey = (k: unknown): boolean => Array.isArray(k) && k[0] === "payouts"
+
+type Props = {
+  initialPage: PayoutPage
+  profiles: Profile[]
+  query: PayoutQuery
+  onQueryChange: (next: PayoutQuery | ((q: PayoutQuery) => PayoutQuery)) => void
+  focusToken: number
+  timezone: string
+}
+
+export function PayoutsTab(props: Props) {
+  return (
+    <SWRConfig value={{ fallback: { [unstable_serialize(payoutKey(DEFAULT_PAYOUT_QUERY))]: props.initialPage }, revalidateOnFocus: false }}>
+      <PayoutsTabInner {...props} />
+    </SWRConfig>
+  )
+}
+
+/** Shown on rows and in the panel: never a misleading $0.00 when nothing could be calculated. */
+export function payoutAmountLabel(p: Pick<PayoutRecord, "jobTotal" | "totalPayout" | "status">): { text: string; provisional: boolean; unavailable: boolean } {
+  const jobTotal = Number(p.jobTotal)
+  const total = Number(p.totalPayout)
+  if (jobTotal <= 0 && total === 0) return { text: "Not calculated", provisional: false, unavailable: true }
+  return { text: money(total), provisional: p.status === "pending" || p.status === "hold", unavailable: false }
+}
+
+function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone }: Props) {
   const router = useRouter()
+  const { mutate: mutateAll } = useSWRConfig()
   const [pending, startTransition] = useTransition()
-  const [filter, setFilter] = useState<(typeof FILTERS)[number]>("all")
-  const [tech, setTech] = useState<string>("all")
   const [selected, setSelected] = useState<Set<number>>(new Set())
-  const [expanded, setExpanded] = useState<number | null>(null)
+  const [openId, setOpenId] = useState<number | null>(null)
   const [message, setMessage] = useState<{ tone: "ok" | "error" | "info"; text: string } | null>(null)
   const [uuid, setUuid] = useState("")
+  const [searchDraft, setSearchDraft] = useState(query.search)
+  const listRef = useRef<HTMLDivElement | null>(null)
 
-  const visible = useMemo(
-    () =>
-      payouts.filter((p) => (filter === "all" || p.status === filter) && (tech === "all" || String(p.profileId) === tech)),
-    [payouts, filter, tech],
-  )
+  const { data, isLoading, isValidating, error, mutate } = useSWR(payoutKey(query), ([, status, profileId, search, page, pageSize]) =>
+    queryPayouts({ status: status as PayoutStatusFilter, profileId: profileId as number | null, search: search as string, page: page as number, pageSize: pageSize as number }),
+  { keepPreviousData: true })
 
-  const readyVisible = visible.filter((p) => p.status === "ready")
+  const items = data?.items ?? []
+  const total = data?.total ?? 0
+  const page = data?.page ?? query.page
+  const pageSize = data?.pageSize ?? query.pageSize
+  const pageCount = Math.max(1, Math.ceil(total / pageSize))
+  const from = total === 0 ? 0 : (page - 1) * pageSize + 1
+  const to = Math.min(total, page * pageSize)
+  const showingStale = Boolean(data) && data!.query && unstable_serialize(payoutKey(data!.query)) !== unstable_serialize(payoutKey(query))
+
+  // Summary-card clicks bump the token; bring the list into view.
+  useEffect(() => {
+    if (focusToken > 0) listRef.current?.scrollIntoView({ behavior: "smooth", block: "start" })
+  }, [focusToken])
+
+  // Keep the search box in sync when a card clears the search filter.
+  useEffect(() => {
+    setSearchDraft(query.search)
+  }, [query.search])
+
+  useEffect(() => {
+    const trimmed = searchDraft.trim()
+    if (trimmed === query.search) return
+    const t = setTimeout(() => onQueryChange((q) => ({ ...q, search: trimmed, page: 1 })), 300)
+    return () => clearTimeout(t)
+  }, [searchDraft, query.search, onQueryChange])
+
+  // Drop stale selections when rows leave the page.
+  useEffect(() => {
+    if (!data) return
+    const ids = new Set(data.items.map((i) => i.id))
+    setSelected((prev) => {
+      const next = new Set(Array.from(prev).filter((id) => ids.has(id)))
+      return next.size === prev.size ? prev : next
+    })
+    if (openId != null && !ids.has(openId)) setOpenId(null)
+  }, [data, openId])
+
+  const refreshAll = async () => {
+    await mutateAll(isPayoutKey, undefined, { revalidate: false })
+    await mutate()
+    router.refresh()
+  }
+
+  const readyVisible = items.filter((p) => p.status === "ready")
   const allReadySelected = readyVisible.length > 0 && readyVisible.every((p) => selected.has(p.id))
-
   const toggleAll = () => {
     const next = new Set(selected)
     if (allReadySelected) readyVisible.forEach((p) => next.delete(p.id))
@@ -56,10 +134,34 @@ export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profi
       }
       setMessage({ tone: "ok", text: okText })
       setSelected(new Set())
-      router.refresh()
+      await refreshAll()
     })
 
-  const selectedTotal = payouts.filter((p) => selected.has(p.id)).reduce((s, p) => s + Number(p.totalPayout), 0)
+  const selectedTotal = items.filter((p) => selected.has(p.id)).reduce((s, p) => s + Number(p.totalPayout), 0)
+  const filtered = query.status !== "all" || query.profileId != null || query.search !== ""
+  const selectedProfile = query.profileId != null ? profiles.find((p) => p.id === query.profileId) ?? null : null
+  const openRecord = openId != null ? items.find((i) => i.id === openId) ?? null : null
+
+  const emptyState = () => {
+    if (query.search) return { title: `No payouts match “${query.search}”`, body: "Search by Workiz job number, customer name, or job UUID." }
+    const who = selectedProfile ? ` for ${selectedProfile.name}` : ""
+    switch (query.status) {
+      case "ready":
+        return { title: `Nothing is ready to pay${who}`, body: "A payout becomes ready once the Workiz job is in a payable status, the customer has paid in full, and every team member on the job is mapped." }
+      case "hold":
+        return { title: `Nothing is on hold${who}`, body: "Payouts land here when a finished, paid job still needs review, for example an unmapped team member or a line-item marker problem." }
+      case "pending":
+        return { title: `No pending payouts${who}`, body: "Pending payouts are jobs that are not finished or not fully paid yet. Their amounts are provisional." }
+      case "paid":
+        return { title: `No paid payouts${who}`, body: "Payouts you mark as paid will be listed here with the paid date." }
+      case "void":
+        return { title: `No voided payouts${who}`, body: "Voided payouts are excluded from every total." }
+      default:
+        return selectedProfile
+          ? { title: `No payouts for ${selectedProfile.name} yet`, body: "Payouts appear after a Workiz job with this technician on it is synced." }
+          : { title: "No payouts yet", body: "Configure Workiz in the Workiz tab, map your team, then run a reconcile." }
+    }
+  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -84,7 +186,7 @@ export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profi
                     tone: d.failed ? "info" : "ok",
                     text: `Scanned ${d.scanned} jobs since ${d.startDate}: ${d.created} new payouts, ${d.updated} updated, ${d.held} held${d.failed ? `, ${d.failed} failed` : ""}${d.unmappedTeamIds.length ? `. Unmapped team ids: ${d.unmappedTeamIds.join(", ")}` : ""}`,
                   })
-                  router.refresh()
+                  await refreshAll()
                 })
               }
             >
@@ -102,11 +204,11 @@ export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profi
                   const d = res.data!
                   setMessage({ tone: "ok", text: `Job ${uuid} (${d.status ?? "?"}): ${d.created} new, ${d.updated} updated, ${d.held} held.${d.notes.length ? ` ${d.notes.join(" · ")}` : ""}` })
                   setUuid("")
-                  router.refresh()
+                  await refreshAll()
                 })
               }}
             >
-              <Input placeholder="Workiz job UUID" value={uuid} onChange={(e) => setUuid(e.target.value)} className="max-w-xs" />
+              <Input placeholder="Workiz job UUID" value={uuid} onChange={(e) => setUuid(e.target.value)} className="max-w-xs" aria-label="Workiz job UUID" />
               <Button size="sm" type="submit" variant="secondary" disabled={pending || !uuid.trim()}>
                 Sync job
               </Button>
@@ -116,83 +218,148 @@ export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profi
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="pb-3">
-          <div className="flex flex-wrap items-center justify-between gap-3">
-            <div>
-              <CardTitle className="text-base">Payout history</CardTitle>
-              <CardDescription>{visible.length} of {payouts.length} payouts shown</CardDescription>
+      <div ref={listRef} className="scroll-mt-4">
+        <Card>
+          <CardHeader className="pb-3">
+            <div className="flex flex-col gap-3">
+              <div className="flex flex-wrap items-start justify-between gap-3">
+                <div className="flex flex-col gap-1">
+                  <CardTitle className="text-base">Payout history</CardTitle>
+                  <CardDescription aria-live="polite">
+                    {isLoading && !data
+                      ? "Loading payouts…"
+                      : total === 0
+                        ? `0 individual payouts${filtered ? " match these filters" : ""}`
+                        : `Showing ${from}–${to} of ${total} individual payout${total === 1 ? "" : "s"}${filtered ? " matching these filters" : ""}`}
+                    {" · "}one record per technician; a shared job appears once per technician
+                  </CardDescription>
+                  {(query.status === "pending" || query.status === "hold") && (
+                    <p className="text-xs text-amber-700 dark:text-amber-300">Amounts in this view are provisional, not ready to pay.</p>
+                  )}
+                </div>
+                <div className="flex flex-wrap items-center gap-2">
+                  {filtered && (
+                    <Button size="sm" variant="ghost" onClick={() => onQueryChange({ ...DEFAULT_PAYOUT_QUERY })}>
+                      <X className="h-4 w-4" />
+                      All payouts
+                    </Button>
+                  )}
+                  <Button
+                    size="sm"
+                    disabled={pending || selected.size === 0}
+                    onClick={() => act(() => bulkMarkPaid(Array.from(selected)), `Marked ${selected.size} payouts as paid (${money(selectedTotal)})`)}
+                  >
+                    Mark {selected.size || ""} paid{selected.size ? ` · ${money(selectedTotal)}` : ""}
+                  </Button>
+                </div>
+              </div>
+
+              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_12rem]">
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="payout-search" className="text-xs">
+                    Search job number or customer
+                  </Label>
+                  <div className="relative">
+                    <Search className="pointer-events-none absolute left-2.5 top-1/2 h-4 w-4 -translate-y-1/2 text-muted-foreground" aria-hidden="true" />
+                    <Input id="payout-search" value={searchDraft} onChange={(e) => setSearchDraft(e.target.value)} placeholder="e.g. 924738 or Smith" className="pl-8" />
+                  </div>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="payout-status" className="text-xs">
+                    Status
+                  </Label>
+                  <Select value={query.status} onValueChange={(v) => onQueryChange((q) => ({ ...q, status: v as PayoutStatusFilter, page: 1 }))}>
+                    <SelectTrigger id="payout-status" aria-label="Filter by status">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      {PAYOUT_STATUS_FILTERS.map((f) => (
+                        <SelectItem key={f} value={f}>
+                          {STATUS_LABELS[f]}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+                <div className="flex flex-col gap-1">
+                  <Label htmlFor="payout-tech" className="text-xs">
+                    Technician
+                  </Label>
+                  <Select value={query.profileId == null ? "all" : String(query.profileId)} onValueChange={(v) => onQueryChange((q) => ({ ...q, profileId: v === "all" ? null : Number(v), page: 1 }))}>
+                    <SelectTrigger id="payout-tech" aria-label="Filter by technician">
+                      <SelectValue />
+                    </SelectTrigger>
+                    <SelectContent>
+                      <SelectItem value="all">All technicians</SelectItem>
+                      {profiles.map((p) => (
+                        <SelectItem key={p.id} value={String(p.id)}>
+                          {p.name}
+                        </SelectItem>
+                      ))}
+                    </SelectContent>
+                  </Select>
+                </div>
+              </div>
             </div>
-            <div className="flex flex-wrap items-center gap-2">
-              <Select value={filter} onValueChange={(v) => setFilter(v as (typeof FILTERS)[number])}>
-                <SelectTrigger className="w-32" aria-label="Filter by status">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  {FILTERS.map((f) => (
-                    <SelectItem key={f} value={f} className="capitalize">
-                      {f === "all" ? "All statuses" : f}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Select value={tech} onValueChange={setTech}>
-                <SelectTrigger className="w-40" aria-label="Filter by technician">
-                  <SelectValue />
-                </SelectTrigger>
-                <SelectContent>
-                  <SelectItem value="all">All technicians</SelectItem>
-                  {profiles.map((p) => (
-                    <SelectItem key={p.id} value={String(p.id)}>
-                      {p.name}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-              <Button
-                size="sm"
-                disabled={pending || selected.size === 0}
-                onClick={() => act(() => bulkMarkPaid(Array.from(selected)), `Marked ${selected.size} payouts as paid (${money(selectedTotal)})`)}
-              >
-                Mark {selected.size || ""} paid{selected.size ? ` · ${money(selectedTotal)}` : ""}
-              </Button>
-            </div>
-          </div>
-        </CardHeader>
-        <CardContent className="p-0">
-          <div className="overflow-x-auto">
-            <Table>
-              <TableHeader>
-                <TableRow>
-                  <TableHead className="w-10">
-                    <Checkbox checked={allReadySelected} onCheckedChange={toggleAll} aria-label="Select all ready payouts" disabled={readyVisible.length === 0} />
-                  </TableHead>
-                  <TableHead className="w-8" />
-                  <TableHead>Job</TableHead>
-                  <TableHead>Technician</TableHead>
-                  <TableHead>Status</TableHead>
-                  <TableHead className="text-right">Job total</TableHead>
-                  <TableHead className="text-right">Payout</TableHead>
-                  <TableHead>Message</TableHead>
-                  <TableHead>Updated</TableHead>
-                </TableRow>
-              </TableHeader>
-              <TableBody>
-                {visible.length === 0 && (
+          </CardHeader>
+          <CardContent className="p-0">
+            {error && (
+              <div className="px-4 pb-3">
+                <InlineMessage tone="error">Could not load payouts: {error instanceof Error ? error.message : String(error)}</InlineMessage>
+              </div>
+            )}
+            <div className={`overflow-x-auto transition-opacity ${isValidating && showingStale ? "opacity-60" : ""}`} aria-busy={isValidating}>
+              <Table>
+                <TableHeader>
                   <TableRow>
-                    <TableCell colSpan={9} className="py-10 text-center text-sm text-muted-foreground">
-                      No payouts yet. Configure Workiz in the Workiz tab, map your team, then run a reconcile.
-                    </TableCell>
+                    <TableHead className="w-10">
+                      <Checkbox checked={allReadySelected} onCheckedChange={toggleAll} aria-label="Select all ready payouts on this page" disabled={readyVisible.length === 0} />
+                    </TableHead>
+                    <TableHead>Job</TableHead>
+                    <TableHead>Customer</TableHead>
+                    <TableHead>Technician</TableHead>
+                    <TableHead className="text-right">Individual payout</TableHead>
+                    <TableHead>Status / reason</TableHead>
+                    <TableHead>Completed</TableHead>
+                    <TableHead>Customer paid by</TableHead>
+                    <TableHead>Message</TableHead>
+                    <TableHead className="w-8">
+                      <span className="sr-only">Open details</span>
+                    </TableHead>
                   </TableRow>
-                )}
-                {visible.map((p) => {
-                  const open = expanded === p.id
-                  return (
-                    <PayoutRows
+                </TableHeader>
+                <TableBody>
+                  {items.length === 0 && !isLoading && (
+                    <TableRow>
+                      <TableCell colSpan={10} className="whitespace-normal py-12 text-center">
+                        <div className="mx-auto flex max-w-md flex-col gap-2">
+                          <p className="text-sm font-medium">{emptyState().title}</p>
+                          <p className="text-sm text-muted-foreground">{emptyState().body}</p>
+                          {filtered && (
+                            <div>
+                              <Button size="sm" variant="outline" onClick={() => onQueryChange({ ...DEFAULT_PAYOUT_QUERY })}>
+                                Show all payouts
+                              </Button>
+                            </div>
+                          )}
+                        </div>
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  {items.length === 0 && isLoading && (
+                    <TableRow>
+                      <TableCell colSpan={10} className="py-12 text-center text-sm text-muted-foreground">
+                        Loading payouts…
+                      </TableCell>
+                    </TableRow>
+                  )}
+                  {items.map((p) => (
+                    <PayoutRow
                       key={p.id}
                       p={p}
-                      open={open}
-                      onToggle={() => setExpanded(open ? null : p.id)}
+                      timezone={timezone}
+                      open={openId === p.id}
+                      onOpen={() => setOpenId(p.id)}
                       checked={selected.has(p.id)}
                       onCheck={(v) => {
                         const next = new Set(selected)
@@ -200,193 +367,156 @@ export function PayoutsTab({ payouts, profiles }: { payouts: PayoutItem[]; profi
                         else next.delete(p.id)
                         setSelected(next)
                       }}
-                      pending={pending}
-                      onAction={(action, note) => act(() => reviewPayout(p.id, action, note), `Payout #${p.id}: ${action.replace("-", " ")}`)}
                     />
-                  )
-                })}
-              </TableBody>
-            </Table>
-          </div>
-        </CardContent>
-      </Card>
+                  ))}
+                </TableBody>
+              </Table>
+            </div>
+            {total > 0 && (
+              <div className="flex flex-wrap items-center justify-between gap-3 border-t px-4 py-3 text-sm">
+                <div className="flex flex-wrap items-center gap-3">
+                  <span className="text-muted-foreground">
+                    Page {page} of {pageCount}
+                  </span>
+                  <div className="flex items-center gap-2">
+                    <Label htmlFor="payout-page-size" className="text-xs text-muted-foreground">
+                      Rows per page
+                    </Label>
+                    <Select value={String(query.pageSize)} onValueChange={(v) => onQueryChange((q) => ({ ...q, pageSize: Number(v), page: 1 }))}>
+                      <SelectTrigger id="payout-page-size" className="h-8 w-20" aria-label="Rows per page">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {[10, 25, 50, 100].map((n) => (
+                          <SelectItem key={n} value={String(n)}>
+                            {n}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                </div>
+                <div className="flex items-center gap-2">
+                  <Button size="sm" variant="outline" disabled={page <= 1 || isValidating} onClick={() => onQueryChange((q) => ({ ...q, page: Math.max(1, q.page - 1) }))}>
+                    <ChevronLeft className="h-4 w-4" />
+                    Previous
+                  </Button>
+                  <Button size="sm" variant="outline" disabled={page >= pageCount || isValidating} onClick={() => onQueryChange((q) => ({ ...q, page: q.page + 1 }))}>
+                    Next
+                    <ChevronRight className="h-4 w-4" />
+                  </Button>
+                </div>
+              </div>
+            )}
+          </CardContent>
+        </Card>
+      </div>
+
+      <PayoutDetailSheet
+        record={openRecord}
+        open={openRecord != null}
+        onOpenChange={(o) => {
+          if (!o) setOpenId(null)
+        }}
+        timezone={timezone}
+        pending={pending}
+        onAction={(id, action, note) => act(() => reviewPayout(id, action, note), `Payout #${id}: ${action.replace("-", " ")}`)}
+      />
     </div>
   )
 }
 
-function PayoutRows({
+function PayoutRow({
   p,
+  timezone,
   open,
-  onToggle,
+  onOpen,
   checked,
   onCheck,
-  pending,
-  onAction,
 }: {
-  p: PayoutItem
+  p: PayoutRecord
+  timezone: string
   open: boolean
-  onToggle: () => void
+  onOpen: () => void
   checked: boolean
   onCheck: (v: boolean) => void
-  pending: boolean
-  onAction: (action: Parameters<typeof reviewPayout>[1], note?: string) => void
 }) {
-  const [note, setNote] = useState(p.adminNote ?? "")
   const b = (p.breakdown ?? {}) as Record<string, unknown>
-  const warnings = Array.isArray(b.warnings) ? (b.warnings as string[]) : []
-  const segment = (b.segment ?? null) as { itemNames?: string[]; markerFields?: string[]; grossAmount?: number; itemDiscountAmount?: number; allocatedDiscountAmount?: number } | null
-  const jobWide = (b.job ?? null) as { jobTotal?: number; markers?: string[] } | null
-  const verification = (b.verification ?? null) as { balanced?: boolean; assignedItemCount?: number; itemCount?: number; doubleCountedItems?: number } | null
+  const jobWide = (b.job ?? null) as { markers?: string[] } | null
   const label = segmentLabel(p.segmentKind, p.segmentMarker ?? jobWide?.markers?.join("/") ?? null)
+  const amount = payoutAmountLabel(p)
+  const methods = paymentMethodsSummary(p.job?.payments)
+  const reason = p.status === "ready" || p.status === "paid" ? null : p.holdReason
 
   return (
-    <>
-      <TableRow className={open ? "bg-muted/40" : undefined}>
-        <TableCell>
-          <Checkbox checked={checked} onCheckedChange={(v) => onCheck(Boolean(v))} disabled={p.status !== "ready"} aria-label={`Select payout ${p.id}`} />
-        </TableCell>
-        <TableCell>
-          <button type="button" onClick={onToggle} className="text-muted-foreground hover:text-foreground" aria-expanded={open} aria-label="Toggle details">
-            {open ? <ChevronDown className="h-4 w-4" /> : <ChevronRight className="h-4 w-4" />}
-          </button>
-        </TableCell>
-        <TableCell>
-          <div className="flex flex-col">
-            <span className="font-medium">#{p.job?.serialId ?? p.jobUuid.slice(0, 8)}</span>
-            <span className="text-xs text-muted-foreground">{p.job?.clientName ?? "—"} · {shortDate(p.job?.jobDateTime)}</span>
-          </div>
-        </TableCell>
-        <TableCell>
-          <div className="flex flex-col">
-            <span>{p.profileName}</span>
-            {label && <span className="font-mono text-xs text-muted-foreground">{label}</span>}
-          </div>
-        </TableCell>
-        <TableCell>
-          <div className="flex flex-col gap-1">
-            <StatusBadge status={p.status} />
-            {p.holdReason && p.status !== "ready" && <span className="max-w-[16rem] text-xs text-muted-foreground">{p.holdReason}</span>}
-          </div>
-        </TableCell>
-        <TableCell className="text-right tabular-nums">{money(p.jobTotal)}</TableCell>
-        <TableCell className="text-right font-semibold tabular-nums">{money(p.totalPayout)}</TableCell>
-        <TableCell>{p.lastNotification ? <StatusBadge status={p.lastNotification.status} /> : <span className="text-xs text-muted-foreground">—</span>}</TableCell>
-        <TableCell className="text-xs text-muted-foreground">{shortDateTime(p.updatedAt)}</TableCell>
-      </TableRow>
-      {open && (
-        <TableRow className="bg-muted/40 hover:bg-muted/40">
-          <TableCell colSpan={9} className="p-4">
-            <div className="grid gap-4 md:grid-cols-3">
-              <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-                {label && (
-                  <>
-                    <dt className="text-muted-foreground">Paid on</dt>
-                    <dd className="text-right font-mono text-xs">{label}</dd>
-                    {jobWide?.jobTotal !== undefined && (
-                      <>
-                        <dt className="text-muted-foreground">Whole job</dt>
-                        <dd className="text-right tabular-nums text-muted-foreground">{money(jobWide.jobTotal)}</dd>
-                      </>
-                    )}
-                  </>
-                )}
-                <dt className="text-muted-foreground">{label ? "Commission base" : "Job total"}</dt>
-                <dd className="text-right tabular-nums">{money(p.jobTotal)}</dd>
-                <dt className="text-muted-foreground">Discount</dt>
-                <dd className="text-right tabular-nums">{money(p.discountAmount)}</dd>
-                <dt className="text-muted-foreground">Color seal</dt>
-                <dd className="text-right tabular-nums">{money(p.colorSealTotal)}</dd>
-                <dt className="text-muted-foreground">Paid by card</dt>
-                <dd className="text-right tabular-nums">{money(p.cardServiceAmount)}</dd>
-                <dt className="text-muted-foreground">Paid other</dt>
-                <dd className="text-right tabular-nums">{money(p.nonCardServiceAmount)}</dd>
-                <dt className="text-muted-foreground">Tips (card / other)</dt>
-                <dd className="text-right tabular-nums">
-                  {money(p.cardTipAmount)} / {money(p.nonCardTipAmount)}
-                </dd>
-              </dl>
-              <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-                <dt className="text-muted-foreground">Rates</dt>
-                <dd className="text-right tabular-nums">
-                  {(Number(p.nonColorRate) * 100).toFixed(0)}% / {(Number(p.colorRate) * 100).toFixed(0)}% · tip {(Number(p.tipShare) * 100).toFixed(0)}%
-                </dd>
-                <dt className="text-muted-foreground">Non-color</dt>
-                <dd className="text-right tabular-nums">{money(p.nonColorPayout)}</dd>
-                <dt className="text-muted-foreground">Color</dt>
-                <dd className="text-right tabular-nums">{money(p.colorPayout)}</dd>
-                <dt className="text-muted-foreground">Tip</dt>
-                <dd className="text-right tabular-nums">{money(p.tipPayout)}</dd>
-                <dt className="font-medium">Total</dt>
-                <dd className="text-right font-semibold tabular-nums">{money(p.totalPayout)}</dd>
-                <dt className="text-muted-foreground">Mode</dt>
-                <dd className="text-right text-xs">{p.calcMode ?? "—"} · {p.splitCount} tech{p.splitCount === 1 ? "" : "s"}</dd>
-              </dl>
-              <div className="flex flex-col gap-2">
-                {label && segment && (
-                  <div className="rounded border bg-background p-2 text-xs">
-                    <p className="font-medium">
-                      {segment.itemNames?.length ?? 0} line item{(segment.itemNames?.length ?? 0) === 1 ? "" : "s"} · gross {money(segment.grossAmount ?? 0)}
-                      {(segment.itemDiscountAmount ?? 0) > 0 ? ` · item discounts ${money(segment.itemDiscountAmount ?? 0)}` : ""}
-                      {(segment.allocatedDiscountAmount ?? 0) > 0 ? ` · share of job discount ${money(segment.allocatedDiscountAmount ?? 0)}` : ""}
-                      {segment.markerFields?.length ? ` · marker found in ${segment.markerFields.join("/")}` : ""}
-                    </p>
-                    {segment.itemNames && segment.itemNames.length > 0 && <p className="mt-1 text-muted-foreground">{segment.itemNames.join(", ")}</p>}
-                    {verification && (
-                      <p className={verification.balanced ? "mt-1 text-muted-foreground" : "mt-1 text-destructive"}>
-                        {verification.balanced
-                          ? `Verified: ${verification.assignedItemCount}/${verification.itemCount} items assigned once, segments sum to the job total`
-                          : `Check failed: ${verification.doubleCountedItems ?? 0} item(s) double-counted or totals do not balance`}
-                      </p>
-                    )}
-                  </div>
-                )}
-                {warnings.length > 0 && (
-                  <ul className="list-disc pl-4 text-xs text-amber-700 dark:text-amber-300">
-                    {warnings.map((w) => (
-                      <li key={w}>{w}</li>
-                    ))}
-                  </ul>
-                )}
-                {p.lastNotification && (
-                  <p className="rounded border bg-background p-2 text-xs">
-                    <span className="font-medium">Last message ({p.lastNotification.status}):</span> {p.lastNotification.message}
-                    {p.lastNotification.error && <span className="text-destructive"> · {p.lastNotification.error}</span>}
-                  </p>
-                )}
-                <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Admin note (optional)" rows={2} className="text-sm" />
-                <div className="flex flex-wrap gap-2">
-                  {p.status !== "ready" && p.status !== "paid" && (
-                    <Button size="sm" disabled={pending} onClick={() => onAction("release", note)}>
-                      Release
-                    </Button>
-                  )}
-                  {p.status === "ready" && (
-                    <Button size="sm" disabled={pending} onClick={() => onAction("mark-paid", note)}>
-                      Mark paid
-                    </Button>
-                  )}
-                  {p.status !== "hold" && p.status !== "paid" && (
-                    <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction("hold", note)}>
-                      Hold
-                    </Button>
-                  )}
-                  {p.status === "paid" && (
-                    <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction("reopen", note)}>
-                      Reopen
-                    </Button>
-                  )}
-                  {p.status !== "void" && p.status !== "paid" && (
-                    <Button size="sm" variant="ghost" className="text-destructive" disabled={pending} onClick={() => onAction("void", note)}>
-                      Void
-                    </Button>
-                  )}
-                </div>
-                {p.paidAt && <p className="text-xs text-muted-foreground">Paid {shortDateTime(p.paidAt)} by {p.paidBy}</p>}
-              </div>
-            </div>
-          </TableCell>
-        </TableRow>
-      )}
-    </>
+    <TableRow
+      onClick={onOpen}
+      className={`cursor-pointer ${open ? "bg-muted/50" : ""}`}
+      data-state={open ? "selected" : undefined}
+      aria-selected={open}
+    >
+      <TableCell onClick={(e) => e.stopPropagation()}>
+        <Checkbox checked={checked} onCheckedChange={(v) => onCheck(Boolean(v))} disabled={p.status !== "ready"} aria-label={`Select payout ${p.id}`} />
+      </TableCell>
+      <TableCell>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation()
+            onOpen()
+          }}
+          className="text-left font-medium underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring rounded-sm"
+          aria-haspopup="dialog"
+          aria-expanded={open}
+        >
+          #{p.job?.serialId ?? p.jobUuid}
+        </button>
+        <div className="text-xs text-muted-foreground">{p.job?.status ?? "Status unavailable"}</div>
+      </TableCell>
+      <TableCell>
+        <div className="flex flex-col">
+          <span>{p.job?.clientName ?? <span className="text-muted-foreground">Customer unavailable</span>}</span>
+          <span className="text-xs text-muted-foreground">Job date {zonedDate(p.job?.jobDateTime, timezone)}</span>
+        </div>
+      </TableCell>
+      <TableCell>
+        <div className="flex flex-col">
+          <span>{p.profileName}</span>
+          {label && <span className="font-mono text-xs text-muted-foreground">{label}</span>}
+          {p.siblings.length > 0 && <span className="text-xs text-muted-foreground">+{p.siblings.length} other on this job</span>}
+        </div>
+      </TableCell>
+      <TableCell className="text-right">
+        <div className="flex flex-col items-end">
+          <span className={`font-semibold tabular-nums ${amount.unavailable ? "text-muted-foreground" : ""}`}>{amount.text}</span>
+          {amount.provisional && <span className="text-[11px] uppercase tracking-wide text-amber-700 dark:text-amber-300">Provisional</span>}
+          {amount.unavailable && <span className="text-[11px] text-muted-foreground">Job total is zero</span>}
+        </div>
+      </TableCell>
+      <TableCell className="whitespace-normal">
+        <div className="flex flex-col gap-1">
+          <StatusBadge status={p.status} />
+          {reason && <span className="max-w-[16rem] text-xs text-muted-foreground">{reason}</span>}
+        </div>
+      </TableCell>
+      <TableCell className="text-xs">
+        <CompletionCell completion={p.completion} timezone={timezone} />
+      </TableCell>
+      <TableCell className="text-xs">
+        <span className={methods.count === 0 ? "text-muted-foreground" : ""}>{methods.label}</span>
+        {methods.mixed && <span className="ml-1 rounded bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground">Mixed</span>}
+      </TableCell>
+      <TableCell>{p.lastNotification ? <StatusBadge status={p.lastNotification.status} /> : <span className="text-xs text-muted-foreground">—</span>}</TableCell>
+      <TableCell className="text-muted-foreground">
+        <ChevronRight className="h-4 w-4" aria-hidden="true" />
+      </TableCell>
+    </TableRow>
   )
+}
+
+export function CompletionCell({ completion, timezone }: { completion: PayoutRecord["completion"]; timezone: string }) {
+  if (!completion) return <span className="text-muted-foreground">Completion date unavailable</span>
+  if (completion.state === "completed") return <span>{zonedDate(completion.at, timezone)}</span>
+  if (completion.state === "not-completed") return <span className="text-muted-foreground">Not completed</span>
+  return <span className="text-muted-foreground">Completion date unavailable</span>
 }

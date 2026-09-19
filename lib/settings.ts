@@ -19,6 +19,8 @@ export type WorkizSettings = {
   tipKeywords: string[]
   /** Days to look back on cron reconciliation. */
   reconcileLookbackDays: number
+  /** IANA timezone used to display job, completion and payment dates. */
+  businessTimezone: string
 }
 
 export type NotificationSettings = {
@@ -43,6 +45,7 @@ export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
   cardMethodKeywords: ["credit", "card", "visa", "mastercard", "amex", "discover", "stripe", "cc"],
   tipKeywords: ["tip", "gratuity"],
   reconcileLookbackDays: 14,
+  businessTimezone: "America/New_York",
 }
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {

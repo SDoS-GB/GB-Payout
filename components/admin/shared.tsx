@@ -18,6 +18,43 @@ export const shortDateTime = (d: Date | string | null | undefined) => {
   return date.toLocaleString(undefined, { month: "short", day: "numeric", hour: "numeric", minute: "2-digit" })
 }
 
+const toDate = (d: Date | string | null | undefined) => {
+  if (!d) return null
+  const date = typeof d === "string" ? new Date(d) : d
+  return Number.isNaN(date.getTime()) ? null : date
+}
+
+const safeTimeZone = (tz: string) => {
+  try {
+    new Intl.DateTimeFormat("en-US", { timeZone: tz })
+    return tz
+  } catch {
+    return "America/New_York"
+  }
+}
+
+/** Calendar date in the business timezone, e.g. "Sep 9, 2026". */
+export const zonedDate = (d: Date | string | null | undefined, tz: string) => {
+  const date = toDate(d)
+  if (!date) return "—"
+  return new Intl.DateTimeFormat("en-US", { timeZone: safeTimeZone(tz), month: "short", day: "numeric", year: "numeric" }).format(date)
+}
+
+/** Date and time in the business timezone with its abbreviation, e.g. "Sep 9, 2026, 9:00 AM EDT". */
+export const zonedDateTime = (d: Date | string | null | undefined, tz: string) => {
+  const date = toDate(d)
+  if (!date) return "—"
+  return new Intl.DateTimeFormat("en-US", {
+    timeZone: safeTimeZone(tz),
+    month: "short",
+    day: "numeric",
+    year: "numeric",
+    hour: "numeric",
+    minute: "2-digit",
+    timeZoneName: "short",
+  }).format(date)
+}
+
 const STATUS_STYLES: Record<string, string> = {
   ready: "bg-primary/10 text-primary border-primary/20",
   hold: "bg-amber-500/10 text-amber-700 border-amber-500/30 dark:text-amber-300",

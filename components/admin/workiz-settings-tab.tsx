@@ -29,6 +29,7 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
     cardMethodKeywords: workiz.cardMethodKeywords.join(", "),
     tipKeywords: workiz.tipKeywords.join(", "),
     reconcileLookbackDays: workiz.reconcileLookbackDays,
+    businessTimezone: workiz.businessTimezone,
   })
   const [probe, setProbe] = useState<Awaited<ReturnType<typeof probeWorkiz>> | null>(null)
   const [copied, setCopied] = useState<string | null>(null)
@@ -103,6 +104,21 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
                   Reconcile lookback (days)
                 </Label>
                 <Input id="lookback" type="number" min={1} max={90} value={form.reconcileLookbackDays} onChange={(e) => setForm({ ...form, reconcileLookbackDays: Number(e.target.value) })} />
+              </div>
+            </div>
+
+            <div className="grid gap-3 md:grid-cols-2">
+              <div className="flex flex-col gap-1">
+                <Label htmlFor="business-tz" className="text-xs">
+                  Business timezone
+                </Label>
+                <Input id="business-tz" value={form.businessTimezone} onChange={(e) => setForm({ ...form, businessTimezone: e.target.value })} placeholder="America/New_York" list="tz-suggestions" />
+                <datalist id="tz-suggestions">
+                  {["America/New_York", "America/Chicago", "America/Denver", "America/Phoenix", "America/Los_Angeles", "America/Anchorage", "Pacific/Honolulu"].map((tz) => (
+                    <option key={tz} value={tz} />
+                  ))}
+                </datalist>
+                <span className="text-xs text-muted-foreground">Job, completion and payment dates in the dashboard are shown in this timezone.</span>
               </div>
             </div>
 

@@ -9,7 +9,7 @@ import {
 } from "@/lib/db/schema"
 import type { WorkizSettings } from "@/lib/settings"
 import { isPayableStatus, type NormalizedJob } from "@/lib/workiz/normalize"
-import { CALC_VERSION, calcPayoutWithPaymentSplit, type SplitPayoutBreakdown } from "./calculator"
+import { CALC_VERSION, CARD_FEE_MULTIPLIER, calcPayoutWithPaymentSplit, type SplitPayoutBreakdown } from "./calculator"
 import { profileToRates } from "./profiles"
 import { planSegments, type JobSegment, type MarkerOwner } from "./segments"
 
@@ -70,6 +70,20 @@ export function computeForProfile(segment: JobSegment, profile: TechnicianProfil
     { nonColorRate: rates.nonColorRate, colorRate: rates.colorRate },
     { separateColorSeal: rates.separateColorSeal, tipShare: rates.tipShare },
   )
+}
+
+/**
+ * Dollars withheld from this payout by the card-processing fee, for display in
+ * the saved snapshot. Read straight off the breakdown the calculator already
+ * produced: the fee multiplier is applied to card-paid service commission and
+ * card tips only, exactly as the calculator does, so this never changes totals.
+ */
+export function cardFeeWithheld(breakdown: SplitPayoutBreakdown, segment: JobSegment, profile: TechnicianProfile): number {
+  const rates = profileToRates(profile)
+  const feeRate = 1 - CARD_FEE_MULTIPLIER
+  const cardCommission = breakdown.cardNonColorAmount * rates.nonColorRate + breakdown.cardColorAmount * rates.colorRate
+  const cardTip = segment.cardTipAmount > 0 ? segment.cardTipAmount * rates.tipShare : 0
+  return Math.round((cardCommission + cardTip) * feeRate * 10000) / 10000
 }
 
 /**
@@ -187,6 +201,7 @@ export async function upsertPayoutsForJob(
     }
 
     const breakdown = computeForProfile(segment, profile)
+    const cardFeeAdjustment = cardFeeWithheld(breakdown, segment, profile)
     const holdReason = baseGate ?? (unmapped.length ? `Job has unmapped team members (${unmapped.join(", ")})` : null)
     const status: PayoutStatus = holdReason ? (isPayableStatus(job.status, settings) ? "hold" : "pending") : "ready"
     if (status === "hold") result.held++
@@ -221,11 +236,13 @@ export async function upsertPayoutsForJob(
       calcMode: breakdown.mode,
       breakdown: {
         ...breakdown,
+        cardFeeAdjustment,
         calcVersion: CALC_VERSION,
         warnings: [...job.warnings, ...plan.warnings],
         segment: {
           kind: segment.kind,
           marker: segment.marker,
+          itemIndexes: segment.itemIndexes,
           itemNames: segment.itemNames,
           markerFields: segment.markerFields,
           grossAmount: segment.grossAmount,
