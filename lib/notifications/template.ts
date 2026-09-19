@@ -8,6 +8,8 @@ export type TemplateContext = {
   jobUuid: string
   clientName: string
   jobTotal: string
+  /** " for your *T* items" / " for crew work (excl. *T*)" when the job was split; empty otherwise. */
+  segmentLine: string
   discountLine: string
   colorSealLine: string
   tipLine: string
@@ -21,12 +23,18 @@ export type TemplateContext = {
 export function buildTemplateContext(payout: PayoutRow, profile: TechnicianProfile, job: WorkizJobRow | null): TemplateContext {
   const m = payoutMoney(payout)
   const tipTotal = m.cardTip + m.nonCardTip
+  const jobMarkers = (payout.breakdown as { job?: { markers?: string[] } } | null)?.job?.markers ?? []
+  const marker = payout.segmentMarker ?? (jobMarkers.length ? jobMarkers.join("/") : null)
+  let segmentLine = ""
+  if (payout.segmentKind === "dedicated") segmentLine = ` for your ${marker ?? "marked"} items`
+  else if (payout.segmentKind === "crew") segmentLine = marker ? ` for crew work (excl. ${marker})` : " for crew work"
   return {
     technician: profile.name,
     jobSerial: job?.serialId ?? payout.jobUuid.slice(0, 8),
     jobUuid: payout.jobUuid,
     clientName: job?.clientName ?? "client",
     jobTotal: formatCurrency(m.jobTotal),
+    segmentLine,
     discountLine: m.discount > 0 ? ` (after ${formatCurrency(m.discount)} discount)` : "",
     colorSealLine: m.colorSeal > 0 ? `, color seal ${formatCurrency(m.colorSeal)}` : "",
     tipLine: tipTotal > 0 ? `, tips ${formatCurrency(tipTotal)}` : "",
@@ -44,6 +52,7 @@ export const TEMPLATE_PLACEHOLDERS = [
   "jobUuid",
   "clientName",
   "jobTotal",
+  "segmentLine",
   "discountLine",
   "colorSealLine",
   "tipLine",

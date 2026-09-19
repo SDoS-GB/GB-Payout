@@ -98,6 +98,10 @@ export function normalizeLineItems(
     const r = entry as Record<string, unknown>
     const id = str(pick(r, "id", "Id", "ID", "ItemId", "ProductId", "product_id"))
     const name = str(pick(r, "Name", "name", "Title", "title", "Description", "description")) ?? "Line item"
+    // Workiz may put the free-text a dispatcher types (including technician markers) in a
+    // separate field from the product name, so keep it for marker matching.
+    const rawDescription = str(pick(r, "Description", "description", "Notes", "notes", "Note", "note", "Comment", "comment"))
+    const description = rawDescription && rawDescription !== name ? rawDescription : null
     const quantity = num(pick(r, "Quantity", "quantity", "Qty", "qty")) || 1
     const unitPrice = num(pick(r, "Price", "price", "UnitPrice", "unit_price", "Rate"))
     const explicitTotal = pick(r, "Total", "total", "LineTotal", "line_total", "Amount", "amount")
@@ -118,7 +122,7 @@ export function normalizeLineItems(
       matchedBy = "keyword"
     }
 
-    items.push({ id, name, quantity, unitPrice, total, isColorSeal, matchedBy })
+    items.push({ id, name, description, quantity, unitPrice, total, isColorSeal, matchedBy })
   }
   return { items, tipItemsTotal: round2(tipItemsTotal) }
 }

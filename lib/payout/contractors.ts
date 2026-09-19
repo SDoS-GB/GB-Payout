@@ -29,3 +29,11 @@ export function legacyProfileOptions(name: string) {
     tipShare: name === "Tim" ? 1 : 0.5,
   }
 }
+
+/**
+ * Literal line-item markers used by dispatch in Workiz to assign an item to one
+ * technician. Only seeded for new profiles; admins edit them in the Technicians tab.
+ */
+export const LINE_ITEM_MARKERS: Partial<Record<ContractorName, string>> = {
+  Tim: "*T*",
+}

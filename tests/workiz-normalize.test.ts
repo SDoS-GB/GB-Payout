@@ -192,6 +192,7 @@ describe("notification template", () => {
       jobUuid: "u",
       clientName: "c",
       jobTotal: "$1.00",
+      segmentLine: "",
       discountLine: "",
       colorSealLine: "",
       tipLine: "",

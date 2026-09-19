@@ -178,9 +178,18 @@ export async function addManualTeamMapping(workizTeamId: string, workizName: str
 
 // --- Technician profiles -----------------------------------------------------
 
+/** Literal marker text; stored trimmed, or null when blank. */
+function normalizeMarker(input: string | null | undefined): string | null {
+  const m = (input ?? "").trim()
+  if (!m) return null
+  if (m.length > 16) throw new Error("Line-item marker must be 16 characters or fewer")
+  if (/\s/.test(m)) throw new Error("Line-item marker cannot contain spaces")
+  return m
+}
+
 export async function updateProfile(
   id: number,
-  patch: { nonColorRate: number; colorRate: number; tipShare: number; separateColorSeal: boolean; active: boolean; newPin?: string },
+  patch: { nonColorRate: number; colorRate: number; tipShare: number; separateColorSeal: boolean; active: boolean; lineItemMarker?: string | null; newPin?: string },
 ): Promise<Result> {
   try {
     await requireAdmin()
@@ -193,6 +202,7 @@ export async function updateProfile(
       colorRate: rate(patch.colorRate),
       tipShare: rate(patch.tipShare),
       separateColorSeal: patch.separateColorSeal,
+      lineItemMarker: normalizeMarker(patch.lineItemMarker),
       active: patch.active,
       updatedAt: new Date(),
     }
@@ -208,7 +218,15 @@ export async function updateProfile(
   }
 }
 
-export async function createProfile(input: { name: string; pin: string; nonColorRate: number; colorRate: number; tipShare: number; separateColorSeal: boolean }): Promise<Result> {
+export async function createProfile(input: {
+  name: string
+  pin: string
+  nonColorRate: number
+  colorRate: number
+  tipShare: number
+  separateColorSeal: boolean
+  lineItemMarker?: string | null
+}): Promise<Result> {
   try {
     await requireAdmin()
     const name = input.name.trim()
@@ -221,6 +239,7 @@ export async function createProfile(input: { name: string; pin: string; nonColor
       colorRate: input.colorRate.toString(),
       tipShare: input.tipShare.toString(),
       separateColorSeal: input.separateColorSeal,
+      lineItemMarker: normalizeMarker(input.lineItemMarker),
       active: true,
     })
     revalidatePath("/admin")

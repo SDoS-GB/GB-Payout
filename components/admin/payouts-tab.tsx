@@ -12,6 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
+import { segmentLabel } from "@/lib/payout/segments"
 import { InlineMessage, StatusBadge, money, shortDate, shortDateTime } from "./shared"
 
 type PayoutItem = AdminDashboardData["payouts"][number]
@@ -233,6 +234,10 @@ function PayoutRows({
   const [note, setNote] = useState(p.adminNote ?? "")
   const b = (p.breakdown ?? {}) as Record<string, unknown>
   const warnings = Array.isArray(b.warnings) ? (b.warnings as string[]) : []
+  const segment = (b.segment ?? null) as { itemNames?: string[]; markerFields?: string[]; grossAmount?: number; itemDiscountAmount?: number; allocatedDiscountAmount?: number } | null
+  const jobWide = (b.job ?? null) as { jobTotal?: number; markers?: string[] } | null
+  const verification = (b.verification ?? null) as { balanced?: boolean; assignedItemCount?: number; itemCount?: number; doubleCountedItems?: number } | null
+  const label = segmentLabel(p.segmentKind, p.segmentMarker ?? jobWide?.markers?.join("/") ?? null)
 
   return (
     <>
@@ -251,7 +256,12 @@ function PayoutRows({
             <span className="text-xs text-muted-foreground">{p.job?.clientName ?? "—"} · {shortDate(p.job?.jobDateTime)}</span>
           </div>
         </TableCell>
-        <TableCell>{p.profileName}</TableCell>
+        <TableCell>
+          <div className="flex flex-col">
+            <span>{p.profileName}</span>
+            {label && <span className="font-mono text-xs text-muted-foreground">{label}</span>}
+          </div>
+        </TableCell>
         <TableCell>
           <div className="flex flex-col gap-1">
             <StatusBadge status={p.status} />
@@ -268,7 +278,19 @@ function PayoutRows({
           <TableCell colSpan={9} className="p-4">
             <div className="grid gap-4 md:grid-cols-3">
               <dl className="grid grid-cols-2 gap-x-3 gap-y-1 text-sm">
-                <dt className="text-muted-foreground">Job total</dt>
+                {label && (
+                  <>
+                    <dt className="text-muted-foreground">Paid on</dt>
+                    <dd className="text-right font-mono text-xs">{label}</dd>
+                    {jobWide?.jobTotal !== undefined && (
+                      <>
+                        <dt className="text-muted-foreground">Whole job</dt>
+                        <dd className="text-right tabular-nums text-muted-foreground">{money(jobWide.jobTotal)}</dd>
+                      </>
+                    )}
+                  </>
+                )}
+                <dt className="text-muted-foreground">{label ? "Commission base" : "Job total"}</dt>
                 <dd className="text-right tabular-nums">{money(p.jobTotal)}</dd>
                 <dt className="text-muted-foreground">Discount</dt>
                 <dd className="text-right tabular-nums">{money(p.discountAmount)}</dd>
@@ -300,6 +322,24 @@ function PayoutRows({
                 <dd className="text-right text-xs">{p.calcMode ?? "—"} · {p.splitCount} tech{p.splitCount === 1 ? "" : "s"}</dd>
               </dl>
               <div className="flex flex-col gap-2">
+                {label && segment && (
+                  <div className="rounded border bg-background p-2 text-xs">
+                    <p className="font-medium">
+                      {segment.itemNames?.length ?? 0} line item{(segment.itemNames?.length ?? 0) === 1 ? "" : "s"} · gross {money(segment.grossAmount ?? 0)}
+                      {(segment.itemDiscountAmount ?? 0) > 0 ? ` · item discounts ${money(segment.itemDiscountAmount ?? 0)}` : ""}
+                      {(segment.allocatedDiscountAmount ?? 0) > 0 ? ` · share of job discount ${money(segment.allocatedDiscountAmount ?? 0)}` : ""}
+                      {segment.markerFields?.length ? ` · marker found in ${segment.markerFields.join("/")}` : ""}
+                    </p>
+                    {segment.itemNames && segment.itemNames.length > 0 && <p className="mt-1 text-muted-foreground">{segment.itemNames.join(", ")}</p>}
+                    {verification && (
+                      <p className={verification.balanced ? "mt-1 text-muted-foreground" : "mt-1 text-destructive"}>
+                        {verification.balanced
+                          ? `Verified: ${verification.assignedItemCount}/${verification.itemCount} items assigned once, segments sum to the job total`
+                          : `Check failed: ${verification.doubleCountedItems ?? 0} item(s) double-counted or totals do not balance`}
+                      </p>
+                    )}
+                  </div>
+                )}
                 {warnings.length > 0 && (
                   <ul className="list-disc pl-4 text-xs text-amber-700 dark:text-amber-300">
                     {warnings.map((w) => (

@@ -55,7 +55,8 @@ export function TechnicianPayoutList({ data }: { data: Data }) {
                         #{p.job?.serialId ?? p.jobUuid.slice(0, 8)} · {p.job?.clientName ?? "Job"}
                       </span>
                       <span className="text-xs text-muted-foreground">
-                        {shortDate(p.job?.jobDateTime)} · job total {money(p.jobTotal)}
+                        {shortDate(p.job?.jobDateTime)} · {p.segmentKind === "dedicated" ? `your ${p.segmentMarker ?? "marked"} items` : p.segmentKind === "crew" ? "crew work" : "job total"}{" "}
+                        {money(p.jobTotal)}
                         {Number(p.colorSealTotal) > 0 ? ` · color seal ${money(p.colorSealTotal)}` : ""}
                         {tips > 0 ? ` · tips ${money(tips)}` : ""}
                       </span>

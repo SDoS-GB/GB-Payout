@@ -50,7 +50,7 @@ export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   channel: "workiz_note",
   template: [
     "Hi {{technician}}, your payout for job #{{jobSerial}} ({{clientName}}) is {{totalPayout}}.",
-    "Job total {{jobTotal}}{{discountLine}}{{colorSealLine}}{{tipLine}}.",
+    "Job total {{jobTotal}}{{segmentLine}}{{discountLine}}{{colorSealLine}}{{tipLine}}.",
     "Base {{basePayout}} + tip {{tipPayout}}. Status: {{status}}.",
   ].join(" "),
 }

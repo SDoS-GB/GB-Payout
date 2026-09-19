@@ -21,7 +21,8 @@ export function ProfilesTab({ profiles }: { profiles: Profile[] }) {
           <CardTitle className="text-base">Technician profiles</CardTitle>
           <CardDescription>
             Rates are fractions (0.25 = 25%). Tip share is the technician&apos;s share of a tip (0.5 when two techs split). &quot;Separate color seal&quot; off means the whole job is
-            paid at the non-color rate, exactly like the calculator does for Tim. PINs are stored hashed; enter a new one only to change it.
+            paid at the non-color rate, exactly like the calculator does for Tim. A line-item marker (e.g. <code className="font-mono">*T*</code>) means Workiz items containing that exact text are
+            paid to this technician only; the crew is paid on the rest and keeps the tips. PINs are stored hashed; enter a new one only to change it.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2">
@@ -46,6 +47,7 @@ function ProfileCard({ profile }: { profile: Profile }) {
     colorRate: Number(profile.colorRate),
     tipShare: Number(profile.tipShare),
     separateColorSeal: profile.separateColorSeal,
+    lineItemMarker: profile.lineItemMarker ?? "",
     active: profile.active,
     newPin: "",
   })
@@ -78,10 +80,13 @@ function ProfileCard({ profile }: { profile: Profile }) {
         <RateField label="Color" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
         <RateField label="Tip share" value={form.tipShare} onChange={(v) => setForm({ ...form, tipShare: v })} />
       </div>
-      <label className="flex items-center gap-2 text-sm">
-        <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
-        Separate color seal rate
-      </label>
+      <div className="flex items-end gap-3">
+        <label className="flex flex-1 items-center gap-2 text-sm">
+          <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
+          Separate color seal rate
+        </label>
+        <MarkerField id={`marker-${profile.id}`} value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
+      </div>
       <div className="flex items-end gap-2">
         <div className="flex flex-1 flex-col gap-1">
           <Label htmlFor={`pin-${profile.id}`} className="text-xs">
@@ -107,10 +112,23 @@ function RateField({ label, value, onChange }: { label: string; value: number; o
   )
 }
 
+function MarkerField({ id, value, onChange }: { id: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="flex w-32 flex-col gap-1">
+      <Label htmlFor={id} className="text-xs">
+        Line-item marker
+      </Label>
+      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none" className="font-mono" maxLength={16} spellCheck={false} />
+    </div>
+  )
+}
+
+const NEW_PROFILE = { name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true, lineItemMarker: "" }
+
 function NewProfileCard() {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
-  const [form, setForm] = useState({ name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true })
+  const [form, setForm] = useState(NEW_PROFILE)
   const [msg, setMsg] = useState<{ tone: "ok" | "error"; text: string } | null>(null)
 
   return (
@@ -129,7 +147,7 @@ function NewProfileCard() {
               const res = await createProfile(form)
               if (!res.ok) return setMsg({ tone: "error", text: res.error })
               setMsg({ tone: "ok", text: `Added ${form.name}` })
-              setForm({ name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true })
+              setForm(NEW_PROFILE)
               router.refresh()
             })
           }}
@@ -149,10 +167,13 @@ function NewProfileCard() {
             <RateField label="Color" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
             <RateField label="Tip share" value={form.tipShare} onChange={(v) => setForm({ ...form, tipShare: v })} />
           </div>
-          <label className="flex items-center gap-2 text-sm">
-            <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
-            Separate color seal rate
-          </label>
+          <div className="flex items-end gap-3">
+            <label className="flex flex-1 items-center gap-2 text-sm">
+              <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
+              Separate color seal rate
+            </label>
+            <MarkerField id="marker-new" value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
+          </div>
           <Button type="submit" size="sm" disabled={pending} className="self-start">
             Add technician
           </Button>

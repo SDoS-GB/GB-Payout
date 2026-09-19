@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { and, eq, inArray } from "drizzle-orm"
+import { and, eq, inArray, isNotNull } from "drizzle-orm"
 import { db } from "@/lib/db"
 import {
   payouts,
@@ -11,6 +11,9 @@ import type { WorkizSettings } from "@/lib/settings"
 import { isPayableStatus, type NormalizedJob } from "@/lib/workiz/normalize"
 import { CALC_VERSION, calcPayoutWithPaymentSplit, type SplitPayoutBreakdown } from "./calculator"
 import { profileToRates } from "./profiles"
+import { planSegments, type JobSegment, type MarkerOwner } from "./segments"
+
+export { planSegments, type MarkerOwner, type SegmentPlan } from "./segments"
 
 export type PayoutStatus = "pending" | "hold" | "ready" | "paid" | "void"
 
@@ -25,20 +28,25 @@ export type EngineResult = {
   notes: string[]
 }
 
+const round2 = (n: number) => Math.round(n * 100) / 100
+
 /**
  * Deterministic fingerprint of everything that influences a payout number.
  * If it does not change between syncs the payout row is left alone, which keeps
  * webhook + cron double-processing idempotent.
  */
-export function payoutInputHash(job: NormalizedJob, profile: TechnicianProfile, splitCount: number): string {
+export function payoutInputHash(segment: JobSegment, job: NormalizedJob, profile: TechnicianProfile, splitCount: number): string {
   const payload = {
     v: CALC_VERSION,
-    jobTotal: job.jobTotal,
-    colorSealTotal: job.colorSealTotal,
-    cardServiceAmount: job.cardServiceAmount,
-    nonCardServiceAmount: job.nonCardServiceAmount,
-    cardTipAmount: job.cardTipAmount,
-    nonCardTipAmount: job.nonCardTipAmount,
+    segment: segment.kind,
+    marker: segment.marker,
+    items: segment.itemIndexes,
+    jobTotal: segment.jobTotal,
+    colorSealTotal: segment.colorSealTotal,
+    cardServiceAmount: segment.cardServiceAmount,
+    nonCardServiceAmount: segment.nonCardServiceAmount,
+    cardTipAmount: segment.cardTipAmount,
+    nonCardTipAmount: segment.nonCardTipAmount,
     discount: job.discountAmount,
     status: job.status,
     fullyPaid: job.fullyPaid,
@@ -48,15 +56,16 @@ export function payoutInputHash(job: NormalizedJob, profile: TechnicianProfile, 
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex")
 }
 
-export function computeForProfile(job: NormalizedJob, profile: TechnicianProfile): SplitPayoutBreakdown {
+/** Runs the unchanged calculator formulas against one segment with the technician's saved rates. */
+export function computeForProfile(segment: JobSegment, profile: TechnicianProfile): SplitPayoutBreakdown {
   const rates = profileToRates(profile)
   return calcPayoutWithPaymentSplit(
     {
-      jobTotal: job.jobTotal,
-      colorSealTotal: job.colorSealTotal,
-      cardServiceAmount: job.cardServiceAmount,
-      cardTip: job.cardTipAmount,
-      nonCardOwedTip: job.nonCardTipAmount,
+      jobTotal: segment.jobTotal,
+      colorSealTotal: segment.colorSealTotal,
+      cardServiceAmount: segment.cardServiceAmount,
+      cardTip: segment.cardTipAmount,
+      nonCardOwedTip: segment.nonCardTipAmount,
     },
     { nonColorRate: rates.nonColorRate, colorRate: rates.colorRate },
     { separateColorSeal: rates.separateColorSeal, tipShare: rates.tipShare },
@@ -67,11 +76,11 @@ export function computeForProfile(job: NormalizedJob, profile: TechnicianProfile
  * Decide whether a payout is releasable. Returns null when it is, otherwise the
  * reason it must be held for admin review.
  */
-export function gateReason(job: NormalizedJob, settings: WorkizSettings): string | null {
+export function gateReason(job: NormalizedJob, settings: WorkizSettings, extraWarnings: string[] = []): string | null {
   if (!isPayableStatus(job.status, settings)) return `Job status "${job.status ?? "unknown"}" is not payable`
   if (!job.fullyPaid) return "Job is not fully paid"
   if (job.jobTotal <= 0) return "Job total is zero"
-  const blocking = job.warnings.filter((w) => !w.startsWith("No payment records"))
+  const blocking = [...job.warnings.filter((w) => !w.startsWith("No payment records")), ...extraWarnings]
   if (blocking.length) return blocking[0]
   return null
 }
@@ -106,6 +115,15 @@ async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook") {
   return { profiles, unmapped, mappingByProfile }
 }
 
+async function loadMarkerOwners(): Promise<MarkerOwner[]> {
+  return db
+    .select({ id: technicianProfiles.id, name: technicianProfiles.name, lineItemMarker: technicianProfiles.lineItemMarker })
+    .from(technicianProfiles)
+    .where(and(eq(technicianProfiles.active, true), isNotNull(technicianProfiles.lineItemMarker)))
+}
+
+const money = (n: number) => `$${n.toFixed(2)}`
+
 /**
  * Compute and persist payouts for every mapped technician on a job.
  * - Never touches rows already marked paid or void.
@@ -136,13 +154,24 @@ export async function upsertPayoutsForJob(
     return result
   }
 
-  const baseGate = gateReason(job, settings)
-  const splitCount = profiles.length
+  const plan = planSegments(job, profiles, await loadMarkerOwners())
+  if (plan.segmentation.segments.length > 1) {
+    result.notes.push(
+      plan.segmentation.segments
+        .map((s) => (s.kind === "dedicated" ? `${s.marker} work ${money(s.jobTotal)} (${s.itemIndexes.length} items)` : `crew work ${money(s.jobTotal)} (${s.itemIndexes.length} items, tips ${money(s.cardTipAmount + s.nonCardTipAmount)})`))
+        .join(" · "),
+    )
+  }
+  result.notes.push(...plan.warnings)
+
+  const baseGate = gateReason(job, settings, plan.warnings)
   const existing = await db.select().from(payouts).where(eq(payouts.jobUuid, job.uuid))
   const existingByProfile = new Map(existing.map((p) => [p.profileId, p]))
 
   for (const profile of profiles) {
-    const hash = payoutInputHash(job, profile, splitCount)
+    const segment = plan.segmentFor.get(profile.id) ?? plan.segmentation.segments[0]
+    const splitCount = plan.splitCountFor.get(profile.id) ?? profiles.length
+    const hash = payoutInputHash(segment, job, profile, splitCount)
     const prior = existingByProfile.get(profile.id)
 
     if (prior && (prior.status === "paid" || prior.status === "void")) {
@@ -157,10 +186,12 @@ export async function upsertPayoutsForJob(
       continue
     }
 
-    const breakdown = computeForProfile(job, profile)
+    const breakdown = computeForProfile(segment, profile)
     const holdReason = baseGate ?? (unmapped.length ? `Job has unmapped team members (${unmapped.join(", ")})` : null)
     const status: PayoutStatus = holdReason ? (isPayableStatus(job.status, settings) ? "hold" : "pending") : "ready"
     if (status === "hold") result.held++
+
+    const discountAmount = segment.kind === "job" ? job.discountAmount : round2(segment.itemDiscountAmount + segment.allocatedDiscountAmount)
 
     const values = {
       jobUuid: job.uuid,
@@ -168,13 +199,13 @@ export async function upsertPayoutsForJob(
       workizTeamId: mappingByProfile.get(profile.id) ?? null,
       status,
       holdReason,
-      jobTotal: job.jobTotal.toFixed(2),
-      discountAmount: job.discountAmount.toFixed(2),
-      colorSealTotal: job.colorSealTotal.toFixed(2),
-      cardServiceAmount: job.cardServiceAmount.toFixed(2),
-      nonCardServiceAmount: job.nonCardServiceAmount.toFixed(2),
-      cardTipAmount: job.cardTipAmount.toFixed(2),
-      nonCardTipAmount: job.nonCardTipAmount.toFixed(2),
+      jobTotal: segment.jobTotal.toFixed(2),
+      discountAmount: discountAmount.toFixed(2),
+      colorSealTotal: segment.colorSealTotal.toFixed(2),
+      cardServiceAmount: segment.cardServiceAmount.toFixed(2),
+      nonCardServiceAmount: segment.nonCardServiceAmount.toFixed(2),
+      cardTipAmount: segment.cardTipAmount.toFixed(2),
+      nonCardTipAmount: segment.nonCardTipAmount.toFixed(2),
       nonColorRate: profile.nonColorRate,
       colorRate: profile.colorRate,
       tipShare: profile.tipShare,
@@ -185,8 +216,32 @@ export async function upsertPayoutsForJob(
       totalPayout: breakdown.totalPayout.toFixed(4),
       splitCount,
       splitShare: "1",
+      segmentKind: segment.kind,
+      segmentMarker: segment.marker,
       calcMode: breakdown.mode,
-      breakdown: { ...breakdown, calcVersion: CALC_VERSION, warnings: job.warnings },
+      breakdown: {
+        ...breakdown,
+        calcVersion: CALC_VERSION,
+        warnings: [...job.warnings, ...plan.warnings],
+        segment: {
+          kind: segment.kind,
+          marker: segment.marker,
+          itemNames: segment.itemNames,
+          markerFields: segment.markerFields,
+          grossAmount: segment.grossAmount,
+          itemDiscountAmount: segment.itemDiscountAmount,
+          allocatedDiscountAmount: segment.allocatedDiscountAmount,
+          share: segment.share,
+        },
+        job: {
+          jobTotal: job.jobTotal,
+          colorSealTotal: job.colorSealTotal,
+          discountAmount: job.discountAmount,
+          cardServiceAmount: job.cardServiceAmount,
+          markers: plan.segmentation.segments.filter((s) => s.kind === "dedicated").map((s) => s.marker),
+        },
+        verification: plan.segmentation.verification,
+      },
       inputHash: hash,
       updatedAt: new Date(),
     }

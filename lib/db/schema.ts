@@ -19,6 +19,11 @@ export const technicianProfiles = pgTable("technician_profiles", {
   colorRate: numeric("color_rate", { precision: 8, scale: 6 }).notNull(),
   tipShare: numeric("tip_share", { precision: 8, scale: 6 }).notNull(),
   separateColorSeal: boolean("separate_color_seal").notNull().default(true),
+  /**
+   * Literal text (e.g. "*T*") that, when present in a Workiz line item, assigns
+   * that item exclusively to this technician. Null for regular crew members.
+   */
+  lineItemMarker: text("line_item_marker"),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
@@ -118,6 +123,9 @@ export const payouts = pgTable(
     totalPayout: numeric("total_payout", { precision: 12, scale: 4 }).notNull().default("0"),
     splitCount: integer("split_count").notNull().default(1),
     splitShare: numeric("split_share", { precision: 8, scale: 6 }).notNull().default("1"),
+    /** "job" = whole job, "dedicated" = marked items only, "crew" = everything except marked items. */
+    segmentKind: text("segment_kind").notNull().default("job"),
+    segmentMarker: text("segment_marker"),
     calcMode: text("calc_mode"),
     breakdown: jsonb("breakdown"),
     inputHash: text("input_hash"),
@@ -167,6 +175,8 @@ export const syncEvents = pgTable("sync_events", {
 export type NormalizedLineItem = {
   id: string | null
   name: string
+  /** Secondary text field from Workiz (Description/Notes) when it differs from the name; searched for technician markers. */
+  description?: string | null
   quantity: number
   unitPrice: number
   total: number
