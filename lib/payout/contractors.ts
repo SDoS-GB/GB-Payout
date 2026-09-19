@@ -31,9 +31,10 @@ export function legacyProfileOptions(name: string) {
 }
 
 /**
- * Literal line-item markers used by dispatch in Workiz to assign an item to one
- * technician. Only seeded for new profiles; admins edit them in the Technicians tab.
+ * Line-item marker tokens dispatch types at the start of a Workiz item to assign
+ * it to one technician (`*T* Grout repair`, `(Tim) Regrout`). Only seeded for new
+ * profiles; admins edit them in the Technicians tab.
  */
 export const LINE_ITEM_MARKERS: Partial<Record<ContractorName, string>> = {
-  Tim: "*T*",
+  Tim: "T, Tim",
 }

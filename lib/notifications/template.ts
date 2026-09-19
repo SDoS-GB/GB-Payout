@@ -1,6 +1,7 @@
 import type { PayoutRow, TechnicianProfile, WorkizJobRow } from "@/lib/db/schema"
 import { formatCurrency } from "@/lib/payout/calculator"
 import { payoutMoney } from "@/lib/payout/money"
+import { markerLabel } from "@/lib/payout/segments"
 
 export type TemplateContext = {
   technician: string
@@ -24,7 +25,7 @@ export function buildTemplateContext(payout: PayoutRow, profile: TechnicianProfi
   const m = payoutMoney(payout)
   const tipTotal = m.cardTip + m.nonCardTip
   const jobMarkers = (payout.breakdown as { job?: { markers?: string[] } } | null)?.job?.markers ?? []
-  const marker = payout.segmentMarker ?? (jobMarkers.length ? jobMarkers.join("/") : null)
+  const marker = markerLabel(payout.segmentMarker) ?? (jobMarkers.length ? jobMarkers.map((m) => markerLabel(m) ?? m).join("/") : null)
   let segmentLine = ""
   if (payout.segmentKind === "dedicated") segmentLine = ` for your ${marker ?? "marked"} items`
   else if (payout.segmentKind === "crew") segmentLine = marker ? ` for crew work (excl. ${marker})` : " for crew work"

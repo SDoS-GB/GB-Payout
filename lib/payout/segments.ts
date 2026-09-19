@@ -4,9 +4,9 @@ import type { NormalizedLineItem } from "@/lib/db/schema"
  * Splits one Workiz job into the commission bases each technician is paid on.
  *
  * A job can carry work for the regular crew and, on the same invoice, separate
- * work performed by a "dedicated" technician (Tim). Line items that contain that
- * technician's literal marker (e.g. `*T*`) belong exclusively to him; everything
- * else is crew work. Each line item lands in exactly one segment and the
+ * work performed by a "dedicated" technician (Tim). Line items that start with
+ * that technician's marker token (`*T* Grout repair`, `(Tim) Regrout`, `T caulk`)
+ * belong exclusively to him; everything else is crew work. Each line item lands in exactly one segment and the
  * segments always add back up to the job's post-discount service total, so no
  * dollar is ever counted in two commission bases.
  *
@@ -73,14 +73,75 @@ const round2 = (n: number) => Math.round(n * 100) / 100
 const BALANCE_TOLERANCE = 0.011
 
 /**
- * Literal, case-sensitive containment test. `*T*` matches the three characters
- * asterisk-T-asterisk; it is never treated as a wildcard.
+ * A profile's marker is a short list of tokens (`T, Tim`). Dispatch decorates a
+ * token however they like when typing the line item, so `*T*`, `*T`, `T`, `(T)`,
+ * `[Tim]`, `T:` and `T -` are all the same marker. Decoration typed into the
+ * profile field is ignored: `*T*` and `T` configure the same token.
+ */
+export function parseMarkerTokens(marker: string | null | undefined): string[] {
+  if (!marker) return []
+  const tokens = marker
+    .split(/[,;/|]+/)
+    .map((t) => t.trim().replace(/^[^A-Za-z0-9]+|[^A-Za-z0-9]+$/g, ""))
+    .filter(Boolean)
+  return Array.from(new Set(tokens.map((t) => t.toLowerCase()))).map((lower) => tokens.find((t) => t.toLowerCase() === lower) as string)
+}
+
+/** Canonical stored form of a marker field: tokens joined as `T, Tim`. */
+export function normalizeMarkerTokens(marker: string | null | undefined): string | null {
+  const tokens = parseMarkerTokens(marker)
+  return tokens.length ? tokens.join(", ") : null
+}
+
+/** How a marker is shown to people: its first token in the `*T*` house style. */
+export function markerLabel(marker: string | null | undefined): string | null {
+  const [first] = parseMarkerTokens(marker)
+  return first ? `*${first}*` : null
+}
+
+const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+/** A regex character class from literal characters; only `\ ] ^ -` are special inside brackets. */
+const charClass = (chars: string) => `[${chars.replace(/[\\\]^-]/g, "\\$&")}]`
+
+const OPENERS = charClass("*([{<")
+const WRAP_CLOSERS = charClass("*)]}>")
+const TERMINATORS = charClass("*)]}>:.,|-\u2013\u2014")
+
+const patternCache = new Map<string, { prefix: RegExp; wrapped: RegExp }>()
+
+function patternsFor(token: string) {
+  const key = token.toLowerCase()
+  let p = patternCache.get(key)
+  if (!p) {
+    const t = escapeRegExp(token)
+    p = {
+      // Start of the text: optional opener(s), the token, then a terminator, whitespace or the end.
+      // The terminator is what keeps `T` from matching "Tile" and `Tim` from matching "Tim's".
+      prefix: new RegExp(`^\\s*${OPENERS}*\\s*${t}(?=\\s*(?:${TERMINATORS}|\\s|$))`, "i"),
+      // Fully wrapped forms (`*T*`, `(Tim)`) are unambiguous, so accept them anywhere in the text.
+      wrapped: new RegExp(`${OPENERS}\\s*${t}\\s*${WRAP_CLOSERS}`, "i"),
+    }
+    patternCache.set(key, p)
+  }
+  return p
+}
+
+function textHasToken(text: string | null | undefined, token: string): boolean {
+  if (!text) return false
+  const { prefix, wrapped } = patternsFor(token)
+  return prefix.test(text) || wrapped.test(text)
+}
+
+/**
+ * Which Workiz field, if any, carries this marker. The item name is checked
+ * first, then the description, because dispatch types the marker at the start
+ * of whichever field they are writing the work into.
  */
 export function findMarker(item: Pick<NormalizedLineItem, "name" | "description">, marker: string): MarkerField | null {
-  const m = marker.trim()
-  if (!m) return null
-  if (item.name.includes(m)) return "name"
-  if (item.description && item.description.includes(m)) return "description"
+  const tokens = parseMarkerTokens(marker)
+  if (tokens.length === 0) return null
+  if (tokens.some((t) => textHasToken(item.name, t))) return "name"
+  if (tokens.some((t) => textHasToken(item.description, t))) return "description"
   return null
 }
 
@@ -167,7 +228,9 @@ export function segmentJob(job: SegmentableJob, markers: string[]): Segmentation
   job.lineItems.forEach((item, index) => {
     const hits = uniqueMarkers.map((m) => ({ marker: m, field: findMarker(item, m) })).filter((h): h is { marker: string; field: MarkerField } => h.field !== null)
     if (hits.length > 1) {
-      warnings.push(`Line item "${item.name}" carries more than one technician marker (${hits.map((h) => h.marker).join(", ")}); assigned to ${hits[0].marker}`)
+      warnings.push(
+        `Line item "${item.name}" carries more than one technician marker (${hits.map((h) => markerLabel(h.marker) ?? h.marker).join(", ")}); assigned to ${markerLabel(hits[0].marker) ?? hits[0].marker}`,
+      )
     }
     const bucket = hits.length ? (dedicated.get(hits[0].marker) as Bucket) : crew
     bucket.indexes.push(index)
@@ -266,7 +329,8 @@ export type SegmentPlan = {
   warnings: string[]
 }
 
-const markerOf = (p: PlannableProfile) => p.lineItemMarker?.trim() || null
+const markerOf = (p: PlannableProfile) => normalizeMarkerTokens(p.lineItemMarker)
+const shown = (marker: string) => markerLabel(marker) ?? marker
 
 /**
  * Decide who is paid on what.
@@ -290,7 +354,7 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
     ownersByMarker.set(m, [...(ownersByMarker.get(m) ?? []), p.name])
   }
   for (const [m, names] of ownersByMarker) {
-    if (names.length > 1) warnings.push(`Marker ${m} is assigned to more than one technician on this job (${names.join(", ")})`)
+    if (names.length > 1) warnings.push(`Marker ${shown(m)} is assigned to more than one technician on this job (${names.join(", ")})`)
   }
 
   const onJobIds = new Set(onJob.map((p) => p.id))
@@ -299,7 +363,7 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
     if (!m || onJobIds.has(owner.id)) continue
     const hits = itemsWithMarker(job.lineItems, m)
     if (hits.length) {
-      warnings.push(`${hits.length} line item${hits.length === 1 ? "" : "s"} carry ${m} but ${owner.name} is not assigned to this job: ${hits.map((i) => i.name).join(", ")}`)
+      warnings.push(`${hits.length} line item${hits.length === 1 ? "" : "s"} carry ${shown(m)} but ${owner.name} is not assigned to this job: ${hits.map((i) => i.name).join(", ")}`)
     }
   }
 
@@ -322,7 +386,7 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
   for (const p of dedicated) {
     const m = markerOf(p) as string
     const seg = segmentation.segments.find((s) => s.kind === "dedicated" && s.marker === m) as JobSegment
-    if (seg.itemIndexes.length === 0) warnings.push(`${p.name} is assigned to this job but no line items carry ${m}`)
+    if (seg.itemIndexes.length === 0) warnings.push(`${p.name} is assigned to this job but no line items carry ${shown(m)}`)
     segmentFor.set(p.id, seg)
     splitCountFor.set(p.id, ownersByMarker.get(m)?.length ?? 1)
   }
@@ -339,7 +403,8 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
 
 /** Short human label for a payout's commission base. */
 export function segmentLabel(kind: string | null | undefined, marker: string | null | undefined): string | null {
-  if (kind === "dedicated") return `${marker ?? "Marked"} work only`
-  if (kind === "crew") return marker ? `Crew work (excl. ${marker})` : "Crew work"
+  const label = markerLabel(marker)
+  if (kind === "dedicated") return `${label ?? "Marked"} work only`
+  if (kind === "crew") return label ? `Crew work (excl. ${label})` : "Crew work"
   return null
 }

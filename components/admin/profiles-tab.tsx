@@ -21,8 +21,9 @@ export function ProfilesTab({ profiles }: { profiles: Profile[] }) {
           <CardTitle className="text-base">Technician profiles</CardTitle>
           <CardDescription>
             Rates are fractions (0.25 = 25%). Tip share is the technician&apos;s share of a tip (0.5 when two techs split). &quot;Separate color seal&quot; off means the whole job is
-            paid at the non-color rate, exactly like the calculator does for Tim. A line-item marker (e.g. <code className="font-mono">*T*</code>) means Workiz items containing that exact text are
-            paid to this technician only; the crew is paid on the rest and keeps the tips. PINs are stored hashed; enter a new one only to change it.
+            paid at the non-color rate, exactly like the calculator does for Tim. Line-item marker tokens (e.g. <code className="font-mono">T, Tim</code>) assign a Workiz item that starts with one of them to
+            this technician only; <code className="font-mono">*T*</code>, <code className="font-mono">*T</code>, <code className="font-mono">T</code>, <code className="font-mono">(T)</code> and{" "}
+            <code className="font-mono">(Tim)</code> all count. The crew is paid on the rest and keeps the tips. PINs are stored hashed; enter a new one only to change it.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2">
@@ -114,11 +115,11 @@ function RateField({ label, value, onChange }: { label: string; value: number; o
 
 function MarkerField({ id, value, onChange }: { id: string; value: string; onChange: (v: string) => void }) {
   return (
-    <div className="flex w-32 flex-col gap-1">
+    <div className="flex w-40 flex-col gap-1">
       <Label htmlFor={id} className="text-xs">
-        Line-item marker
+        Marker tokens
       </Label>
-      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none" className="font-mono" maxLength={16} spellCheck={false} />
+      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none (e.g. T, Tim)" className="font-mono" maxLength={60} spellCheck={false} />
     </div>
   )
 }

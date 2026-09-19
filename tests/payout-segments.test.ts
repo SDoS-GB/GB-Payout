@@ -1,13 +1,13 @@
 import { describe, expect, it } from "vitest"
 import { CARD_FEE_MULTIPLIER, calcPayoutWithPaymentSplit } from "@/lib/payout/calculator"
-import { findMarker, planSegments, segmentJob, type JobSegment } from "@/lib/payout/segments"
+import { findMarker, markerLabel, normalizeMarkerTokens, parseMarkerTokens, planSegments, segmentJob, type JobSegment } from "@/lib/payout/segments"
 import { DEFAULT_WORKIZ_SETTINGS } from "@/lib/settings"
 import { normalizeJob } from "@/lib/workiz/normalize"
 
 const settings = DEFAULT_WORKIZ_SETTINGS
 const noCatalog = new Map<string, boolean>()
 
-const TIM = { id: 5, name: "Tim", lineItemMarker: "*T*", nonColorRate: "0.8", colorRate: "0.8", tipShare: "1", separateColorSeal: false }
+const TIM = { id: 5, name: "Tim", lineItemMarker: "T, Tim", nonColorRate: "0.8", colorRate: "0.8", tipShare: "1", separateColorSeal: false }
 const VADIM = { id: 1, name: "Vadim", lineItemMarker: null, nonColorRate: "0.25", colorRate: "0.25", tipShare: "0.5", separateColorSeal: true }
 const DENIS = { id: 2, name: "Denis", lineItemMarker: null, nonColorRate: "0.2", colorRate: "0.25", tipShare: "0.5", separateColorSeal: true }
 
@@ -23,7 +23,7 @@ const payFor = (seg: JobSegment, p: typeof TIM | typeof VADIM) =>
 /**
  * One invoice, one customer payment, two kinds of work:
  *   crew:  door 800 + color seal 200          = 1000 gross
- *   Tim:   grout *T* 400 + color seal *T* 100 =  500 gross
+ *   Tim:   *T* grout 400 + (Tim) color seal 100 = 500 gross
  *   whole-job discount 100 -> SubTotal 1400; paid 1000 card + 400 Zelle; tips 60 card + 40 cash (recorded).
  */
 const mixedJob = () =>
@@ -43,8 +43,8 @@ const mixedJob = () =>
       Items: [
         { Name: "Frameless shower door", Price: 800, Quantity: 1 },
         { Name: "Color Seal upgrade", Price: 200, Quantity: 1 },
-        { Name: "Grout repair *T*", Price: 400, Quantity: 1 },
-        { Name: "Color Seal *T* shower floor", Price: 100, Quantity: 1 },
+        { Name: "*T* Grout repair in bathroom", Price: 400, Quantity: 1 },
+        { Name: "(Tim) Color Seal shower floor", Price: 100, Quantity: 1 },
       ],
       Payments: [
         { Amount: 1000, Method: "Visa" },
@@ -58,12 +58,36 @@ const mixedJob = () =>
   )
 
 describe("marker matching", () => {
-  it("matches the literal asterisks, never a wildcard", () => {
-    expect(findMarker({ name: "Grout repair *T*", description: null }, "*T*")).toBe("name")
-    expect(findMarker({ name: "Tile work T", description: null }, "*T*")).toBeNull()
-    expect(findMarker({ name: "Tim's shower", description: null }, "*T*")).toBeNull()
-    expect(findMarker({ name: "Bracket *TT*", description: null }, "*T*")).toBeNull()
-    expect(findMarker({ name: "Regrout", description: null }, "*t*")).toBeNull()
+  const name = (n: string) => ({ name: n, description: null })
+
+  it("accepts every way dispatch writes the marker at the start of the item", () => {
+    for (const n of ["*T* Grout repair in bathroom", "*T Grout repair", "T Grout repair", "(T) Grout repair", "(Tim) Grout repair", "T: regrout", "T - caulk", "[Tim] shower floor", "  *T*Regrout", "t grout"]) {
+      expect(findMarker(name(n), "T, Tim"), n).toBe("name")
+    }
+  })
+
+  it("does not fire on words that merely begin with the token", () => {
+    for (const n of ["Tile work", "Tim's shower door", "Timer install", "Trim and caulk", "Bracket *TT*", "Toilet reset T-bolt"]) {
+      expect(findMarker(name(n), "T, Tim"), n).toBeNull()
+    }
+  })
+
+  it("only accepts a bare token at the start, but a wrapped one anywhere", () => {
+    expect(findMarker(name("Grout repair T"), "T")).toBeNull()
+    expect(findMarker(name("Grout repair Tim"), "T, Tim")).toBeNull()
+    expect(findMarker(name("Grout repair *T*"), "T")).toBe("name")
+    expect(findMarker(name("Regrout shower (Tim)"), "T, Tim")).toBe("name")
+  })
+
+  it("ignores decoration typed into the profile field and normalizes tokens", () => {
+    expect(parseMarkerTokens("*T*")).toEqual(["T"])
+    expect(parseMarkerTokens(" (T) , Tim ; tim")).toEqual(["T", "Tim"])
+    expect(parseMarkerTokens("***")).toEqual([])
+    expect(normalizeMarkerTokens("*T*, (Tim)")).toBe("T, Tim")
+    expect(normalizeMarkerTokens("  ")).toBeNull()
+    expect(markerLabel("T, Tim")).toBe("*T*")
+    expect(markerLabel(null)).toBeNull()
+    expect(findMarker(name("*T* Grout"), "*T*")).toBe("name")
   })
 
   it("finds the marker in the Description field and records where it was found", () => {
@@ -83,7 +107,7 @@ describe("marker matching", () => {
       noCatalog,
     )
     expect(job.lineItems[1].description).toBe("*T* upstairs bath")
-    const { segments } = segmentJob(job, ["*T*"])
+    const { segments } = segmentJob(job, [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     expect(tim.itemNames).toEqual(["Grout repair"])
     expect(tim.markerFields).toEqual(["description"])
@@ -94,7 +118,7 @@ describe("marker matching", () => {
 describe("segmentJob – Tim + crew on one invoice", () => {
   it("assigns every item to exactly one segment and the segments sum to the job total", () => {
     const job = mixedJob()
-    const { segments, verification, warnings } = segmentJob(job, ["*T*"])
+    const { segments, verification, warnings } = segmentJob(job, [TIM.lineItemMarker])
     expect(warnings).toEqual([])
     expect(verification.balanced).toBe(true)
     expect(verification.doubleCountedItems).toBe(0)
@@ -109,7 +133,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
   })
 
   it("allocates the whole-job discount proportionally", () => {
-    const { segments } = segmentJob(mixedJob(), ["*T*"])
+    const { segments } = segmentJob(mixedJob(), [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     const crew = segments.find((s) => s.kind === "crew")!
     // 100 discount over 1500 gross: Tim 500 -> 466.67, crew 1000 -> 933.33
@@ -123,7 +147,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
     const job = mixedJob()
     // Whole-job color seal counts both color items (300 gross scaled to 280).
     expect(job.colorSealTotal).toBe(280)
-    const { segments } = segmentJob(job, ["*T*"])
+    const { segments } = segmentJob(job, [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     const crew = segments.find((s) => s.kind === "crew")!
     // Crew color seal is only its own 200 item after the discount ratio.
@@ -133,7 +157,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
   })
 
   it("allocates the card-paid portion proportionally and gives tips to the crew only", () => {
-    const { segments } = segmentJob(mixedJob(), ["*T*"])
+    const { segments } = segmentJob(mixedJob(), [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     const crew = segments.find((s) => s.kind === "crew")!
     expect(tim.cardServiceAmount + crew.cardServiceAmount).toBeCloseTo(1000, 2)
@@ -148,7 +172,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
   })
 
   it("pays Tim 80% of his marked work with the card fee only on his card share, and no tip", () => {
-    const { segments } = segmentJob(mixedJob(), ["*T*"])
+    const { segments } = segmentJob(mixedJob(), [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     const result = payFor(tim, TIM)
     const expected = 333.34 * CARD_FEE_MULTIPLIER * 0.8 + 133.33 * 0.8
@@ -160,7 +184,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
   })
 
   it("pays each crew member their own rates on crew work only, splitting the tip two ways", () => {
-    const { segments } = segmentJob(mixedJob(), ["*T*"])
+    const { segments } = segmentJob(mixedJob(), [TIM.lineItemMarker])
     const crew = segments.find((s) => s.kind === "crew")!
 
     const vadim = payFor(crew, VADIM)
@@ -197,7 +221,7 @@ describe("segmentJob – Tim + crew on one invoice", () => {
       noCatalog,
     )
     expect(job.jobTotal).toBe(1260)
-    const { segments, verification } = segmentJob(job, ["*T*"])
+    const { segments, verification } = segmentJob(job, [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
     const crew = segments.find((s) => s.kind === "crew")!
     // Tim's base is 500 - 100 = 400; pool 1400; the unmarked 140 is spread 400:1000.

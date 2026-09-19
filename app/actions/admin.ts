@@ -15,6 +15,7 @@ import {
 import { notifyPayout } from "@/lib/notifications/send"
 import { buildTemplateContext, renderTemplate } from "@/lib/notifications/template"
 import { listProfiles } from "@/lib/payout/profiles"
+import { parseMarkerTokens } from "@/lib/payout/segments"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
 import {
@@ -178,13 +179,17 @@ export async function addManualTeamMapping(workizTeamId: string, workizName: str
 
 // --- Technician profiles -----------------------------------------------------
 
-/** Literal marker text; stored trimmed, or null when blank. */
+/** Marker tokens (`T, Tim`); decoration like `*T*` is stripped. Null when blank. */
 function normalizeMarker(input: string | null | undefined): string | null {
-  const m = (input ?? "").trim()
-  if (!m) return null
-  if (m.length > 16) throw new Error("Line-item marker must be 16 characters or fewer")
-  if (/\s/.test(m)) throw new Error("Line-item marker cannot contain spaces")
-  return m
+  if (!(input ?? "").trim()) return null
+  const tokens = parseMarkerTokens(input)
+  if (tokens.length === 0) throw new Error("Line-item marker needs at least one letter or digit (e.g. T or T, Tim)")
+  if (tokens.length > 4) throw new Error("Use at most 4 marker tokens")
+  for (const t of tokens) {
+    if (t.length > 12) throw new Error(`Marker token "${t}" must be 12 characters or fewer`)
+    if (!/^[A-Za-z0-9]+$/.test(t)) throw new Error(`Marker token "${t}" may only contain letters and digits`)
+  }
+  return tokens.join(", ")
 }
 
 export async function updateProfile(
