@@ -279,6 +279,9 @@ export default function PayoutCalculator() {
             <Button onClick={handleLogin} className="w-full h-14 text-lg font-semibold" size="lg">
               Login
             </Button>
+            <Link href="/admin/login" className="block text-center text-sm text-muted-foreground hover:underline">
+              Admin
+            </Link>
           </CardContent>
         </Card>
         <Toaster />
