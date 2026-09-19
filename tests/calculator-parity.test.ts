@@ -55,14 +55,24 @@ function legacyCalcJobPayout(job: LegacyJob, contractorName: string, selectedCon
 const AMOUNTS = ["0", "1", "0.01", "99.99", "100", "123.45", "500", "900", "1000", "1487.16", "2333.33", "4999.97", "10000"]
 const TIPS = ["0", "1", "0.01", "20", "50", "100", "156.15", "333.33"]
 
+const LEGACY_NAMES = Object.keys(LEGACY_CONTRACTORS) as (keyof typeof LEGACY_CONTRACTORS)[]
+
 describe("contractor constants are unchanged", () => {
-  it("matches the frozen table exactly", () => {
-    expect(CONTRACTORS).toEqual(LEGACY_CONTRACTORS)
+  it("every legacy technician still matches the frozen table exactly", () => {
+    expect(CONTRACTORS).toMatchObject(LEGACY_CONTRACTORS)
+  })
+
+  it("Daniel was added on Arthur's commission and is the only addition", () => {
+    const { pin: _daniel, ...danielRates } = CONTRACTORS.Daniel
+    const { pin: _arthur, ...arthurRates } = CONTRACTORS.Arthur
+    expect(danielRates).toEqual(arthurRates)
+    expect(legacyProfileOptions("Daniel")).toEqual(legacyProfileOptions("Arthur"))
+    expect(CONTRACTOR_NAMES.filter((n) => !(n in LEGACY_CONTRACTORS))).toEqual(["Daniel"])
   })
 })
 
 describe("calcLegacyJobPayout is bit-identical to the original calcJobPayout", () => {
-  for (const name of CONTRACTOR_NAMES) {
+  for (const name of LEGACY_NAMES) {
     it(`parity for ${name} across the input grid (all-card and all-non-card)`, () => {
       let checked = 0
       for (const jobTotal of AMOUNTS) {

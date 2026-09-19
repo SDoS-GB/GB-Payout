@@ -1,7 +1,8 @@
 /**
  * Technician profiles that the manual payout calculator has always used.
  * Moved verbatim out of app/page.tsx so the server-side Workiz payout engine
- * and the calculator share one source of truth. Values are unchanged.
+ * and the calculator share one source of truth. Legacy values are unchanged;
+ * Daniel was added later on the same commission as Arthur.
  */
 export const CONTRACTORS = {
   Vadim: { pin: "4826", nonColorRate: 0.25, colorRate: 0.25 },
@@ -11,6 +12,7 @@ export const CONTRACTORS = {
   Tim: { pin: "4496", nonColorRate: 0.8, colorRate: 0.8 },
   Alex: { pin: "8254", nonColorRate: 0.2, colorRate: 0.25 },
   Rodion: { pin: "8585", nonColorRate: 0.2, colorRate: 0.25 },
+  Daniel: { pin: "1468", nonColorRate: 0.2, colorRate: 0.25 },
 } as const
 
 export type ContractorName = keyof typeof CONTRACTORS
