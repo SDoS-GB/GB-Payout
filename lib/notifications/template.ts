@@ -1,6 +1,6 @@
 import type { PayoutRow, TechnicianProfile, WorkizJobRow } from "@/lib/db/schema"
 import { formatCurrency } from "@/lib/payout/calculator"
-import { payoutMoney } from "@/lib/payout/engine"
+import { payoutMoney } from "@/lib/payout/money"
 
 export type TemplateContext = {
   technician: string

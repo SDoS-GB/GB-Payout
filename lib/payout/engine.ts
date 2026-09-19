@@ -5,7 +5,6 @@ import {
   payouts,
   technicianProfiles,
   workizTeamMappings,
-  type PayoutRow,
   type TechnicianProfile,
 } from "@/lib/db/schema"
 import type { WorkizSettings } from "@/lib/settings"
@@ -206,19 +205,4 @@ export async function upsertPayoutsForJob(
   return result
 }
 
-export function payoutMoney(row: PayoutRow) {
-  return {
-    total: Number(row.totalPayout),
-    base: Number(row.basePayout),
-    tip: Number(row.tipPayout),
-    nonColor: Number(row.nonColorPayout),
-    color: Number(row.colorPayout),
-    jobTotal: Number(row.jobTotal),
-    colorSeal: Number(row.colorSealTotal),
-    discount: Number(row.discountAmount),
-    cardService: Number(row.cardServiceAmount),
-    nonCardService: Number(row.nonCardServiceAmount),
-    cardTip: Number(row.cardTipAmount),
-    nonCardTip: Number(row.nonCardTipAmount),
-  }
-}
+export { payoutMoney } from "./money"

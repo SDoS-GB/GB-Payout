@@ -38,7 +38,7 @@ export function AdminLoginForm({ needsBootstrap, bootstrapAvailable }: { needsBo
           <ShieldCheck className="h-6 w-6" />
         </div>
         <CardTitle className="text-2xl">Admin sign in</CardTitle>
-        <CardDescription>Workiz payout automation for Glass Brothers</CardDescription>
+        <CardDescription>Workiz payout automation for Grout Brothers</CardDescription>
       </CardHeader>
       <CardContent>
         <form onSubmit={submit} className="flex flex-col gap-4">
