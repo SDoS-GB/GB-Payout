@@ -33,7 +33,7 @@ import {
   saveWorkizSettings,
   type NotificationSettings,
 } from "@/lib/settings"
-import { WorkizClient } from "@/lib/workiz/client"
+import { WorkizApiError, WorkizClient } from "@/lib/workiz/client"
 import { parseWorkizDate } from "@/lib/workiz/time"
 import { logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
 
@@ -111,7 +111,8 @@ export async function probeWorkiz(): Promise<Result<Awaited<ReturnType<WorkizCli
     await logSyncEvent("probe", { ok: true, summary: `Workiz reachable in ${data.latencyMs}ms · ${data.teamCount} team members`, details: data })
     return { ok: true, data }
   } catch (err) {
-    await logSyncEvent("probe", { ok: false, summary: `Workiz probe failed: ${err instanceof Error ? err.message : String(err)}` })
+    const details = err instanceof WorkizApiError ? { status: err.status, endpoint: err.endpoint, response: err.body ?? null } : undefined
+    await logSyncEvent("probe", { ok: false, summary: `Workiz probe failed: ${err instanceof Error ? err.message : String(err)}`, details })
     return fail(err)
   }
 }
@@ -626,6 +627,9 @@ export async function loadAdminDashboard() {
     workiz: {
       hasApiToken: Boolean(workiz.apiToken),
       hasApiSecret: Boolean(workiz.apiSecret),
+      // Format-only checks so the UI can flag a paste into the wrong box without exposing the values.
+      apiTokenLooksValid: /^api_[A-Za-z0-9]{8,}$/.test(workiz.apiToken),
+      apiSecretLooksValid: /^sec_[A-Za-z0-9]{8,}$/.test(workiz.apiSecret),
       hasWebhookSecret: Boolean(workiz.webhookSecret),
       webhookSecret: workiz.webhookSecret,
       payableStatuses: workiz.payableStatuses,

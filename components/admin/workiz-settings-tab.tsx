@@ -56,8 +56,12 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
               </CardDescription>
             </div>
             <div className="flex items-center gap-2">
-              <Badge variant={workiz.hasApiToken ? "default" : "outline"}>{workiz.hasApiToken ? "Token set" : "No token"}</Badge>
-              <Badge variant={workiz.hasApiSecret ? "default" : "outline"}>{workiz.hasApiSecret ? "Secret set" : "No secret"}</Badge>
+              <Badge variant={!workiz.hasApiToken ? "outline" : workiz.apiTokenLooksValid ? "default" : "destructive"}>
+                {!workiz.hasApiToken ? "No token" : workiz.apiTokenLooksValid ? "Token set" : "Token looks wrong"}
+              </Badge>
+              <Badge variant={!workiz.hasApiSecret ? "outline" : workiz.apiSecretLooksValid ? "default" : "destructive"}>
+                {!workiz.hasApiSecret ? "No secret" : workiz.apiSecretLooksValid ? "Secret set" : "Secret looks wrong"}
+              </Badge>
             </div>
           </div>
         </CardHeader>
@@ -81,13 +85,39 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
                 <Label htmlFor="api-token" className="text-xs">
                   API token {workiz.hasApiToken && <span className="text-muted-foreground">(leave blank to keep)</span>}
                 </Label>
-                <Input id="api-token" type="password" autoComplete="off" value={form.apiToken} onChange={(e) => setForm({ ...form, apiToken: e.target.value })} placeholder={workiz.hasApiToken ? "••••••••" : "api_xxx"} />
+                <Input
+                  id="api-token"
+                  type="password"
+                  autoComplete="off"
+                  value={form.apiToken}
+                  onChange={(e) => setForm({ ...form, apiToken: e.target.value })}
+                  placeholder={workiz.hasApiToken ? "••••••••" : "api_xxx"}
+                  aria-describedby={workiz.hasApiToken && !workiz.apiTokenLooksValid ? "api-token-warning" : undefined}
+                />
+                {workiz.hasApiToken && !workiz.apiTokenLooksValid && (
+                  <span id="api-token-warning" className="text-xs text-destructive">
+                    The saved token does not look like a Workiz API token (they start with <code>api_</code>). Copy it from Workiz → Settings → Integrations → Developer and paste it here.
+                  </span>
+                )}
               </div>
               <div className="flex flex-col gap-1">
                 <Label htmlFor="api-secret" className="text-xs">
                   API secret {workiz.hasApiSecret && <span className="text-muted-foreground">(leave blank to keep)</span>}
                 </Label>
-                <Input id="api-secret" type="password" autoComplete="off" value={form.apiSecret} onChange={(e) => setForm({ ...form, apiSecret: e.target.value })} placeholder={workiz.hasApiSecret ? "••••••••" : "sec_xxx"} />
+                <Input
+                  id="api-secret"
+                  type="password"
+                  autoComplete="off"
+                  value={form.apiSecret}
+                  onChange={(e) => setForm({ ...form, apiSecret: e.target.value })}
+                  placeholder={workiz.hasApiSecret ? "••••••••" : "sec_xxx"}
+                  aria-describedby={workiz.hasApiSecret && !workiz.apiSecretLooksValid ? "api-secret-warning" : undefined}
+                />
+                {workiz.hasApiSecret && !workiz.apiSecretLooksValid && (
+                  <span id="api-secret-warning" className="text-xs text-destructive">
+                    The saved secret does not look like a Workiz API secret (they start with <code>sec_</code>).
+                  </span>
+                )}
               </div>
             </div>
 

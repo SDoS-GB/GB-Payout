@@ -34,6 +34,29 @@ export class WorkizApiError extends Error {
   }
 }
 
+/** Workiz's own error text from a failed response, when it sent one. */
+function workizMessage(body: unknown): string | null {
+  if (!body || typeof body !== "object") return typeof body === "string" && body.trim() ? body.trim().slice(0, 200) : null
+  const b = body as Record<string, unknown>
+  const msg = [b.message, b.error, b.msg].find((v) => typeof v === "string" && v.trim())
+  return msg ? String(msg).trim() : null
+}
+
+/**
+ * Human-readable failure text. Workiz answers every bad or unknown token with
+ * 403 "Invalid API path or malformed API key", so a credential problem is
+ * called out explicitly rather than looking like a permissions issue on one
+ * endpoint.
+ */
+function describeFailure(method: string, path: string, status: number, body: unknown): string {
+  const detail = workizMessage(body)
+  const base = `Workiz ${method} ${path} failed with ${status}${detail ? `: ${detail}` : ""}`
+  if (status === 401 || status === 403) {
+    return `${base}. Workiz rejected the API token itself, so every endpoint will fail until it is fixed. Re-copy the API token (it starts with "api_") from Workiz → Settings → Integrations → Developer and save it in the API token field.`
+  }
+  return base
+}
+
 export type WorkizTeamMember = {
   id: string
   name: string
@@ -89,7 +112,7 @@ export class WorkizClient {
       json = text
     }
     if (!res.ok) {
-      throw new WorkizApiError(`Workiz ${method} ${path} failed with ${res.status}`, res.status, path, json)
+      throw new WorkizApiError(describeFailure(method, path, res.status, json), res.status, path, json)
     }
     // Workiz wraps payloads as { flag: boolean, data: ..., has_more?: boolean }.
     if (json && typeof json === "object" && "flag" in json && (json as { flag: unknown }).flag === false) {
