@@ -28,6 +28,7 @@ import { getWebhookUrl } from "@/lib/public-origin"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
 import {
+  DEFAULT_WORKIZ_SETTINGS,
   getNotificationSettings,
   getWorkizSettings,
   saveAdminSettings,
@@ -70,7 +71,7 @@ export async function updateWorkizSettings(form: {
       colorSealKeywords: splitList(form.colorSealKeywords),
       cardMethodKeywords: splitList(form.cardMethodKeywords),
       tipKeywords: splitList(form.tipKeywords),
-      reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || 14))),
+      reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || DEFAULT_WORKIZ_SETTINGS.reconcileLookbackDays))),
     }
     if (form.businessTimezone !== undefined) {
       const tz = form.businessTimezone.trim() || DEFAULT_BUSINESS_TIMEZONE
