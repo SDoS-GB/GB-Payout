@@ -108,6 +108,7 @@ const isDiscountType = (type: string | null, name: string) => (type ? /discount/
 export const INFORMATIONAL_WARNING_PREFIXES = ["Line items mention sealing", "Workiz invoice total exceeds"] as const
 
 export const PAYMENT_METHOD_UNKNOWN_PREFIX = "Payment method unknown"
+export const UNITEMIZED_DISCOUNT_PREFIX = "Unitemized discount"
 
 export function isBlockingWarning(warning: string): boolean {
   return !INFORMATIONAL_WARNING_PREFIXES.some((prefix) => warning.startsWith(prefix))
@@ -249,8 +250,6 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   }
   jobTotal = round2(Math.max(0, jobTotal))
 
-  if (jobTotal === 0) warnings.push("Job total is zero")
-
   if (invoiceTotal !== null && jobTotal > 0) {
     // JobTotalPrice should be the service total plus anything Workiz adds on top (tax, fees, invoiced tips).
     const expected = round2(jobTotal + tipItemsTotal + (taxAmount ?? 0))
@@ -260,11 +259,20 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
         `Workiz invoice total exceeds the service total by $${diff.toFixed(2)} ($${invoiceTotal.toFixed(2)} vs $${expected.toFixed(2)}); Workiz does not itemize tax or fees, so commission is calculated on the service total only`,
       )
     } else if (diff < -0.05) {
+      // Live job #924820: SubTotal 475, no discount line, JobTotalPrice 425. Workiz applied a
+      // job-level discount or write-off it does not itemize. Commission is owed on what the
+      // customer was actually charged, so the shortfall is treated as one more whole-job
+      // discount, and the payout is held until an admin confirms it was a discount, not a write-off.
+      const shortfall = -diff
+      discountAmount = round2(discountAmount + shortfall)
+      jobTotal = round2(Math.max(0, jobTotal - shortfall))
       warnings.push(
-        `Workiz invoice total $${invoiceTotal.toFixed(2)} is $${(-diff).toFixed(2)} less than the service total $${expected.toFixed(2)}; check the job for a discount or write-off the sync could not see`,
+        `${UNITEMIZED_DISCOUNT_PREFIX}: Workiz invoice total $${invoiceTotal.toFixed(2)} is $${shortfall.toFixed(2)} less than the itemized service total $${expected.toFixed(2)}; treated as a whole-job discount, confirm it is not a write-off`,
       )
     }
   }
+
+  if (jobTotal === 0) warnings.push("Job total is zero")
 
   // --- Color seal ------------------------------------------------------------
   const colorGross = round2(lineItems.filter((i) => i.isColorSeal && i.total > 0).reduce((s, i) => s + i.total, 0))

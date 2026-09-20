@@ -17,7 +17,11 @@ export type WorkizSettings = {
   cardMethodKeywords: string[]
   /** Product/service names that are treated as tips when Workiz has no dedicated tip field. */
   tipKeywords: string[]
-  /** Days to look back on cron reconciliation. */
+  /**
+   * Days to look back on cron reconciliation. Workiz's `job/all?start_date` filters on the
+   * scheduled JobDateTime, not on the last change, so the window must be wide enough to
+   * still see a job that was scheduled weeks ago and only paid today.
+   */
   reconcileLookbackDays: number
   /** IANA timezone used to display job, completion and payment dates. */
   businessTimezone: string
@@ -44,7 +48,7 @@ export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
   colorSealKeywords: ["color seal", "colour seal", "color-seal", "colorseal", "color sealing"],
   cardMethodKeywords: ["credit", "card", "visa", "mastercard", "amex", "discover", "stripe", "cc"],
   tipKeywords: ["tip", "gratuity"],
-  reconcileLookbackDays: 14,
+  reconcileLookbackDays: 60,
   businessTimezone: "America/New_York",
 }
 

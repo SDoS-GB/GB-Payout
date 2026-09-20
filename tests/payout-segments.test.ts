@@ -21,10 +21,11 @@ const payFor = (seg: JobSegment, p: typeof TIM | typeof VADIM) =>
   )
 
 /**
- * One invoice, one customer payment, two kinds of work:
- *   crew:  door 800 + color seal 200          = 1000 gross
- *   Tim:   *T* grout 400 + (Tim) color seal 100 = 500 gross
- *   whole-job discount 100 -> SubTotal 1400; paid 1000 card + 400 Zelle; tips 60 card + 40 cash (recorded).
+ * One invoice, one customer payment, two kinds of work (real Workiz shape: SubTotal is
+ * pre-discount, the discount is a DISCOUNT_TYPE line, JobTotalPrice is after it):
+ *   crew:  door 800 + color seal 200            = 1000 gross
+ *   Tim:   *T* grout 400 + *Tim* color seal 100 = 500 gross
+ *   whole-job discount 100 -> JobTotalPrice 1400; paid 1000 card + 400 Zelle; tips 60 card + 40 cash (recorded).
  */
 const mixedJob = () =>
   normalizeJob(
@@ -37,14 +38,14 @@ const mixedJob = () =>
         { id: 12, Name: "Denis" },
         { id: 15, Name: "Tim" },
       ],
-      SubTotal: 1400,
-      JobTotal: 1400,
-      Discount: 100,
-      Items: [
-        { Name: "Frameless shower door", Price: 800, Quantity: 1 },
-        { Name: "Color Seal upgrade", Price: 200, Quantity: 1 },
-        { Name: "*T* Grout repair in bathroom", Price: 400, Quantity: 1 },
-        { Name: "(Tim) Color Seal shower floor", Price: 100, Quantity: 1 },
+      SubTotal: 1500,
+      JobTotalPrice: 1400,
+      LineItems: [
+        { Name: "Frameless shower door", Price: 800, Quantity: 1, Type: "service" },
+        { Name: "Color Seal upgrade", Price: 200, Quantity: 1, Type: "service" },
+        { Name: "*T* Grout repair in bathroom", Price: 400, Quantity: 1, Type: "service" },
+        { Name: "*Tim* Color Seal shower floor", Price: 100, Quantity: 1, Type: "service" },
+        { Name: "discount", Price: 100, Quantity: 1, Type: "DISCOUNT_TYPE" },
       ],
       Payments: [
         { Amount: 1000, Method: "Visa" },
@@ -60,28 +61,43 @@ const mixedJob = () =>
 describe("marker matching", () => {
   const name = (n: string) => ({ name: n, description: null })
 
-  it("accepts every way dispatch writes the marker at the start of the item", () => {
-    for (const n of ["*T* Grout repair in bathroom", "*T Grout repair", "T Grout repair", "(T) Grout repair", "(Tim) Grout repair", "T: regrout", "T - caulk", "[Tim] shower floor", "  *T*Regrout", "t grout"]) {
+  it("accepts the literal asterisk-wrapped marker anywhere in the item name", () => {
+    for (const n of ["*T* Grout repair in bathroom", "Grout repair *T*", "  *T*Regrout", "*t* grout", "*Tim* shower floor", "Regrout shower *Tim*"]) {
       expect(findMarker(name(n), "T, Tim"), n).toBe("name")
     }
   })
 
-  it("does not fire on words that merely begin with the token", () => {
-    for (const n of ["Tile work", "Tim's shower door", "Timer install", "Trim and caulk", "Bracket *TT*", "Toilet reset T-bolt"]) {
+  it("never fires on a bare letter T, other decorations, or words that begin with the token", () => {
+    for (const n of [
+      "T Grout repair",
+      "(T) Grout repair",
+      "(Tim) Grout repair",
+      "T: regrout",
+      "T - caulk",
+      "[Tim] shower floor",
+      "t grout",
+      "*T Grout repair",
+      "Tile work",
+      "Tim's shower door",
+      "Timer install",
+      "Trim and caulk",
+      "Bracket *TT*",
+      "Toilet reset T-bolt",
+      "Grout repair T",
+      "Grout repair Tim",
+    ]) {
       expect(findMarker(name(n), "T, Tim"), n).toBeNull()
     }
   })
 
-  it("only accepts a bare token at the start, but a wrapped one anywhere", () => {
-    expect(findMarker(name("Grout repair T"), "T")).toBeNull()
-    expect(findMarker(name("Grout repair Tim"), "T, Tim")).toBeNull()
-    expect(findMarker(name("Grout repair *T*"), "T")).toBe("name")
-    expect(findMarker(name("Regrout shower (Tim)"), "T, Tim")).toBe("name")
+  it("does not misread a live-style description that merely starts with an asterisk", () => {
+    const item = { name: "Walk-in Shower Restoration & Seal", description: "*Important Notice: The shower floor has an existing sealer" }
+    expect(findMarker(item, "T, Tim")).toBeNull()
   })
 
   it("ignores decoration typed into the profile field and normalizes tokens", () => {
     expect(parseMarkerTokens("*T*")).toEqual(["T"])
-    expect(parseMarkerTokens(" (T) , Tim ; tim")).toEqual(["T", "Tim"])
+    expect(parseMarkerTokens(" *T* , Tim ; tim")).toEqual(["T", "Tim"])
     expect(parseMarkerTokens("***")).toEqual([])
     expect(normalizeMarkerTokens("*T*, (Tim)")).toBe("T, Tim")
     expect(normalizeMarkerTokens("  ")).toBeNull()
@@ -122,12 +138,13 @@ describe("segmentJob – Tim + crew on one invoice", () => {
     expect(warnings).toEqual([])
     expect(verification.balanced).toBe(true)
     expect(verification.doubleCountedItems).toBe(0)
-    expect(verification.assignedItemCount).toBe(4)
+    // 4 service lines + the unmarked DISCOUNT_TYPE line, which rides with the crew as a whole-job discount.
+    expect(verification.assignedItemCount).toBe(5)
 
     const tim = segments.find((s) => s.kind === "dedicated")!
     const crew = segments.find((s) => s.kind === "crew")!
     expect(tim.itemIndexes).toEqual([2, 3])
-    expect(crew.itemIndexes).toEqual([0, 1])
+    expect(crew.itemIndexes).toEqual([0, 1, 4])
     expect(tim.itemIndexes.some((i) => crew.itemIndexes.includes(i))).toBe(false)
     expect(Math.round((tim.jobTotal + crew.jobTotal) * 100) / 100).toBe(job.jobTotal)
   })

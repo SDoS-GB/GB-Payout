@@ -102,10 +102,13 @@ export class WorkizClient {
       if (!this.creds.apiSecret) throw new Error("Workiz API secret is required for write calls")
       headers["api_secret"] = this.creds.apiSecret
     }
+    // The published request bodies (e.g. addPaymentBody) carry the secret as `auth_secret`;
+    // the header is kept for compatibility. Live-verified: a body `auth_secret` is accepted.
+    const body = opts?.body && method === "POST" ? { auth_secret: this.creds.apiSecret, ...(opts.body as Record<string, unknown>) } : opts?.body
     const res = await fetch(this.url(path, opts?.query), {
       method,
       headers,
-      body: opts?.body ? JSON.stringify(opts.body) : undefined,
+      body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
     })
     const text = await res.text()
@@ -179,16 +182,18 @@ export class WorkizClient {
   }
 
   /**
-   * POST job/note/ — append an internal note to a job.
+   * POST job/addNote/ — append an internal note to a job.
    *
-   * UNVERIFIED: this path is not in the published Workiz OpenAPI document (the
-   * spec only defines an unused `NoteBody` schema with `uuid`/`comment` fields).
-   * Kept as the configured "workiz_note" channel target; sending stays disabled
-   * by default and every attempt is recorded in `notifications` with its result.
+   * Not in the published OpenAPI document, but live-verified on 2026-09-19 with a
+   * non-existent UUID: `job/note/` (the previous target) answers 404 "Invalid end
+   * point", while `job/addNote/` validates `UUID` (required) and `JobNote` and
+   * answers 204 with an empty body, so a success carries no delivery receipt.
+   * This is an internal job note, not an SMS. Sending stays disabled by default
+   * and every attempt is recorded in `notifications` with its result.
    */
   async addJobNote(uuid: string, note: string) {
-    return this.request<{ flag: boolean; data?: unknown }>("POST", "job/note/", {
-      body: { UUID: uuid, Note: note },
+    return this.request<unknown>("POST", "job/addNote/", {
+      body: { UUID: uuid, JobNote: note },
     })
   }
 

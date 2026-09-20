@@ -105,6 +105,23 @@ export function gateReason(job: NormalizedJob, settings: WorkizSettings, extraWa
   return null
 }
 
+/**
+ * Why an admin may not release a held payout, or null when they may. Review
+ * warnings (unknown payment method, unitemized discount, marker problems) are
+ * exactly what an admin resolves by releasing; an unfinished or unpaid job is
+ * not, so those holds cannot be overridden from the dashboard.
+ */
+export function releaseBlocker(
+  job: { status: string | null; fullyPaid: boolean; jobTotal: number } | null,
+  settings: WorkizSettings,
+): string | null {
+  if (!job) return "No Workiz snapshot exists for this payout; sync the job first"
+  if (!isPayableStatus(job.status, settings)) return `Job status "${job.status ?? "unknown"}" is not completed`
+  if (!job.fullyPaid) return "Job is not fully paid in Workiz"
+  if (job.jobTotal <= 0) return "Job total is zero"
+  return null
+}
+
 async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook") {
   if (job.teamIds.length === 0) return { profiles: [] as TechnicianProfile[], unmapped: [] as string[], mappingByProfile: new Map<number, string>() }
 

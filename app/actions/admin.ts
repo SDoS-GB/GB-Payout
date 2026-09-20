@@ -14,6 +14,7 @@ import {
 } from "@/lib/db/schema"
 import { notifyPayout } from "@/lib/notifications/send"
 import { buildTemplateContext, renderTemplate } from "@/lib/notifications/template"
+import { releaseBlocker } from "@/lib/payout/engine"
 import { listProfiles } from "@/lib/payout/profiles"
 import {
   DEFAULT_BUSINESS_TIMEZONE,
@@ -311,10 +312,21 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
     const set: Partial<typeof payouts.$inferInsert> = { updatedAt: now, reviewedAt: now, reviewedBy: "admin" }
     if (note !== undefined) set.adminNote = note.trim() || null
     switch (action) {
-      case "release":
+      case "release": {
+        const [payout] = await db.select({ jobUuid: payouts.jobUuid, status: payouts.status }).from(payouts).where(eq(payouts.id, id)).limit(1)
+        if (!payout) throw new Error("Payout not found")
+        if (payout.status === "paid" || payout.status === "void") throw new Error(`Payout is already ${payout.status}; use Reopen first`)
+        const [job] = await db
+          .select({ status: workizJobs.status, fullyPaid: workizJobs.fullyPaid, jobTotal: workizJobs.jobTotal })
+          .from(workizJobs)
+          .where(eq(workizJobs.uuid, payout.jobUuid))
+          .limit(1)
+        const blocker = releaseBlocker(job ? { status: job.status, fullyPaid: job.fullyPaid, jobTotal: Number(job.jobTotal) } : null, await getWorkizSettings())
+        if (blocker) throw new Error(`Cannot release: ${blocker}`)
         set.status = "ready"
         set.holdReason = null
         break
+      }
       case "hold":
         set.status = "hold"
         set.holdReason = note?.trim() || "Held by admin"
@@ -336,6 +348,9 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
         break
     }
     await db.update(payouts).set(set).where(eq(payouts.id, id))
+    // A release makes the payout ready, so it gets the same ready-to-pay message a sync would
+    // produce; notifyPayout only previews unless sending is enabled and never delivers twice.
+    if (action === "release") await notifyPayout(id)
     revalidatePath("/admin")
     revalidatePath("/payouts")
     return { ok: true }
