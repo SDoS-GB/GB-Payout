@@ -83,7 +83,11 @@ export async function saveJobSnapshot(job: NormalizedJob, raw: WorkizRawJob, sou
 /**
  * Process one raw Workiz job end to end. Safe to call repeatedly.
  */
-export async function processRawJob(raw: WorkizRawJob, source: SyncSource, ctx?: { settings: WorkizSettings; catalog: ColorSealCatalog }): Promise<JobSyncResult> {
+export async function processRawJob(
+  raw: WorkizRawJob,
+  source: SyncSource,
+  ctx?: { settings?: WorkizSettings; catalog?: ColorSealCatalog; via?: string },
+): Promise<JobSyncResult> {
   const settings = ctx?.settings ?? (await getWorkizSettings())
   const catalog = ctx?.catalog ?? (await loadColorSealCatalog())
 
@@ -100,20 +104,20 @@ export async function processRawJob(raw: WorkizRawJob, source: SyncSource, ctx?:
   await logSyncEvent(`job:${source}`, {
     jobUuid: normalized.uuid,
     ok: true,
-    summary: `${normalized.serialId ?? normalized.uuid} · ${normalized.status ?? "?"} · total ${normalized.jobTotal.toFixed(2)} · payouts +${engine.created}/~${engine.updated}/=${engine.unchanged}${engine.held ? ` · held ${engine.held}` : ""}`,
-    details: { engine, warnings: normalized.warnings, notifications: notifications.map((n) => ({ id: n.notificationId, status: n.status, reason: n.reason })) },
+    summary: `${normalized.serialId ?? normalized.uuid} · ${normalized.status ?? "?"} · total ${normalized.jobTotal.toFixed(2)} · payouts +${engine.created}/~${engine.updated}/=${engine.unchanged}${engine.held ? ` · held ${engine.held}` : ""}${ctx?.via ? ` · via ${ctx.via}` : ""}`,
+    details: { engine, warnings: normalized.warnings, via: ctx?.via ?? null, notifications: notifications.map((n) => ({ id: n.notificationId, status: n.status, reason: n.reason })) },
   })
 
   return { uuid: normalized.uuid, normalized, engine, notifications }
 }
 
 /** Fetch a single job from Workiz by UUID and process it. */
-export async function syncJobByUuid(uuid: string, source: SyncSource = "rest"): Promise<JobSyncResult> {
+export async function syncJobByUuid(uuid: string, source: SyncSource = "rest", opts?: { via?: string }): Promise<JobSyncResult> {
   const { client, settings } = await getWorkizClient()
   const raw = await client.getJob(uuid)
   if (!raw) throw new Error(`Workiz job ${uuid} not found`)
   const catalog = await loadColorSealCatalog()
-  return processRawJob(raw, source, { settings, catalog })
+  return processRawJob(raw, source, { settings, catalog, via: opts?.via })
 }
 
 export type ReconcileSummary = {

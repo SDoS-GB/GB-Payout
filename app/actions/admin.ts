@@ -24,6 +24,7 @@ import {
   type PayoutQuery,
 } from "@/lib/payout/presentation"
 import { parseMarkerTokens } from "@/lib/payout/segments"
+import { getWebhookUrl } from "@/lib/public-origin"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
 import {
@@ -101,6 +102,61 @@ export async function rotateWebhookSecret(): Promise<Result<{ secret: string }>>
   } catch (err) {
     return fail(err)
   }
+}
+
+/**
+ * Posts a Workiz-shaped `self_test` event to the public webhook URL exactly as the
+ * automation would, using the most recently synced job's UUID. Proves the route is
+ * deployed, reachable, that the auth key matches and that the Workiz API answers —
+ * without touching any payout.
+ */
+export async function testWebhookEndpoint(): Promise<Result<{ summary: string }>> {
+  try {
+    await requireAdmin()
+    const settings = await getWorkizSettings()
+    if (!settings.webhookSecret) throw new Error("Generate an auth key first.")
+    const [latest] = await db.select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId }).from(workizJobs).orderBy(desc(workizJobs.lastSeenAt)).limit(1)
+    if (!latest) throw new Error("No synced job to test with yet. Run Sync now first.")
+
+    const url = await getWebhookUrl()
+    if (!url.startsWith("http")) throw new Error("Public URL unknown in this environment. Test from the deployed site.")
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15_000)
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.webhookSecret}` },
+        body: JSON.stringify({
+          trigger: { type: "self_test", timestamp: new Date().toISOString() },
+          data: { uuid: latest.uuid, serialId: latest.serialId },
+          metadata: { ruleName: "Admin self-test" },
+        }),
+        cache: "no-store",
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+    const body = (await res.json().catch(() => null)) as { ok?: boolean; summary?: string; error?: string } | null
+    if (!res.ok || !body?.ok) throw new Error(body?.error ?? body?.summary ?? `Endpoint answered HTTP ${res.status}`)
+    revalidatePath("/admin")
+    return { ok: true, data: { summary: body.summary ?? "Self-test passed" } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/** Newest webhook that Workiz itself sent (self-tests excluded), for the setup status badge. */
+async function latestWorkizWebhook() {
+  const [row] = await db
+    .select({ createdAt: syncEvents.createdAt, ok: syncEvents.ok, summary: syncEvents.summary, kind: syncEvents.kind })
+    .from(syncEvents)
+    .where(and(inArray(syncEvents.kind, ["webhook", "job:webhook"]), sql`coalesce(${syncEvents.details}->>'selfTest', 'false') <> 'true'`))
+    .orderBy(desc(syncEvents.createdAt))
+    .limit(1)
+  return row ?? null
 }
 
 export async function probeWorkiz(): Promise<Result<Awaited<ReturnType<WorkizClient["probe"]>>>> {
@@ -610,7 +666,7 @@ async function unmappedTeamImpact(teamIds: string[]) {
 
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
@@ -619,6 +675,7 @@ export async function loadAdminDashboard() {
     db.select().from(syncEvents).orderBy(desc(syncEvents.createdAt)).limit(40),
     payoutStatusCounts(),
     queryPayouts(DEFAULT_PAYOUT_QUERY),
+    latestWorkizWebhook(),
   ])
 
   const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
@@ -651,6 +708,7 @@ export async function loadAdminDashboard() {
       apiSecretLooksValid: /^sec_[A-Za-z0-9]{8,}$/.test(workiz.apiSecret),
       hasWebhookSecret: Boolean(workiz.webhookSecret),
       webhookSecret: workiz.webhookSecret,
+      lastWebhook,
       payableStatuses: workiz.payableStatuses,
       colorSealKeywords: workiz.colorSealKeywords,
       cardMethodKeywords: workiz.cardMethodKeywords,
