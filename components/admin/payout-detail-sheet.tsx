@@ -132,7 +132,10 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
   const paymentDates = Array.from(new Set(payments.map((x) => (x.date ? zonedDate(x.date, timezone) : null)).filter(Boolean) as string[]))
   const jobTotal = num(job?.jobTotal)
   const tax = job?.taxAmount == null ? null : num(job.taxAmount)
-  const grandTotal = jobTotal + (tax ?? 0)
+  // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
+  const workizInvoiceTotal = job?.invoiceTotal != null && Number.isFinite(job.invoiceTotal) && job.invoiceTotal > 0 ? job.invoiceTotal : null
+  const grandTotal = workizInvoiceTotal ?? jobTotal + (tax ?? 0)
+  const unitemized = workizInvoiceTotal !== null ? Math.max(0, workizInvoiceTotal - jobTotal - (tax ?? 0)) : 0
   const totalPaid = num(job?.totalPaid)
   const tipsTotal = num(job?.cardTipAmount) + num(job?.nonCardTipAmount)
   // Workiz's own balance figure is authoritative when the sync got no per-payment records.
@@ -429,8 +432,8 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
               ["Invoice subtotal", job?.subTotal != null ? money(job.subTotal) : "Not provided by Workiz"],
               ["Discount", job ? `−${money(job.discountAmount)}` : "Unavailable"],
               ["Tip", job ? money(tipsTotal) : "Unavailable"],
-              ["Tax", tax != null ? money(tax) : "Not provided by Workiz"],
-              ["Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
+              ["Tax", tax != null ? money(tax) : unitemized > 0.005 ? `${money(unitemized)} · tax/fees not itemized by Workiz` : "Not provided by Workiz"],
+              [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
               ["Payments received", job ? (payments.length ? money(totalPaid) : collectedPerWorkiz !== null ? `${money(collectedPerWorkiz)} · per Workiz balance, no payment records` : money(totalPaid)) : "Unavailable"],
               [
                 "Remaining balance",

@@ -177,10 +177,15 @@ export type NormalizedLineItem = {
   name: string
   /** Secondary text field from Workiz (Description/Notes) when it differs from the name; searched for technician markers. */
   description?: string | null
+  /** Workiz item `Type` ("service", "product", "DISCOUNT_TYPE"). */
+  type?: string | null
   quantity: number
   unitPrice: number
+  /** Extended amount (unit price x quantity). Negative for discount lines. */
   total: number
   isColorSeal: boolean
+  /** True for Workiz discount lines, which arrive with a positive price and `Type: "DISCOUNT_TYPE"`. */
+  isDiscount?: boolean
   matchedBy: "catalog" | "keyword" | "none"
 }
 

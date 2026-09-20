@@ -8,7 +8,7 @@ import {
   type TechnicianProfile,
 } from "@/lib/db/schema"
 import type { WorkizSettings } from "@/lib/settings"
-import { isPayableStatus, type NormalizedJob } from "@/lib/workiz/normalize"
+import { isBlockingWarning, isPayableStatus, type NormalizedJob } from "@/lib/workiz/normalize"
 import { CALC_VERSION, CARD_FEE_MULTIPLIER, calcPayoutWithPaymentSplit, type SplitPayoutBreakdown } from "./calculator"
 import { profileToRates } from "./profiles"
 import { planSegments, type JobSegment, type MarkerOwner } from "./segments"
@@ -35,7 +35,7 @@ const round2 = (n: number) => Math.round(n * 100) / 100
  * If it does not change between syncs the payout row is left alone, which keeps
  * webhook + cron double-processing idempotent.
  */
-export function payoutInputHash(segment: JobSegment, job: NormalizedJob, profile: TechnicianProfile, splitCount: number): string {
+export function payoutInputHash(segment: JobSegment, job: NormalizedJob, profile: TechnicianProfile, splitCount: number, unmappedTeamIds: string[] = []): string {
   const payload = {
     v: CALC_VERSION,
     segment: segment.kind,
@@ -50,8 +50,12 @@ export function payoutInputHash(segment: JobSegment, job: NormalizedJob, profile
     discount: job.discountAmount,
     status: job.status,
     fullyPaid: job.fullyPaid,
+    paidEvidence: job.paidEvidence,
+    blockingWarnings: job.warnings.filter(isBlockingWarning),
     rates: [profile.nonColorRate, profile.colorRate, profile.tipShare, profile.separateColorSeal],
     splitCount,
+    // Excluding or mapping a team member must re-gate the payout even when the money is unchanged.
+    unmapped: [...unmappedTeamIds].sort(),
   }
   return createHash("sha256").update(JSON.stringify(payload)).digest("hex")
 }
@@ -94,7 +98,9 @@ export function gateReason(job: NormalizedJob, settings: WorkizSettings, extraWa
   if (!isPayableStatus(job.status, settings)) return `Job status "${job.status ?? "unknown"}" is not payable`
   if (!job.fullyPaid) return "Job is not fully paid"
   if (job.jobTotal <= 0) return "Job total is zero"
-  const blocking = [...job.warnings.filter((w) => !w.startsWith("No payment records")), ...extraWarnings]
+  // Every non-informational warning holds the payout: an unknown payment method
+  // is flagged for review rather than silently paid as non-card.
+  const blocking = [...job.warnings.filter(isBlockingWarning), ...extraWarnings.filter(isBlockingWarning)]
   if (blocking.length) return blocking[0]
   return null
 }
@@ -185,7 +191,7 @@ export async function upsertPayoutsForJob(
   for (const profile of profiles) {
     const segment = plan.segmentFor.get(profile.id) ?? plan.segmentation.segments[0]
     const splitCount = plan.splitCountFor.get(profile.id) ?? profiles.length
-    const hash = payoutInputHash(segment, job, profile, splitCount)
+    const hash = payoutInputHash(segment, job, profile, splitCount, unmapped)
     const prior = existingByProfile.get(profile.id)
 
     if (prior && (prior.status === "paid" || prior.status === "void")) {
@@ -255,6 +261,9 @@ export async function upsertPayoutsForJob(
           colorSealTotal: job.colorSealTotal,
           discountAmount: job.discountAmount,
           cardServiceAmount: job.cardServiceAmount,
+          invoiceTotal: job.invoiceTotal,
+          amountDue: job.amountDue,
+          paidEvidence: job.paidEvidence,
           markers: plan.segmentation.segments.filter((s) => s.kind === "dedicated").map((s) => s.marker),
         },
         verification: plan.segmentation.verification,

@@ -1,16 +1,20 @@
 /**
  * Thin, typed wrapper over the Workiz REST API (https://developer.workiz.com/).
  *
- * Verified from the published OpenAPI document (developer.workiz.com/api.json):
+ * Verified from the published OpenAPI document (developer.workiz.com/api.json,
+ * 20 paths) and live responses:
  *   - Base URL:      https://api.workiz.com/api/v1/{token}/
- *   - Read calls:    GET  job/all/, job/get/{UUID}/, team/all/
- *   - Write calls:   POST job/update/, job/addPayment/{UUID}/, job/assign/,
- *                    job/note/ (require the `api_secret` header)
- *   - Job payload:   UUID, SerialId, JobDateTime, JobEndDateTime, Status, SubStatus,
- *                    PaymentDueDate, JobTotal, SubTotal, ClientId, FirstName, LastName,
- *                    Address/City/State/PostalCode, Phone, Email, JobType, JobSource,
- *                    Team[] ({id, Name}), Tags[], Comments, JobNotes, plus optional
- *                    Items[] / Payments[] arrays on job/get/ when the account exposes them.
+ *   - Read calls:    GET  job/all/, job/get/{UUID}/, team/all/, team/get/{USER_ID}
+ *   - Write calls:   POST job/create/, job/update/, job/addPayment/{UUID}/, job/assign/,
+ *                    job/unassign/ (require the `api_secret` header)
+ *   - Job payload:   UUID, SerialId, JobDateTime, JobEndDateTime, LastStatusUpdate, Status,
+ *                    SubStatus, PaymentDueDate, JobTotalPrice, SubTotal, JobAmountDue, ClientId,
+ *                    FirstName, LastName, Address/City/State/PostalCode, Phone, Email, JobType,
+ *                    JobSource, Team[] ({id, Name}), Tags[], Comments, JobNotes,
+ *                    LineItems[] ({Id, Name, Description, Price, Quantity, Type, Taxable}).
+ *   - NOT provided:  per-payment records (method, date), Discount, TaxAmount, InvoiceStatus.
+ *   - NOT published: any job-note or SMS endpoint. `addJobNote` below targets an
+ *                    undocumented path and is unverified; do not rely on it for delivery.
  *
  * Every response shape is treated as untrusted and normalised in `normalize.ts`.
  */
@@ -126,7 +130,12 @@ export class WorkizClient {
     return json as T
   }
 
-  /** GET job/all/ — paginated list. Workiz caps `records` at 100. */
+  /**
+   * GET job/all/ — paginated list. Workiz caps `records` at 100.
+   * `only_open` defaults to TRUE on the Workiz side and hides Done/Canceled jobs
+   * (verified live: 15 jobs without it vs 80 with only_open=false), so it is
+   * always sent explicitly.
+   */
   async listJobs(params: ListJobsParams = {}) {
     const res = await this.request<{ flag: boolean; data: WorkizRawJob[]; has_more?: boolean; found?: number }>(
       "GET",
@@ -136,7 +145,7 @@ export class WorkizClient {
           start_date: params.startDate,
           offset: params.offset ?? 0,
           records: Math.min(params.records ?? 100, 100),
-          only_open: params.onlyOpen ? "true" : undefined,
+          only_open: params.onlyOpen ? "true" : "false",
         },
       },
     )
@@ -170,10 +179,12 @@ export class WorkizClient {
   }
 
   /**
-   * POST job/note/ — append an internal note to a job. Used as the default
-   * technician notification channel because Workiz automations can forward a
-   * job note to the assigned tech via SMS/push, and the note is visible in the
-   * job timeline for audit.
+   * POST job/note/ — append an internal note to a job.
+   *
+   * UNVERIFIED: this path is not in the published Workiz OpenAPI document (the
+   * spec only defines an unused `NoteBody` schema with `uuid`/`comment` fields).
+   * Kept as the configured "workiz_note" channel target; sending stays disabled
+   * by default and every attempt is recorded in `notifications` with its result.
    */
   async addJobNote(uuid: string, note: string) {
     return this.request<{ flag: boolean; data?: unknown }>("POST", "job/note/", {

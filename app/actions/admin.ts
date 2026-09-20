@@ -331,6 +331,8 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
         set.status = "pending"
         set.paidAt = null
         set.paidBy = null
+        // Force the next sync to recompute and re-gate instead of matching the old fingerprint.
+        set.inputHash = null
         break
     }
     await db.update(payouts).set(set).where(eq(payouts.id, id))
@@ -502,6 +504,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
         updatedAt: workizJobs.updatedAt,
         lastStatusUpdate: sql<string | null>`${workizJobs.raw}->>'LastStatusUpdate'`,
         amountDue: sql<string | null>`${workizJobs.raw}->>'JobAmountDue'`,
+        invoiceTotal: sql<string | null>`${workizJobs.raw}->>'JobTotalPrice'`,
       },
     })
     .from(payouts)
@@ -532,6 +535,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
           ...raw,
           lastStatusUpdate: parseWorkizDate(raw.lastStatusUpdate, timeZone),
           amountDue: raw.amountDue === null || raw.amountDue === undefined || raw.amountDue === "" ? null : Number(raw.amountDue),
+          invoiceTotal: raw.invoiceTotal === null || raw.invoiceTotal === undefined || raw.invoiceTotal === "" ? null : Number(raw.invoiceTotal),
         }
       : null
     return {
