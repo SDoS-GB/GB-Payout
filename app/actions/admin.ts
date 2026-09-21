@@ -37,8 +37,9 @@ import {
   type NotificationSettings,
 } from "@/lib/settings"
 import { WorkizApiError, WorkizClient } from "@/lib/workiz/client"
+import { validateManualPayments, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { parseWorkizDate } from "@/lib/workiz/time"
-import { applyPayoutReadyTag, describeTagOutcome, getWorkizClient, logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
+import { applyPayoutReadyTag, describeTagOutcome, getWorkizClient, logSyncEvent, reconcileRecentJobs, replaceManualPayments, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
 import { DEFAULT_PAYOUT_READY_TAG, explainNotApplied, normalizeTagName } from "@/lib/workiz/tags"
 
 type Result<T = undefined> = { ok: true; data?: T } | { ok: false; error: string }
@@ -273,6 +274,63 @@ export async function syncSingleJob(uuid: string): Promise<Result<{ status: stri
         notes: [...result.engine.notes, ...result.normalized.warnings],
       },
     }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+// --- Customer payment confirmation ------------------------------------------
+
+export type PaymentConfirmationOutcome = { status: string | null; payments: number; held: number; notes: string[] }
+
+/**
+ * Record what the Workiz Payments tab shows for a job when Workiz's API will not say. The
+ * admin transcribes each payment (method, amount, date); the entries must add up to the
+ * Workiz invoice total, are stored with the admin's name, and the job is then re-processed
+ * through the normal sync path — every completion/paid/mapping check still applies, and
+ * nothing here forces a payout to Ready.
+ */
+export async function confirmJobPayments(jobUuid: string, entries: ManualPaymentEntry[]): Promise<Result<PaymentConfirmationOutcome>> {
+  try {
+    await requireAdmin()
+    const uuid = jobUuid.trim()
+    if (!uuid) return { ok: false, error: "Job UUID is required" }
+    const [job] = await db.select({ uuid: workizJobs.uuid, raw: workizJobs.raw }).from(workizJobs).where(eq(workizJobs.uuid, uuid)).limit(1)
+    if (!job) return { ok: false, error: "This job has not been synced yet; sync it first" }
+    const rawTotal = (job.raw as { JobTotalPrice?: unknown } | null)?.JobTotalPrice
+    const invoiceTotal = rawTotal === undefined || rawTotal === null ? null : Number(rawTotal)
+    const checked = validateManualPayments(entries, invoiceTotal !== null && Number.isFinite(invoiceTotal) ? invoiceTotal : null)
+    if (!checked.ok) return { ok: false, error: checked.error }
+
+    await replaceManualPayments(uuid, checked.entries, "admin")
+    const result = await syncJobByUuid(uuid, "rest", { via: "payment-confirmation" })
+    revalidatePath("/admin")
+    revalidatePath("/payouts")
+    return {
+      ok: true,
+      data: {
+        status: result.normalized.status,
+        payments: result.normalized.payments.length,
+        held: result.engine.held,
+        notes: [...result.engine.notes, ...result.normalized.warnings],
+      },
+    }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/** Remove the admin-confirmed payments for a job and re-process it from Workiz data alone. */
+export async function clearConfirmedPayments(jobUuid: string): Promise<Result<PaymentConfirmationOutcome>> {
+  try {
+    await requireAdmin()
+    const uuid = jobUuid.trim()
+    if (!uuid) return { ok: false, error: "Job UUID is required" }
+    await replaceManualPayments(uuid, [], "admin")
+    const result = await syncJobByUuid(uuid, "rest", { via: "payment-confirmation-cleared" })
+    revalidatePath("/admin")
+    revalidatePath("/payouts")
+    return { ok: true, data: { status: result.normalized.status, payments: result.normalized.payments.length, held: result.engine.held, notes: [...result.engine.notes, ...result.normalized.warnings] } }
   } catch (err) {
     return fail(err)
   }

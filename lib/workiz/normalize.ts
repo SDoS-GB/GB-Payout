@@ -1,7 +1,8 @@
-import type { NormalizedLineItem, NormalizedPayment } from "@/lib/db/schema"
+import type { NormalizedLineItem, NormalizedPayment, PaymentSource } from "@/lib/db/schema"
 import type { WorkizSettings } from "@/lib/settings"
 import { DEFAULT_BUSINESS_TIMEZONE } from "@/lib/payout/presentation"
 import type { WorkizRawJob } from "./client"
+import { classifyPaymentMethod, mergePayments } from "./payments"
 import { parseWorkizDate } from "./time"
 
 /**
@@ -18,7 +19,9 @@ import { parseWorkizDate } from "./time"
  *   - Discounts arrive as line items with `Type: "DISCOUNT_TYPE"` and a POSITIVE price.
  *   - `JobTotalPrice` = SubTotal - discounts (+ tax/fees Workiz does not itemize).
  *   - `JobAmountDue` is the customer balance. No `Payments`, `Discount`, `TaxAmount`
- *     or `InvoiceStatus` field is returned, so the payment method is never known.
+ *     or `InvoiceStatus` field is returned, so the job payload alone never reveals the
+ *     payment method. Payment records reach `normalizeJob` through `externalPayments`
+ *     (invoice webhooks, admin confirmations — see lib/workiz/payments.ts).
  */
 export type NormalizedJob = {
   uuid: string
@@ -166,7 +169,7 @@ export function normalizeLineItems(
   return { items, tipItemsTotal: round2(tipItemsTotal) }
 }
 
-export function normalizePayments(raw: unknown, settings: WorkizSettings): NormalizedPayment[] {
+export function normalizePayments(raw: unknown, settings: WorkizSettings, source: PaymentSource = "workiz-job"): NormalizedPayment[] {
   if (!Array.isArray(raw)) return []
   const out: NormalizedPayment[] = []
   const seen = new Set<string>()
@@ -183,19 +186,27 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings): Norma
     }
     const method = str(pick(r, "Method", "method", "PaymentMethod", "payment_method", "Type", "type")) ?? "Unknown"
     const tipAmount = num(pick(r, "Tip", "tip", "TipAmount", "tip_amount"))
-    const isCard = includesKeyword(method, settings.cardMethodKeywords)
+    // A manual cash/check/Zelle entry has no processor id or settlement status; the method text
+    // alone decides the side. Unrecognised text is kept, flagged, and held — never assumed cash.
+    const cls = classifyPaymentMethod(method, settings.cardMethodKeywords)
     const isTipFlag = Boolean(pick(r, "IsTip", "is_tip")) || hasKeywordWord(str(pick(r, "Note", "note", "Description")) ?? "", settings.tipKeywords)
     const paidAt = str(pick(r, "Date", "date", "PaymentDate", "payment_date", "CreatedAt", "created_at"))
+    const base = { id, method, isCard: cls.isCard, methodKnown: cls.known, source, date: paidAt }
 
     if (tipAmount > 0 && tipAmount < amount) {
       // Workiz can attach a tip to a payment; split it so service and tip are tracked separately.
-      out.push({ id, amount: round2(amount - tipAmount), method, isCard, isTip: false, date: paidAt })
-      out.push({ id, amount: round2(tipAmount), method, isCard, isTip: true, date: paidAt })
+      out.push({ ...base, amount: round2(amount - tipAmount), isTip: false })
+      out.push({ ...base, amount: round2(tipAmount), isTip: true })
       continue
     }
-    out.push({ id, amount, method, isCard, isTip: isTipFlag, date: paidAt })
+    out.push({ ...base, amount, isTip: isTipFlag })
   }
   return out
+}
+
+export type NormalizeOptions = {
+  /** Payment records from outside the job payload (invoice webhooks, admin confirmations). */
+  externalPayments?: NormalizedPayment[]
 }
 
 /**
@@ -203,7 +214,7 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings): Norma
  * anything the calculator later multiplies except the 2-decimal money inputs that
  * Workiz itself stores in cents.
  */
-export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalog: ColorSealCatalog): NormalizedJob {
+export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalog: ColorSealCatalog, opts: NormalizeOptions = {}): NormalizedJob {
   const r = raw as Record<string, unknown>
   const warnings: string[] = []
 
@@ -220,7 +231,7 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   const tags = Array.isArray(r.Tags) ? (r.Tags as unknown[]).map((t) => String(t)).filter(Boolean) : []
 
   const { items: lineItems, tipItemsTotal } = normalizeLineItems(pick(r, "LineItems", "line_items", "Items", "items"), settings, catalog)
-  const payments = normalizePayments(pick(r, "Payments", "payments"), settings)
+  const payments = mergePayments(normalizePayments(pick(r, "Payments", "payments"), settings), opts.externalPayments ?? [])
 
   // --- Revenue -------------------------------------------------------------
   const invoiceTotalRaw = pick(r, "JobTotalPrice", "JobTotal", "job_total", "Total")
@@ -331,21 +342,48 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
       const paidTowardInvoice = round2(servicePaid + (tipItemsTotal > 0 ? tipPaid : 0))
       fullyPaid = invoiceDue > 0 && paidTowardInvoice + 0.005 >= invoiceDue
       paidEvidence = "payments"
+
+      // A payment whose method text we cannot classify is kept on the non-card side only
+      // provisionally; the warning holds the payout until an admin confirms card or not.
+      const unknown = servicePayments.filter((p) => p.methodKnown === false)
+      if (unknown.length) {
+        const methods = Array.from(new Set(unknown.map((p) => p.method))).join(", ")
+        const sum = round2(unknown.reduce((s, p) => s + p.amount, 0))
+        warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: $${sum.toFixed(2)} was recorded with a method that is not recognised (${methods}); confirm whether it was paid by card before release`)
+      }
+
+      if (amountDue !== null) {
+        // Workiz's balance is the authority on WHETHER the customer has paid; the records only
+        // say HOW. A record set that claims full payment while Workiz still shows a balance is
+        // not paid; a $0 balance that the records do not cover is paid but partly untyped.
+        if (amountDue > 0.005 && fullyPaid) {
+          fullyPaid = false
+          warnings.push(`Workiz still shows $${amountDue.toFixed(2)} due although payment records total $${paidTowardInvoice.toFixed(2)}; the Workiz balance decides paid status`)
+        } else if (amountDue <= 0.005 && !fullyPaid && invoiceDue > 0) {
+          const untyped = round2(invoiceDue - paidTowardInvoice)
+          fullyPaid = true
+          totalPaid = round2(totalPaid + untyped)
+          nonCardServiceAmount = round2(nonCardServiceAmount + untyped)
+          warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: Workiz shows the $${invoiceDue.toFixed(2)} invoice paid in full but payment records cover only $${paidTowardInvoice.toFixed(2)}; the remaining $${untyped.toFixed(2)} has no payment type and is provisional as non-card`)
+        }
+      }
       if (servicePaid > 0 && Math.abs(servicePaid - invoiceDue) > 0.05 && Math.abs(servicePaid - jobTotal) > 0.05 && !fullyPaid) {
         warnings.push(`Payments (${servicePaid.toFixed(2)}) do not match job total (${invoiceDue.toFixed(2)})`)
       }
     } else if (amountDue !== null && invoiceTotal !== null && invoiceTotal > 0 && jobTotal > 0) {
-      // Live Workiz payloads carry no payment records at all: the only paid signal is the balance.
+      // Live job payloads carry no payment records at all (verified 2026-09-21 on #924886, which
+      // Workiz's own UI shows as paid $50 cash): the balance is the only paid signal. This is
+      // "details unavailable", not "the customer has not paid".
       totalPaid = round2(Math.max(0, invoiceTotal - Math.max(0, amountDue)))
       fullyPaid = amountDue <= 0.005
       paidEvidence = "balance"
       nonCardServiceAmount = jobTotal
       warnings.push(
-        `${PAYMENT_METHOD_UNKNOWN_PREFIX}: Workiz returned no payment records, so paid status comes only from the job balance ($${Math.max(0, amountDue).toFixed(2)} due of $${invoiceTotal.toFixed(2)}) and card vs check/cash/Zelle cannot be determined; amount is provisional as non-card until confirmed`,
+        `${PAYMENT_METHOD_UNKNOWN_PREFIX}: payment details unavailable from Workiz — its job API reports only the balance ($${Math.max(0, amountDue).toFixed(2)} due of $${invoiceTotal.toFixed(2)}), not the payment type, so card vs cash/check/Zelle cannot be determined. Create a Workiz invoice (its webhook reports the type) or confirm the payment in the payout details; amount is provisional as non-card until then`,
       )
     } else if (jobTotal > 0) {
       nonCardServiceAmount = jobTotal
-      warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: Workiz returned no payment records or balance for this job; amount is provisional as non-card until confirmed`)
+      warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: payment details unavailable — Workiz returned neither payment records nor a balance for this job; amount is provisional as non-card until confirmed`)
     }
 
     if (!fullyPaid && statusSaysPaid) {

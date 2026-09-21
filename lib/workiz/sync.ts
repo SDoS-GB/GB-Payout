@@ -1,11 +1,12 @@
-import { and, eq } from "drizzle-orm"
+import { and, eq, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
-import { colorSealItems, payouts, syncEvents, workizJobs, workizTeamMappings } from "@/lib/db/schema"
+import { colorSealItems, jobPayments, payouts, syncEvents, workizJobs, workizTeamMappings, type NormalizedPayment } from "@/lib/db/schema"
 import { notifyPayout, type NotifyOutcome } from "@/lib/notifications/send"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
 import { getWorkizSettings, type WorkizSettings } from "@/lib/settings"
 import { WorkizClient, type WorkizRawJob } from "./client"
 import { normalizeJob, type ColorSealCatalog, type NormalizedJob } from "./normalize"
+import { externalRowsToPayments, type ExternalPaymentInput, type InvoiceWebhookPayments, type ManualPaymentEntry } from "./payments"
 import { explainNotApplied, planPayoutReadyTag, verifyTagApplied, type TagSkipReason, type TagVerdict } from "./tags"
 
 export type SyncSource = "rest" | "webhook"
@@ -107,6 +108,91 @@ export async function loadColorSealCatalog(): Promise<ColorSealCatalog> {
   return new Map(rows.map((r) => [r.productId, r.isColorSeal]))
 }
 
+// --- Payment records the job payload never carries -----------------------------
+
+/** Stored invoice-webhook and admin-confirmed payments for a job, in normalizer shape. */
+export async function loadExternalPayments(jobUuid: string, settings: WorkizSettings): Promise<NormalizedPayment[]> {
+  const rows = await db.select().from(jobPayments).where(eq(jobPayments.jobUuid, jobUuid)).orderBy(jobPayments.paidAt, jobPayments.id)
+  return externalRowsToPayments(rows, settings.cardMethodKeywords)
+}
+
+/**
+ * Persist payments delivered by an invoice webhook. Keyed by Workiz's payment id, so a
+ * retried or duplicated webhook updates the same row instead of doubling the paid total.
+ * Records without an id cannot be de-duplicated safely and are skipped with a log entry.
+ */
+export async function recordExternalPayments(jobUuid: string, inputs: ExternalPaymentInput[]): Promise<{ stored: number; skipped: number }> {
+  let stored = 0
+  let skipped = 0
+  for (const p of inputs) {
+    if (!p.externalId) {
+      skipped++
+      continue
+    }
+    const now = new Date()
+    const values = {
+      jobUuid,
+      externalId: p.externalId,
+      source: p.source,
+      method: p.method,
+      amount: p.amount.toFixed(2),
+      tipAmount: p.tipAmount.toFixed(2),
+      paidAt: p.paidAt ? new Date(p.paidAt) : null,
+      invoiceId: p.invoiceId,
+      reference: p.reference,
+      recordedBy: p.recordedBy,
+      raw: (p.raw as object) ?? null,
+      updatedAt: now,
+    }
+    if (values.paidAt && Number.isNaN(values.paidAt.getTime())) values.paidAt = null
+    await db
+      .insert(jobPayments)
+      .values(values)
+      .onConflictDoUpdate({
+        target: [jobPayments.jobUuid, jobPayments.externalId],
+        targetWhere: sql`${jobPayments.externalId} is not null`,
+        set: { method: values.method, amount: values.amount, tipAmount: values.tipAmount, paidAt: values.paidAt, invoiceId: values.invoiceId, reference: values.reference, raw: values.raw, updatedAt: now },
+      })
+    stored++
+  }
+  if (skipped) await logSyncEvent("payments", { jobUuid, ok: false, summary: `${skipped} webhook payment record(s) had no id and were not stored`, details: { skipped } })
+  return { stored, skipped }
+}
+
+/**
+ * Replace the admin-confirmed payments for a job with a new set. Re-submitting the same
+ * form is idempotent, and clearing the set (empty array) removes the confirmation.
+ */
+export async function replaceManualPayments(jobUuid: string, entries: ManualPaymentEntry[], recordedBy: string): Promise<number> {
+  await db.transaction(async (tx) => {
+    await tx.delete(jobPayments).where(and(eq(jobPayments.jobUuid, jobUuid), eq(jobPayments.source, "manual")))
+    if (entries.length) {
+      await tx.insert(jobPayments).values(
+        entries.map((e) => ({
+          jobUuid,
+          externalId: null,
+          source: "manual",
+          method: e.method,
+          amount: e.amount.toFixed(2),
+          tipAmount: "0",
+          paidAt: e.paidAt ? new Date(e.paidAt) : null,
+          invoiceId: null,
+          reference: e.reference ?? null,
+          recordedBy,
+          raw: null,
+        })),
+      )
+    }
+  })
+  await logSyncEvent("payments", {
+    jobUuid,
+    ok: true,
+    summary: entries.length ? `Admin confirmed ${entries.length} payment(s): ${entries.map((e) => `$${e.amount.toFixed(2)} ${e.method}`).join(", ")}` : "Admin cleared confirmed payments",
+    details: { entries, recordedBy },
+  })
+  return entries.length
+}
+
 export async function getWorkizClient(settings?: WorkizSettings) {
   const s = settings ?? (await getWorkizSettings())
   if (!s.apiToken) throw new Error("Workiz API token is not configured. Add it in Admin → Workiz settings.")
@@ -167,7 +253,11 @@ export async function processRawJob(
   const settings = ctx?.settings ?? (await getWorkizSettings())
   const catalog = ctx?.catalog ?? (await loadColorSealCatalog())
 
-  const normalized = normalizeJob(raw, settings, catalog)
+  // The job payload has no payment records; merge whatever an invoice webhook or an admin
+  // has recorded for this job so a re-fetch never erases the known payment type.
+  const uuid = typeof raw.UUID === "string" ? raw.UUID : null
+  const externalPayments = uuid ? await loadExternalPayments(uuid, settings) : []
+  const normalized = normalizeJob(raw, settings, catalog, { externalPayments })
   await saveJobSnapshot(normalized, raw, source)
   const engine = await upsertPayoutsForJob(normalized, settings, source)
 
@@ -205,6 +295,47 @@ export async function syncJobByUuid(uuid: string, source: SyncSource = "rest", o
   if (!raw) throw new Error(`Workiz job ${uuid} not found`)
   const catalog = await loadColorSealCatalog()
   return processRawJob(raw, source, { settings, catalog, client, via: opts?.via })
+}
+
+/**
+ * An `invoice_*` webhook is the one Workiz surface that names the payment type. Resolve the
+ * job (Workiz's example puts the job uuid in `data.uuid`; other candidates get a turn), store
+ * the payments, then run the normal processing path. Returns null when no candidate is a job,
+ * after logging the invoice ids so the real payload shape can be confirmed from sync_events.
+ */
+export async function syncInvoiceWebhook(args: { uuidCandidates: string[]; invoice: InvoiceWebhookPayments | null; via: string }): Promise<JobSyncResult | null> {
+  const { client, settings } = await getWorkizClient()
+  const catalog = await loadColorSealCatalog()
+  let lastError: string | null = null
+  for (const candidate of args.uuidCandidates) {
+    let raw: WorkizRawJob | null = null
+    try {
+      raw = await client.getJob(candidate)
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+      if (!/not found/i.test(lastError)) throw err
+    }
+    if (!raw?.UUID) continue
+    if (args.invoice) {
+      const { stored, skipped } = await recordExternalPayments(raw.UUID, args.invoice.payments)
+      await logSyncEvent("payments", {
+        jobUuid: raw.UUID,
+        ok: true,
+        summary: `Invoice webhook (${args.via}) carried ${args.invoice.payments.length} payment record(s): stored ${stored}${skipped ? `, skipped ${skipped}` : ""}`,
+        details: { invoiceId: args.invoice.invoiceId, jobId: args.invoice.jobId, invoiceTotal: args.invoice.invoiceTotal, amountDue: args.invoice.amountDue, payments: args.invoice.payments.map((p) => ({ id: p.externalId, method: p.method, amount: p.amount, tipAmount: p.tipAmount, paidAt: p.paidAt })) },
+      })
+    } else {
+      await logSyncEvent("payments", { jobUuid: raw.UUID, ok: true, summary: `Invoice webhook (${args.via}) included no payments array; job re-synced from the balance only`, details: { candidates: args.uuidCandidates } })
+    }
+    return processRawJob(raw, "webhook", { settings, catalog, client, via: args.via })
+  }
+  await logSyncEvent("webhook", {
+    jobUuid: args.uuidCandidates[0] ?? null,
+    ok: false,
+    summary: `Invoice webhook (${args.via}) could not be matched to a job${lastError ? `: ${lastError}` : ""}`,
+    details: { candidates: args.uuidCandidates, invoiceId: args.invoice?.invoiceId ?? null, jobId: args.invoice?.jobId ?? null, paymentCount: args.invoice?.payments.length ?? null },
+  })
+  return null
 }
 
 export type ReconcileSummary = {

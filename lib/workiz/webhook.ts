@@ -1,4 +1,5 @@
 import { safeEqual } from "@/lib/security/crypto"
+import { extractInvoiceWebhookPayments, type InvoiceWebhookPayments } from "./payments"
 
 /**
  * Parsing for the Workiz Automation "post webhook" action.
@@ -11,6 +12,10 @@ import { safeEqual } from "@/lib/security/crypto"
  * `data.jobId` are internal ids the REST API cannot resolve, so they are never
  * used for lookups. The optional "Auth key" Workiz asks for is sent verbatim as
  * `Authorization: Bearer <key>`.
+ *
+ * Invoice events are the only payload that names the payment type
+ * (`data.payments: [{ id, type: "Cash", amount, tipAmount }]`); the job payload
+ * and the REST API never do, so those records are kept, not just used as a hint.
  */
 
 export type WebhookEventKind = "job" | "invoice" | "self_test" | "ignored" | "unknown"
@@ -23,6 +28,8 @@ export type ParsedWebhook = {
   uuidCandidates: string[]
   serialId: string | null
   status: string | null
+  /** Payment records from an invoice event; null when the payload had no `payments` array. */
+  invoice: InvoiceWebhookPayments | null
 }
 
 const SHORT_UUID = /^[A-Za-z0-9]{4,12}$/
@@ -80,6 +87,7 @@ export function parseWebhookBody(body: unknown, query?: URLSearchParams): Parsed
     uuidCandidates: Array.from(new Set(candidates)),
     serialId: str(data?.serialId) ?? str(root.SerialId) ?? null,
     status: str(data?.status) ?? str(root.Status) ?? null,
+    invoice: kind === "invoice" ? extractInvoiceWebhookPayments(data, str(trigger?.timestamp)) : null,
   }
 }
 

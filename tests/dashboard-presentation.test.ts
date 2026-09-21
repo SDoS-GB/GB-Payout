@@ -47,7 +47,7 @@ describe("paymentMethodsSummary", () => {
   })
   it("ignores tip payments when service payments exist and reports empty lists honestly", () => {
     expect(paymentMethodsSummary([{ id: "1", amount: 100, method: "Zelle", isCard: false, isTip: false, date: null }, { id: "2", amount: 20, method: "Cash", isCard: false, isTip: true, date: null }]).label).toBe("Zelle")
-    expect(paymentMethodsSummary([])).toEqual({ label: "No payments recorded", mixed: false, count: 0 })
+    expect(paymentMethodsSummary([])).toEqual({ label: "Payment details unavailable", mixed: false, count: 0 })
   })
 })
 

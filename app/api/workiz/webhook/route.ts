@@ -1,6 +1,6 @@
 import { NextResponse } from "next/server"
 import { getWorkizSettings } from "@/lib/settings"
-import { getWorkizClient, logSyncEvent, syncJobByUuid } from "@/lib/workiz/sync"
+import { getWorkizClient, logSyncEvent, syncInvoiceWebhook, syncJobByUuid } from "@/lib/workiz/sync"
 import { parseRawBody, parseWebhookBody, webhookAuthorized } from "@/lib/workiz/webhook"
 
 export const runtime = "nodejs"
@@ -15,8 +15,11 @@ const NO_STORE = { "Cache-Control": "no-store" }
  * changed to Done) and, separately, an invoice/payment trigger → "do this": post
  * webhook → URL = this route, Auth key = the secret from Admin → Workiz.
  *
- * The payload is only a hint: the job is always re-fetched through the REST API
- * before anything is calculated, so a spoofed body cannot inject amounts.
+ * The payload is only a hint for amounts: the job is always re-fetched through the
+ * REST API before anything is calculated, so a spoofed body cannot inject totals.
+ * Invoice events are the exception that matters: their `payments[]` is the only
+ * place Workiz ever states the payment type, so those records are stored (behind the
+ * same auth key) and merged into the job on every sync.
  */
 export async function POST(req: Request) {
   const settings = await getWorkizSettings()
@@ -59,6 +62,34 @@ export async function POST(req: Request) {
       const error = err instanceof Error ? err.message : String(err)
       await logSyncEvent("webhook", { ok: false, summary: `Self-test failed: ${error}`, details: { selfTest: true } })
       return NextResponse.json({ ok: false, selfTest: true, error }, { status: 502, headers: NO_STORE })
+    }
+  }
+
+  if (parsed.kind === "invoice") {
+    try {
+      const result = await syncInvoiceWebhook({ uuidCandidates: parsed.uuidCandidates, invoice: parsed.invoice, via })
+      if (!result) return NextResponse.json({ ok: false, error: "Invoice webhook did not match a Workiz job" }, { status: 404, headers: NO_STORE })
+      return NextResponse.json(
+        {
+          ok: true,
+          trigger: parsed.triggerType,
+          uuid: result.uuid,
+          status: result.normalized.status,
+          payments: result.normalized.payments.length,
+          payouts: result.engine,
+          notifications: result.notifications.map((n) => ({ payoutId: n.payoutId, status: n.status, reason: n.reason })),
+        },
+        { headers: NO_STORE },
+      )
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err)
+      await logSyncEvent("webhook", {
+        jobUuid: parsed.uuidCandidates[0],
+        ok: false,
+        summary: `Invoice webhook (${via}) failed: ${error}`,
+        details: { trigger: parsed.triggerType, candidates: parsed.uuidCandidates, invoiceId: parsed.invoice?.invoiceId ?? null },
+      })
+      return NextResponse.json({ ok: false, error }, { status: 502, headers: NO_STORE })
     }
   }
 

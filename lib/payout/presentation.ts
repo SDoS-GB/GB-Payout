@@ -1,4 +1,5 @@
 import type { NormalizedPayment } from "@/lib/db/schema"
+import { classifyPaymentMethod } from "@/lib/workiz/payments"
 
 /**
  * Pure, side-effect-free helpers shared by the admin read models and the
@@ -56,31 +57,38 @@ export function completionState(input: {
   return { state: "completed", at: input.lastStatusUpdate.toISOString() }
 }
 
-const METHOD_LABELS: Array<[RegExp, string]> = [
-  [/credit|card|visa|master|amex|discover|stripe|^cc$/i, "Card"],
-  [/check|cheque/i, "Check"],
-  [/cash/i, "Cash"],
-  [/zelle/i, "Zelle"],
-  [/venmo/i, "Venmo"],
-  [/ach|bank|wire/i, "Bank transfer"],
-  [/financ|wisetack|affirm/i, "Financing"],
-]
-
 export function paymentMethodLabel(method: string | null | undefined, isCard?: boolean): string {
-  const m = (method ?? "").trim()
   if (isCard) return "Card"
-  if (!m) return "Unknown method"
-  for (const [re, label] of METHOD_LABELS) if (re.test(m)) return label
-  return m.charAt(0).toUpperCase() + m.slice(1)
+  return classifyPaymentMethod(method).label
 }
 
-/** "Card + Check" for mixed jobs; "No payments recorded" when Workiz has none. */
+/** What the admin sees when a job has no payment records: Workiz's API never lists payments, so this is "unavailable", never "unpaid". */
+export const PAYMENT_DETAILS_UNAVAILABLE = "Payment details unavailable"
+
+/** "Card + Check" for mixed jobs; "Payment details unavailable" when no records reached the app. */
 export function paymentMethodsSummary(payments: NormalizedPayment[] | null | undefined): { label: string; mixed: boolean; count: number } {
   const service = (payments ?? []).filter((p) => !p.isTip)
   const all = service.length ? service : (payments ?? [])
-  if (all.length === 0) return { label: "No payments recorded", mixed: false, count: 0 }
+  if (all.length === 0) return { label: PAYMENT_DETAILS_UNAVAILABLE, mixed: false, count: 0 }
   const labels = Array.from(new Set(all.map((p) => paymentMethodLabel(p.method, p.isCard))))
   return { label: labels.join(" + "), mixed: labels.length > 1, count: all.length }
+}
+
+/** Provenance of one payment record, for the Status column and the "Paid by" fact. */
+export function paymentSourceLabel(payment: Pick<NormalizedPayment, "source" | "recordedBy">): string {
+  switch (payment.source) {
+    case "invoice-webhook":
+      return "From Workiz invoice webhook"
+    case "manual":
+      return `Confirmed by ${payment.recordedBy ?? "admin"} from the Workiz Payments tab`
+    default:
+      return "Recorded in Workiz"
+  }
+}
+
+/** True when at least one record came from Workiz itself rather than an admin. */
+export function hasWorkizPaymentRecords(payments: NormalizedPayment[] | null | undefined): boolean {
+  return (payments ?? []).some((p) => p.source !== "manual")
 }
 
 export type StatusExplanation = {
@@ -142,12 +150,27 @@ export function explainPayoutStatus(input: {
     }
   }
   if (/^payment method unknown/i.test(reason)) {
+    const body = reason.replace(/^payment method unknown:\s*/i, "")
+    if (/not recognised/i.test(reason)) {
+      return {
+        headline: "On hold: payment method not recognised",
+        detail: `${body.charAt(0).toUpperCase()}${body.slice(1)}. The amount shown assumes no card fee.`,
+        action: "Check the payment in Workiz. Confirm the payments below with the right method (card portions get the 3.5% deduction automatically), then the payout is re-gated.",
+      }
+    }
+    if (/cover only/i.test(reason)) {
+      return {
+        headline: "On hold: part of the payment has no type",
+        detail: `${body.charAt(0).toUpperCase()}${body.slice(1)}.`,
+        action: "Open the job's Payments tab in Workiz and confirm every payment below so the card and non-card portions are known.",
+      }
+    }
     return {
-      headline: "On hold: confirm how the customer paid",
+      headline: "On hold: payment details unavailable from Workiz",
       detail:
-        "Workiz's API returns the job balance but no payment records, so the sync cannot tell card from check/cash/Zelle. The amount shown assumes no card fee.",
+        "Workiz's job API reports the balance but not how the customer paid, and it has no endpoint that lists payments, so the sync cannot tell card from cash/check/Zelle. The amount shown assumes no card fee.",
       action:
-        "Check the payment in Workiz. If it was check, cash or Zelle, Release. If any of it was paid by card, do not release as-is: the 3.5% card deduction still has to be applied.",
+        "Open the job's Payments tab in Workiz and confirm the payments below (method, amount, date); card portions get the 3.5% deduction automatically and the payout is re-gated. Creating a Workiz invoice also works: its webhook reports the payment type.",
     }
   }
   if (/invoice total .* less than the service total/i.test(reason)) {
