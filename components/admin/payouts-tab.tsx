@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 import useSWR, { SWRConfig, unstable_serialize, useSWRConfig } from "swr"
 import { ChevronLeft, ChevronRight, RefreshCw, Search, X } from "lucide-react"
 import type { PayoutPage, PayoutRecord, AdminDashboardData } from "@/app/actions/admin"
-import { bulkMarkPaid, queryPayouts, reviewPayout, runReconcile, syncSingleJob } from "@/app/actions/admin"
+import { bulkMarkPaid, clearConfirmedPayments, confirmJobPayments, queryPayouts, reviewPayout, runReconcile, syncSingleJob } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -421,6 +421,10 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
         timezone={timezone}
         pending={pending}
         onAction={(id, action, note) => act(() => reviewPayout(id, action, note), `Payout #${id}: ${action.replace("-", " ")}`)}
+        payments={{
+          onConfirmPayments: (jobUuid, entries) => act(() => confirmJobPayments(jobUuid, entries), "Payments confirmed and job re-synced"),
+          onClearPayments: (jobUuid) => act(() => clearConfirmedPayments(jobUuid), "Payment confirmation cleared and job re-synced"),
+        }}
       />
     </div>
   )

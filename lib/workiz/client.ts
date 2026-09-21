@@ -123,8 +123,11 @@ export class WorkizClient {
     }
     // Workiz wraps payloads as { flag: boolean, data: ..., has_more?: boolean }.
     if (json && typeof json === "object" && "flag" in json && (json as { flag: unknown }).flag === false) {
+      // Workiz answers 200 + {flag:false, msg:"job Not Found"} for a missing record; keep the
+      // msg so callers can tell "not found" from a real failure.
+      const msg = (json as { msg?: unknown }).msg
       throw new WorkizApiError(
-        `Workiz ${method} ${path} returned flag=false`,
+        `Workiz ${method} ${path} returned flag=false${typeof msg === "string" && msg.trim() ? ` (${msg.trim()})` : ""}`,
         res.status,
         path,
         json,

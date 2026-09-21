@@ -162,6 +162,36 @@ export const notifications = pgTable(
   (t) => [uniqueIndex("notifications_payout_delivery_unique").on(t.payoutId).where(sql`${t.status} in ('sending', 'sent')`)],
 )
 
+/**
+ * Payment records Workiz's job API never returns. `job/get` only reports the balance
+ * (`JobAmountDue`); the payment type reaches us either through an invoice webhook
+ * (`data.payments[]`) or an admin confirming what the Workiz Payments tab shows.
+ * Rows are merged into the job's payments on every sync, so they survive re-fetches.
+ */
+export const jobPayments = pgTable(
+  "job_payments",
+  {
+    id: serial("id").primaryKey(),
+    jobUuid: text("job_uuid").notNull(),
+    /** Workiz payment id ("PAY-…") when the record came from Workiz; null for admin confirmations. */
+    externalId: text("external_id"),
+    /** invoice-webhook | manual */
+    source: text("source").notNull(),
+    method: text("method").notNull(),
+    amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+    tipAmount: numeric("tip_amount", { precision: 12, scale: 2 }).notNull().default("0"),
+    paidAt: timestamp("paid_at", { withTimezone: true }),
+    invoiceId: text("invoice_id"),
+    reference: text("reference"),
+    recordedBy: text("recorded_by"),
+    raw: jsonb("raw"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  // The same Workiz payment delivered twice (webhook retry, two automations) is one row.
+  (t) => [uniqueIndex("job_payments_external_unique").on(t.jobUuid, t.externalId).where(sql`${t.externalId} is not null`)],
+)
+
 export const appSettings = pgTable("app_settings", {
   key: text("key").primaryKey(),
   value: jsonb("value").notNull(),
@@ -196,6 +226,9 @@ export type NormalizedLineItem = {
   matchedBy: "catalog" | "keyword" | "none"
 }
 
+/** Where a payment record came from. Absent on rows saved before provenance was tracked (all were job payloads). */
+export type PaymentSource = "workiz-job" | "invoice-webhook" | "manual"
+
 export type NormalizedPayment = {
   id: string | null
   amount: number
@@ -203,7 +236,14 @@ export type NormalizedPayment = {
   isCard: boolean
   isTip: boolean
   date: string | null
+  source?: PaymentSource
+  /** False when the method text is not one we can place on the card / non-card side; the payout is held. */
+  methodKnown?: boolean
+  /** Admin who confirmed a manual record. */
+  recordedBy?: string | null
 }
+
+export type JobPaymentRow = typeof jobPayments.$inferSelect
 
 export type TechnicianProfile = typeof technicianProfiles.$inferSelect
 export type WorkizJobRow = typeof workizJobs.$inferSelect

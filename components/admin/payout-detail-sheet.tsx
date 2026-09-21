@@ -10,10 +10,26 @@ import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
 import { segmentLabel } from "@/lib/payout/segments"
-import { explainPayoutStatus, lineItemOwnership, paymentMethodLabel, paymentMethodsSummary, workizJobUrl } from "@/lib/payout/presentation"
+import {
+  PAYMENT_DETAILS_UNAVAILABLE,
+  explainPayoutStatus,
+  hasWorkizPaymentRecords,
+  lineItemOwnership,
+  paymentMethodLabel,
+  paymentMethodsSummary,
+  paymentSourceLabel,
+  workizJobUrl,
+} from "@/lib/payout/presentation"
+import type { ManualPaymentEntry } from "@/lib/workiz/payments"
+import { PaymentConfirmationForm } from "./payment-confirmation-form"
 import { InlineMessage, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
 
 type ReviewAction = Parameters<typeof reviewPayout>[1]
+
+export type PaymentHandlers = {
+  onConfirmPayments: (jobUuid: string, entries: ManualPaymentEntry[]) => void
+  onClearPayments: (jobUuid: string) => void
+}
 
 /** Shape of the JSON snapshot the engine saves with every payout (lib/payout/engine.ts). */
 type Snapshot = Partial<{
@@ -89,6 +105,7 @@ export function PayoutDetailSheet({
   timezone,
   pending,
   onAction,
+  payments,
 }: {
   record: PayoutRecord | null
   open: boolean
@@ -96,17 +113,30 @@ export function PayoutDetailSheet({
   timezone: string
   pending: boolean
   onAction: (id: number, action: ReviewAction, note?: string) => void
+  payments: PaymentHandlers
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl">
-        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} />}
+        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} paymentHandlers={payments} />}
       </SheetContent>
     </Sheet>
   )
 }
 
-function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; timezone: string; pending: boolean; onAction: (id: number, action: ReviewAction, note?: string) => void }) {
+function PayoutDetail({
+  p,
+  timezone,
+  pending,
+  onAction,
+  paymentHandlers,
+}: {
+  p: PayoutRecord
+  timezone: string
+  pending: boolean
+  onAction: (id: number, action: ReviewAction, note?: string) => void
+  paymentHandlers: PaymentHandlers
+}) {
   const [note, setNote] = useState(p.adminNote ?? "")
   useEffect(() => setNote(p.adminNote ?? ""), [p.adminNote])
 
@@ -130,6 +160,11 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
   const payments = [...(job?.payments ?? [])].sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))
   const methods = paymentMethodsSummary(job?.payments)
   const paymentDates = Array.from(new Set(payments.map((x) => (x.date ? zonedDate(x.date, timezone) : null)).filter(Boolean) as string[]))
+  const manualPayments = payments.filter((x) => x.source === "manual" && !x.isTip)
+  const fromWorkiz = hasWorkizPaymentRecords(payments)
+  // Offer the confirmation form only where it is the missing piece: an unpaid-to-tech payout
+  // whose payment type Workiz did not supply (or that an admin already transcribed).
+  const canConfirmPayments = Boolean(job) && (p.status === "pending" || p.status === "hold") && !fromWorkiz
   const jobTotal = num(job?.jobTotal)
   const tax = job?.taxAmount == null ? null : num(job.taxAmount)
   // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
@@ -159,7 +194,7 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
       case "whole-job":
         return { text: p.splitCount > 1 ? `Whole job · shared by ${p.splitCount} technicians` : "Whole job", mine: true }
       case "this-technician":
-        return { text: p.segmentKind === "dedicated" ? `${p.profileName} · ${label ?? "marked work"}` : `${p.profileName} · crew work`, mine: true }
+        return { text: p.segmentKind === "dedicated" ? `${p.profileName} �� ${label ?? "marked work"}` : `${p.profileName} · crew work`, mine: true }
       case "crew":
         return { text: "Crew work · not this technician", mine: false }
       case "dedicated":
@@ -293,7 +328,7 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
                       ? `Not completed · Workiz status is "${p.completion.status}"`
                       : `Completion date unavailable · ${p.completion.reason}`,
               ],
-              ["Customer payment dates", paymentDates.length ? paymentDates.join(", ") : payments.length ? "Payments recorded without dates" : "No payments recorded"],
+              ["Customer payment dates", paymentDates.length ? paymentDates.join(", ") : payments.length ? "Payments recorded without dates" : PAYMENT_DETAILS_UNAVAILABLE],
               job?.paymentDueDate ? ["Payment due (Workiz)", zonedDate(job.paymentDueDate, timezone)] : null,
               ["Last Workiz sync", job?.lastSeenAt ? zonedDateTime(job.lastSeenAt, timezone) : "Unavailable"],
               ["Payout last updated", zonedDateTime(p.updatedAt, timezone)],
@@ -409,32 +444,49 @@ function PayoutDetail({ p, timezone, pending, onAction }: { p: PayoutRecord; tim
                 <TableBody>
                   {payments.map((pay, i) => (
                     <TableRow key={`${pay.id ?? "pay"}-${i}`}>
-                      <TableCell className="text-sm">{pay.date ? zonedDate(pay.date, timezone) : <span className="text-muted-foreground">No date</span>}</TableCell>
-                      <TableCell className="whitespace-normal text-sm">{paymentMethodLabel(pay.method, pay.isCard)}{pay.method && paymentMethodLabel(pay.method, pay.isCard).toLowerCase() !== pay.method.toLowerCase() ? <span className="ml-1 text-xs text-muted-foreground">({pay.method})</span> : null}</TableCell>
+                      <TableCell className="text-sm">{pay.date ? zonedDateTime(pay.date, timezone) : <span className="text-muted-foreground">No date</span>}</TableCell>
+                      <TableCell className="whitespace-normal text-sm">
+                        {paymentMethodLabel(pay.method, pay.isCard)}
+                        {pay.method && paymentMethodLabel(pay.method, pay.isCard).toLowerCase() !== pay.method.toLowerCase() ? <span className="ml-1 text-xs text-muted-foreground">({pay.method})</span> : null}
+                        {pay.methodKnown === false && <span className="ml-1 text-xs text-destructive">not recognised</span>}
+                      </TableCell>
                       <TableCell className="text-sm">{pay.isTip ? "Tip" : "Service"}</TableCell>
                       <TableCell className="text-right tabular-nums">{money(pay.amount)}</TableCell>
-                      <TableCell className="text-xs text-muted-foreground">Recorded in Workiz</TableCell>
+                      <TableCell className="whitespace-normal text-xs text-muted-foreground">{paymentSourceLabel(pay)}</TableCell>
                     </TableRow>
                   ))}
                 </TableBody>
               </Table>
             </div>
           ) : (
-            <p className="text-sm text-muted-foreground">
-              {collectedPerWorkiz !== null && collectedPerWorkiz > 0
-                ? `Workiz did not return individual payment records for this job, but its balance shows ${money(collectedPerWorkiz)} has been collected so far.`
-                : "No customer payment records returned by Workiz yet."}
-            </p>
+            <div className="flex flex-col gap-1 text-sm">
+              <p className="font-medium">{PAYMENT_DETAILS_UNAVAILABLE}</p>
+              <p className="text-muted-foreground">
+                {workizDue !== null
+                  ? `Workiz's job API reports only the balance (${money(workizDue)} due of ${money(grandTotal)}), not individual payments or how they were made. ${collectedPerWorkiz !== null && collectedPerWorkiz > 0 ? `Its balance shows ${money(collectedPerWorkiz)} has been collected.` : ""}`.trim()
+                  : "Workiz returned neither payment records nor a balance for this job."}
+              </p>
+            </div>
+          )}
+          {canConfirmPayments && (
+            <PaymentConfirmationForm
+              jobUuid={p.jobUuid}
+              invoiceTotal={workizInvoiceTotal}
+              existing={manualPayments}
+              pending={pending}
+              onConfirm={paymentHandlers.onConfirmPayments}
+              onClear={paymentHandlers.onClearPayments}
+            />
           )}
           <Facts
             rows={[
-              ["Paid by", methods.count ? `${methods.label}${methods.mixed ? " (mixed)" : ""}` : "No payment records"],
+              ["Paid by", methods.count ? `${methods.label}${methods.mixed ? " (mixed)" : ""}${manualPayments.length && !fromWorkiz ? " · confirmed by admin" : ""}` : PAYMENT_DETAILS_UNAVAILABLE],
               ["Invoice subtotal", job?.subTotal != null ? money(job.subTotal) : "Not provided by Workiz"],
               ["Discount", job ? `−${money(job.discountAmount)}` : "Unavailable"],
               ["Tip", job ? money(tipsTotal) : "Unavailable"],
               ["Tax", tax != null ? money(tax) : unitemized > 0.005 ? `${money(unitemized)} · tax/fees not itemized by Workiz` : "Not provided by Workiz"],
               [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
-              ["Payments received", job ? (payments.length ? money(totalPaid) : collectedPerWorkiz !== null ? `${money(collectedPerWorkiz)} · per Workiz balance, no payment records` : money(totalPaid)) : "Unavailable"],
+              ["Payments received", job ? (payments.length ? money(totalPaid) : collectedPerWorkiz !== null ? `${money(collectedPerWorkiz)} · per Workiz balance, payment details unavailable` : money(totalPaid)) : "Unavailable"],
               [
                 "Remaining balance",
                 job
