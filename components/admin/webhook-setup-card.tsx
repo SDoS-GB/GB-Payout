@@ -56,7 +56,7 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
         )}
 
         <ol className="flex flex-col gap-5">
-          <Step n={1} title="Create the auth key" done={workiz.hasWebhookSecret}>
+          <SetupStep n={1} title="Create the auth key" done={workiz.hasWebhookSecret}>
             <p className="text-xs text-muted-foreground">
               Workiz sends this key with every call so nobody else can trigger a sync. Paste the key exactly as shown; Workiz adds the word
               &quot;Bearer&quot; itself.
@@ -92,18 +92,18 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
                 </Button>
               </div>
             </div>
-          </Step>
+          </SetupStep>
 
-          <Step n={2} title="Copy the webhook URL">
+          <SetupStep n={2} title="Copy the webhook URL">
             <div className="flex items-center gap-2">
               <Input readOnly value={webhookUrl} className="font-mono text-xs" aria-label="Webhook URL" />
               <Button type="button" size="icon" variant="outline" onClick={() => copy("url", webhookUrl)} aria-label="Copy webhook URL">
                 {copied === "url" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
               </Button>
             </div>
-          </Step>
+          </SetupStep>
 
-          <Step n={3} title="Create two automations in Workiz">
+          <SetupStep n={3} title="Create two automations in Workiz">
             <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm leading-relaxed">
               <li>
                 In Workiz open <span className="font-medium">Automations</span> (top bar) and select <span className="font-medium">Add automation</span>.
@@ -128,9 +128,9 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
               Lead and estimate events are ignored automatically. Each event only tells the app which job changed; every amount is re-read from the Workiz
               API before a payout is calculated.
             </p>
-          </Step>
+          </SetupStep>
 
-          <Step n={4} title="Confirm it works" done={Boolean(workiz.lastWebhook?.ok)}>
+          <SetupStep n={4} title="Confirm it works" done={Boolean(workiz.lastWebhook?.ok)}>
             <div className="flex flex-col gap-2 sm:flex-row sm:items-center">
               <Button
                 type="button"
@@ -155,7 +155,7 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
                 &quot;Connected&quot; and the job shows up under Activity.
               </p>
             </div>
-          </Step>
+          </SetupStep>
         </ol>
 
         {msg && <InlineMessage tone={msg.tone}>{msg.text}</InlineMessage>}
@@ -169,7 +169,7 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
   )
 }
 
-function Step({ n, title, done, children }: { n: number; title: string; done?: boolean; children: React.ReactNode }) {
+export function SetupStep({ n, title, done, children }: { n: number; title: string; done?: boolean; children: React.ReactNode }) {
   return (
     <li className="flex gap-3">
       <span

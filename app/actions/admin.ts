@@ -38,7 +38,8 @@ import {
 } from "@/lib/settings"
 import { WorkizApiError, WorkizClient } from "@/lib/workiz/client"
 import { parseWorkizDate } from "@/lib/workiz/time"
-import { logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
+import { applyPayoutReadyTag, describeTagOutcome, getWorkizClient, logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
+import { DEFAULT_PAYOUT_READY_TAG, explainNotApplied, normalizeTagName } from "@/lib/workiz/tags"
 
 type Result<T = undefined> = { ok: true; data?: T } | { ok: false; error: string }
 
@@ -147,6 +148,64 @@ export async function testWebhookEndpoint(): Promise<Result<{ summary: string }>
   } catch (err) {
     return fail(err)
   }
+}
+
+export async function updatePayoutTagSettings(form: { enabled: boolean; tag: string }): Promise<Result<{ tag: string }>> {
+  try {
+    await requireAdmin()
+    const tag = normalizeTagName(form.tag) || DEFAULT_PAYOUT_READY_TAG
+    if (tag.length > 60) throw new Error("Tag name is too long (max 60 characters).")
+    await saveWorkizSettings({ payoutReadyTagEnabled: Boolean(form.enabled), payoutReadyTag: tag }, "admin")
+    await logSyncEvent("settings", { ok: true, summary: `Payout-ready tagging ${form.enabled ? "enabled" : "disabled"} · tag "${tag}"` })
+    revalidatePath("/admin")
+    return { ok: true, data: { tag } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/**
+ * Add the payout-ready tag to one job right now, regardless of its payouts, so the admin can
+ * confirm the Workiz automation texts them. The tag cannot be removed through the API afterwards.
+ */
+export async function tagJobForPayoutTest(jobRef: string): Promise<Result<{ summary: string }>> {
+  try {
+    await requireAdmin()
+    const ref = jobRef.trim()
+    if (!ref) throw new Error("Enter a job number or UUID.")
+    const where = /^\d+$/.test(ref) ? eq(workizJobs.serialId, ref) : eq(workizJobs.uuid, ref)
+    const [job] = await db.select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId }).from(workizJobs).where(where).limit(1)
+    if (!job) throw new Error(`Job ${ref} has not been synced yet. Run Sync now, or paste the job's UUID.`)
+
+    const { client, settings } = await getWorkizClient()
+    const fresh = await client.getJob(job.uuid)
+    if (!fresh) throw new Error(`Workiz job ${job.uuid} not found`)
+    const existingTags = Array.isArray(fresh.Tags) ? (fresh.Tags as unknown[]).map(String) : []
+    const outcome = await applyPayoutReadyTag({ client, uuid: job.uuid, serialId: job.serialId, existingTags, settings, force: true, via: "admin-test" })
+    revalidatePath("/admin")
+
+    const label = job.serialId ? `#${job.serialId}` : job.uuid
+    if (outcome.action === "skip") {
+      if (outcome.reason === "already-tagged") return { ok: true, data: { summary: `Job ${label} already carries "${settings.payoutReadyTag}", so Workiz will not fire again for it. Test with a different job.` } }
+      throw new Error(`Nothing to do: ${describeTagOutcome(outcome)}`)
+    }
+    if ("error" in outcome) throw new Error(outcome.error)
+    if (outcome.verdict !== "applied") throw new Error(explainNotApplied(outcome.tag))
+    return { ok: true, data: { summary: `Tagged job ${label} with "${outcome.tag}". If your Workiz automation is live, the text is on its way.` } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/** Newest payout-ready tagging attempt, for the text-alerts status badge. */
+async function latestTagEvent() {
+  const [row] = await db
+    .select({ createdAt: syncEvents.createdAt, ok: syncEvents.ok, summary: syncEvents.summary })
+    .from(syncEvents)
+    .where(eq(syncEvents.kind, "job:tag"))
+    .orderBy(desc(syncEvents.createdAt))
+    .limit(1)
+  return row ?? null
 }
 
 /** Newest webhook that Workiz itself sent (self-tests excluded), for the setup status badge. */
@@ -407,13 +466,36 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
     await db.update(payouts).set(set).where(eq(payouts.id, id))
     // A release makes the payout ready, so it gets the same ready-to-pay message a sync would
     // produce; notifyPayout only previews unless sending is enabled and never delivers twice.
-    if (action === "release") await notifyPayout(id)
+    if (action === "release") {
+      await notifyPayout(id)
+      await tagReleasedJob(id)
+    }
     revalidatePath("/admin")
     revalidatePath("/payouts")
     return { ok: true }
   } catch (err) {
     return fail(err)
   }
+}
+
+/**
+ * A released hold is now a ready payout, so the job should be tagged without waiting for the
+ * next cron. Best-effort: tagging problems are logged by applyPayoutReadyTag, never surfaced here.
+ */
+async function tagReleasedJob(payoutId: number) {
+  const settings = await getWorkizSettings()
+  if (!settings.payoutReadyTagEnabled || !settings.apiToken) return
+  const [row] = await db
+    .select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId, raw: workizJobs.raw })
+    .from(payouts)
+    .innerJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
+    .where(eq(payouts.id, payoutId))
+    .limit(1)
+  if (!row) return
+  const rawTags = (row.raw as { Tags?: unknown } | null)?.Tags
+  const existingTags = Array.isArray(rawTags) ? rawTags.map(String) : []
+  const client = new WorkizClient({ apiToken: settings.apiToken, apiSecret: settings.apiSecret })
+  await applyPayoutReadyTag({ client, uuid: row.uuid, serialId: row.serialId, existingTags, settings, via: "release" })
 }
 
 export async function bulkMarkPaid(ids: number[]): Promise<Result<{ count: number }>> {
@@ -667,7 +749,7 @@ async function unmappedTeamImpact(teamIds: string[]) {
 
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook, lastTagEvent] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
@@ -677,6 +759,7 @@ export async function loadAdminDashboard() {
     payoutStatusCounts(),
     queryPayouts(DEFAULT_PAYOUT_QUERY),
     latestWorkizWebhook(),
+    latestTagEvent(),
   ])
 
   const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
@@ -716,6 +799,9 @@ export async function loadAdminDashboard() {
       tipKeywords: workiz.tipKeywords,
       reconcileLookbackDays: workiz.reconcileLookbackDays,
       businessTimezone: workiz.businessTimezone || DEFAULT_BUSINESS_TIMEZONE,
+      payoutReadyTagEnabled: workiz.payoutReadyTagEnabled,
+      payoutReadyTag: workiz.payoutReadyTag,
+      lastTagEvent,
     },
     notifications: notif,
     events,

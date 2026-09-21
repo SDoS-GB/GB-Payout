@@ -197,6 +197,17 @@ export class WorkizClient {
     })
   }
 
+  /**
+   * POST job/update/ — partial update. Only `UUID` plus the fields being changed are sent.
+   * `Tags` MERGES with the job's existing tags and unknown tag names are silently dropped;
+   * see lib/workiz/tags.ts for the verified semantics before using this for anything else.
+   */
+  async updateJob(uuid: string, fields: { Tags?: string[]; SubStatus?: string }) {
+    return this.request<{ flag?: boolean; data?: unknown }>("POST", "job/update/", {
+      body: { UUID: uuid, ...fields },
+    })
+  }
+
   /** Cheap credential probe used by the admin settings screen. */
   async probe() {
     const started = Date.now()

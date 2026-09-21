@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation"
 import { Radio, Trash2 } from "lucide-react"
 import type { AdminDashboardData } from "@/app/actions/admin"
 import { deleteColorSealItem, probeWorkiz, updateWorkizSettings, upsertColorSealItem } from "@/app/actions/admin"
+import { PayoutTextAlertsCard } from "./payout-text-alerts-card"
 import { WebhookSetupCard } from "./webhook-setup-card"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -124,6 +125,12 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
                   Reconcile lookback (days)
                 </Label>
                 <Input id="lookback" type="number" min={1} max={90} value={form.reconcileLookbackDays} onChange={(e) => setForm({ ...form, reconcileLookbackDays: Number(e.target.value) })} />
+                {form.reconcileLookbackDays < 30 && (
+                  <p className="text-xs text-destructive" role="status">
+                    Workiz filters by scheduled date, so the 6-hour reconcile will only see jobs scheduled in the last {form.reconcileLookbackDays || 0}{" "}
+                    day{form.reconcileLookbackDays === 1 ? "" : "s"}. A job scheduled earlier and paid today is only caught if the webhook fires. 60 is recommended.
+                  </p>
+                )}
               </div>
             </div>
 
@@ -204,6 +211,8 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
       </Card>
 
       <WebhookSetupCard workiz={workiz} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />
+
+      <PayoutTextAlertsCard workiz={workiz} dashboardUrl={webhookUrl.replace(/\/api\/workiz\/webhook$/, "") + "/admin"} />
 
       <ColorSealCatalog catalog={catalog} />
     </div>
