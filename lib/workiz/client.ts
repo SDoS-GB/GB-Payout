@@ -197,6 +197,18 @@ export class WorkizClient {
     })
   }
 
+  /**
+   * POST job/update/ — partial update. Only `UUID` plus the fields being changed are sent.
+   * The published schema (developer.workiz.com/api.json → updateResponse) lists `Tags` as a
+   * plain string array; whether it replaces or merges is verified live by
+   * tests/live-workiz-tags.probe.test.ts and encoded in lib/workiz/tags.ts.
+   */
+  async updateJob(uuid: string, fields: { Tags?: string[]; SubStatus?: string }) {
+    return this.request<{ flag?: boolean; data?: unknown }>("POST", "job/update/", {
+      body: { UUID: uuid, ...fields },
+    })
+  }
+
   /** Cheap credential probe used by the admin settings screen. */
   async probe() {
     const started = Date.now()
