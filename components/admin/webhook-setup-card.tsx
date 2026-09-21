@@ -117,6 +117,10 @@ export function WebhookSetupCard({ workiz, webhookUrl, cronConfigured }: { worki
                 Paste the URL from step 2 and the key from step 1 into <span className="font-medium">Auth key</span>. Save.
               </li>
               <li>
+                Do <span className="font-medium">not</span> add a condition on the payout-ready tag here. Workiz checks conditions the instant the job
+                changes status, before this app has tagged it, so the webhook would never fire.
+              </li>
+              <li>
                 Select <span className="font-medium">Add automation</span>.
               </li>
               <li>
