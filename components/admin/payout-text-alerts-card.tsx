@@ -30,7 +30,7 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
   const status = alertStatus(workiz)
   const tagApplied = Boolean(workiz.lastTagEvent?.ok)
   const messageTemplate = `Mark paid: ${dashboardUrl}`
-  const previewBlock = ["PAYOUT READY (GB app)", "Pay Arthur $95.00", "Job #924738 - Grout Cleaning - Milano", "Paid $475.00 by Card on Sep 21, 2:45 PM", "Tip $20.00 (Arthur gets $10.00)"].join("\n")
+  const previewBlock = ["PAYOUT READY (GB app)", "Pay Arthur $105.00 (total and tip included)", "Job #924738 - Grout Cleaning - Milano", "Paid $475.00 by Card on Sep 21, 2:45 PM", "Tip $20.00"].join("\n")
 
   const copyTemplate = async () => {
     try {

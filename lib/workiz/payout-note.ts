@@ -55,7 +55,8 @@ export function buildPayoutNote(input: PayoutNoteInput): string {
   } else {
     for (const tech of input.techs) {
       const scope = segmentScope(tech)
-      lines.push(`Pay ${tech.name} ${formatCurrency(tech.total)}${scope ? ` (${scope})` : ""}`)
+      const included = tech.tip > 0 ? "total and tip included" : "total"
+      lines.push(`Pay ${tech.name} ${formatCurrency(tech.total)} (${scope ? `${scope}, ` : ""}${included})`)
     }
   }
 
@@ -105,8 +106,7 @@ function tipSummary(input: PayoutNoteInput): string | null {
   const fromRecords = input.payments.filter((p) => p.isTip).reduce((sum, p) => sum + p.amount, 0)
   const tipTotal = input.tipTotal > 0 ? input.tipTotal : fromRecords
   if (tipTotal <= 0) return null
-  const shares = input.techs.filter((t) => t.tip > 0).map((t) => `${t.name} gets ${formatCurrency(t.tip)}`)
-  return `Tip ${formatCurrency(tipTotal)}${shares.length ? ` (${shares.join(", ")})` : ""}`
+  return `Tip ${formatCurrency(tipTotal)}`
 }
 
 function latestPaymentDate(records: NormalizedPayment[], timeZone: string): string | null {

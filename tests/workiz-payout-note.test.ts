@@ -30,9 +30,25 @@ describe("buildPayoutNote", () => {
     const note = buildPayoutNote(input())
     expect(note.split("\n")).toEqual([
       PAYOUT_NOTE_HEADER,
-      "Pay Arthur $9.65",
+      "Pay Arthur $9.65 (total)",
       "Job #924886 - Grout Cleaning - Jane Doe",
       "Paid $50.00 by Card on Sep 21, 2:45 PM",
+    ])
+  })
+
+  it("matches the admin's requested layout when there is a tip", () => {
+    const note = buildPayoutNote(
+      input({
+        tipTotal: 5,
+        techs: [{ name: "Arthur", total: 12.06, tip: 2.41, segmentKind: "job", segmentMarker: null }],
+      }),
+    )
+    expect(note.split("\n")).toEqual([
+      PAYOUT_NOTE_HEADER,
+      "Pay Arthur $12.06 (total and tip included)",
+      "Job #924886 - Grout Cleaning - Jane Doe",
+      "Paid $50.00 by Card on Sep 21, 2:45 PM",
+      "Tip $5.00",
     ])
   })
 
@@ -52,8 +68,8 @@ describe("buildPayoutNote", () => {
         ],
       }),
     )
-    expect(note).toContain("Pay Tim $160.00 (*T* items)")
-    expect(note).toContain("Pay Denis $40.00 (crew, excl. *T*)")
+    expect(note).toContain("Pay Tim $160.00 (*T* items, total)")
+    expect(note).toContain("Pay Denis $40.00 (crew, excl. *T*, total)")
     expect(note).toContain("Paid $400.00 by Zelle on Sep 21, 10:00 AM")
   })
 
@@ -70,7 +86,7 @@ describe("buildPayoutNote", () => {
     expect(note).toContain("Paid $100.00: $60.00 Card + $40.00 Cash on Sep 21, 11:00 AM")
   })
 
-  it("adds a tip line with each technician's share and omits it when there is no tip", () => {
+  it("adds a plain tip line, marks only the techs whose total includes tip, and omits the line when there is no tip", () => {
     const withTip = buildPayoutNote(
       input({
         tipTotal: 20,
@@ -80,7 +96,10 @@ describe("buildPayoutNote", () => {
         ],
       }),
     )
-    expect(withTip).toContain("Tip $20.00 (Arthur gets $10.00)")
+    expect(withTip).toContain("Pay Arthur $19.65 (total and tip included)")
+    expect(withTip).toContain("Pay Denis $9.65 (total)")
+    expect(withTip).toContain("\nTip $20.00")
+    expect(withTip).not.toContain("gets")
     expect(buildPayoutNote(input())).not.toContain("Tip")
   })
 
