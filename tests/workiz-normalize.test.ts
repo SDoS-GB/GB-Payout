@@ -21,17 +21,20 @@ const baseJob = {
 }
 
 describe("normalizeJob – revenue & discounts", () => {
-  it("uses SubTotal as the post-discount, pre-tax service revenue", () => {
+  // Verified against live job/get payloads (Sept 2026): SubTotal is the PRE-discount sum of the
+  // service lines, discounts are LineItems with Type "DISCOUNT_TYPE" and a positive Price, and
+  // JobTotalPrice = SubTotal - discounts (+ unitemized tax). 7 of 9 discounted live jobs matched exactly.
+  it("treats SubTotal as pre-discount and subtracts DISCOUNT_TYPE lines to reach the service revenue", () => {
     const job = normalizeJob(
       {
         ...baseJob,
-        SubTotal: 900,
-        JobTotal: 963,
+        SubTotal: 1000,
+        JobTotalPrice: 963,
         TaxAmount: 63,
-        Discount: 100,
-        Items: [
-          { Name: "Frameless shower door", Price: 800, Quantity: 1 },
-          { Name: "Color Seal upgrade", Price: 200, Quantity: 1 },
+        LineItems: [
+          { Name: "Frameless shower door", Price: 800, Quantity: 1, Type: "service" },
+          { Name: "Color Seal upgrade", Price: 200, Quantity: 1, Type: "service" },
+          { Name: "discount", Price: 100, Quantity: 1, Type: "DISCOUNT_TYPE" },
         ],
         Payments: [{ Amount: 963, Method: "Credit Card" }],
       },
@@ -40,6 +43,7 @@ describe("normalizeJob – revenue & discounts", () => {
     )
     expect(job.jobTotal).toBe(900)
     expect(job.discountAmount).toBe(100)
+    expect(job.lineItems.find((i) => i.isDiscount)?.total).toBe(-100)
     // Color seal 200 of 1000 gross scales to 900 net → 180
     expect(job.colorSealTotal).toBe(180)
     expect(job.taxAmount).toBe(63)
@@ -47,6 +51,28 @@ describe("normalizeJob – revenue & discounts", () => {
     expect(job.cardServiceAmount).toBe(900)
     expect(job.nonCardServiceAmount).toBe(0)
     expect(job.fullyPaid).toBe(true)
+  })
+
+  it("treats a JobTotalPrice shortfall with no discount line as an unitemized whole-job discount and flags it (live job #924820)", () => {
+    const job = normalizeJob(
+      { ...baseJob, Team: [{ id: 15, Name: "Tim" }], SubTotal: 475, JobTotalPrice: 425, JobAmountDue: 0, LineItems: [{ Name: "Walk-in Shower Restoration & Seal", Price: 475, Quantity: 1, Type: "service" }] },
+      settings,
+      noCatalog,
+    )
+    expect(job.jobTotal).toBe(425)
+    expect(job.discountAmount).toBe(50)
+    expect(job.warnings.some((w) => w.startsWith("Unitemized discount"))).toBe(true)
+  })
+
+  it("does not lower the service total when JobTotalPrice is higher (unitemized tax or fees), only notes it", () => {
+    const job = normalizeJob(
+      { ...baseJob, SubTotal: 450, JobTotalPrice: 457.43, JobAmountDue: 0, LineItems: [{ Name: "Regrout", Price: 450, Quantity: 1, Type: "service" }] },
+      settings,
+      noCatalog,
+    )
+    expect(job.jobTotal).toBe(450)
+    expect(job.discountAmount).toBe(0)
+    expect(job.warnings.some((w) => w.startsWith("Workiz invoice total exceeds"))).toBe(true)
   })
 
   it("derives discounts from negative line items when Workiz gives no Discount field", () => {
@@ -144,11 +170,24 @@ describe("normalizeJob – mixed payments and tips", () => {
     expect(job.nonCardServiceAmount).toBe(500)
   })
 
-  it("flags jobs with no payment data and assumes non-card", () => {
+  it("flags jobs with no payment data or balance as payment-method-unknown and provisionally non-card", () => {
     const job = normalizeJob({ ...baseJob, SubTotal: 300, Items: [{ Name: "Door", Price: 300 }] }, settings, noCatalog)
-    expect(job.warnings.some((w) => w.startsWith("No payment records"))).toBe(true)
+    expect(job.warnings.some((w) => w.startsWith("Payment method unknown"))).toBe(true)
     expect(job.nonCardServiceAmount).toBe(300)
     expect(job.fullyPaid).toBe(false)
+    expect(job.paidEvidence).toBe("none")
+  })
+
+  it("uses the Workiz balance as the only paid signal when the payload has no Payments (live shape) and still flags the method", () => {
+    const paid = normalizeJob({ ...baseJob, SubTotal: 300, JobTotalPrice: 300, JobAmountDue: 4.5474735088646e-13, LineItems: [{ Name: "Door", Price: 300, Quantity: 1 }] }, settings, noCatalog)
+    expect(paid.fullyPaid).toBe(true)
+    expect(paid.paidEvidence).toBe("balance")
+    expect(paid.totalPaid).toBe(300)
+    expect(paid.warnings.some((w) => w.startsWith("Payment method unknown"))).toBe(true)
+
+    const partial = normalizeJob({ ...baseJob, SubTotal: 300, JobTotalPrice: 300, JobAmountDue: 200, LineItems: [{ Name: "Door", Price: 300, Quantity: 1 }] }, settings, noCatalog)
+    expect(partial.fullyPaid).toBe(false)
+    expect(partial.totalPaid).toBe(100)
   })
 })
 

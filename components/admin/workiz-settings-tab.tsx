@@ -2,9 +2,10 @@
 
 import { useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
-import { Check, Copy, KeyRound, Radio, Trash2 } from "lucide-react"
+import { Radio, Trash2 } from "lucide-react"
 import type { AdminDashboardData } from "@/app/actions/admin"
-import { deleteColorSealItem, probeWorkiz, rotateWebhookSecret, updateWorkizSettings, upsertColorSealItem } from "@/app/actions/admin"
+import { deleteColorSealItem, probeWorkiz, updateWorkizSettings, upsertColorSealItem } from "@/app/actions/admin"
+import { WebhookSetupCard } from "./webhook-setup-card"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -32,17 +33,6 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
     businessTimezone: workiz.businessTimezone,
   })
   const [probe, setProbe] = useState<Awaited<ReturnType<typeof probeWorkiz>> | null>(null)
-  const [copied, setCopied] = useState<string | null>(null)
-
-  const copy = async (label: string, value: string) => {
-    try {
-      await navigator.clipboard.writeText(value)
-      setCopied(label)
-      setTimeout(() => setCopied(null), 1500)
-    } catch {
-      setCopied(null)
-    }
-  }
 
   return (
     <div className="flex flex-col gap-4">
@@ -56,8 +46,12 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
               </CardDescription>
             </div>
             <div className="flex items-center gap-2">
-              <Badge variant={workiz.hasApiToken ? "default" : "outline"}>{workiz.hasApiToken ? "Token set" : "No token"}</Badge>
-              <Badge variant={workiz.hasApiSecret ? "default" : "outline"}>{workiz.hasApiSecret ? "Secret set" : "No secret"}</Badge>
+              <Badge variant={!workiz.hasApiToken ? "outline" : workiz.apiTokenLooksValid ? "default" : "destructive"}>
+                {!workiz.hasApiToken ? "No token" : workiz.apiTokenLooksValid ? "Token set" : "Token looks wrong"}
+              </Badge>
+              <Badge variant={!workiz.hasApiSecret ? "outline" : workiz.apiSecretLooksValid ? "default" : "destructive"}>
+                {!workiz.hasApiSecret ? "No secret" : workiz.apiSecretLooksValid ? "Secret set" : "Secret looks wrong"}
+              </Badge>
             </div>
           </div>
         </CardHeader>
@@ -81,13 +75,39 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
                 <Label htmlFor="api-token" className="text-xs">
                   API token {workiz.hasApiToken && <span className="text-muted-foreground">(leave blank to keep)</span>}
                 </Label>
-                <Input id="api-token" type="password" autoComplete="off" value={form.apiToken} onChange={(e) => setForm({ ...form, apiToken: e.target.value })} placeholder={workiz.hasApiToken ? "••••••••" : "api_xxx"} />
+                <Input
+                  id="api-token"
+                  type="password"
+                  autoComplete="off"
+                  value={form.apiToken}
+                  onChange={(e) => setForm({ ...form, apiToken: e.target.value })}
+                  placeholder={workiz.hasApiToken ? "••••••••" : "api_xxx"}
+                  aria-describedby={workiz.hasApiToken && !workiz.apiTokenLooksValid ? "api-token-warning" : undefined}
+                />
+                {workiz.hasApiToken && !workiz.apiTokenLooksValid && (
+                  <span id="api-token-warning" className="text-xs text-destructive">
+                    The saved token does not look like a Workiz API token (they start with <code>api_</code>). Copy it from Workiz → Settings → Integrations → Developer and paste it here.
+                  </span>
+                )}
               </div>
               <div className="flex flex-col gap-1">
                 <Label htmlFor="api-secret" className="text-xs">
                   API secret {workiz.hasApiSecret && <span className="text-muted-foreground">(leave blank to keep)</span>}
                 </Label>
-                <Input id="api-secret" type="password" autoComplete="off" value={form.apiSecret} onChange={(e) => setForm({ ...form, apiSecret: e.target.value })} placeholder={workiz.hasApiSecret ? "••••••••" : "sec_xxx"} />
+                <Input
+                  id="api-secret"
+                  type="password"
+                  autoComplete="off"
+                  value={form.apiSecret}
+                  onChange={(e) => setForm({ ...form, apiSecret: e.target.value })}
+                  placeholder={workiz.hasApiSecret ? "••••••••" : "sec_xxx"}
+                  aria-describedby={workiz.hasApiSecret && !workiz.apiSecretLooksValid ? "api-secret-warning" : undefined}
+                />
+                {workiz.hasApiSecret && !workiz.apiSecretLooksValid && (
+                  <span id="api-secret-warning" className="text-xs text-destructive">
+                    The saved secret does not look like a Workiz API secret (they start with <code>sec_</code>).
+                  </span>
+                )}
               </div>
             </div>
 
@@ -183,60 +203,7 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
         </CardContent>
       </Card>
 
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Webhook &amp; schedule</CardTitle>
-          <CardDescription>
-            In Workiz create an Automation: trigger &quot;Job status changed&quot;, action &quot;Webhook&quot;, POST to the URL below with the Authorization header. The body
-            only needs the job UUID; every amount is re-fetched from the API before anything is calculated. Reconciliation runs every 6 hours as a fallback.
-          </CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs">Webhook URL</Label>
-            <div className="flex items-center gap-2">
-              <Input readOnly value={webhookUrl} className="font-mono text-xs" />
-              <Button type="button" size="icon" variant="outline" onClick={() => copy("url", webhookUrl)} aria-label="Copy webhook URL">
-                {copied === "url" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-              </Button>
-            </div>
-          </div>
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs">Authorization header</Label>
-            <div className="flex items-center gap-2">
-              <Input readOnly value={workiz.hasWebhookSecret ? `Bearer ${workiz.webhookSecret}` : "Generate a secret first"} className="font-mono text-xs" />
-              <Button type="button" size="icon" variant="outline" disabled={!workiz.hasWebhookSecret} onClick={() => copy("secret", `Bearer ${workiz.webhookSecret}`)} aria-label="Copy header">
-                {copied === "secret" ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
-              </Button>
-              <Button
-                type="button"
-                size="sm"
-                variant="outline"
-                disabled={pending}
-                onClick={() =>
-                  startTransition(async () => {
-                    const res = await rotateWebhookSecret()
-                    if (!res.ok) return setMsg({ tone: "error", text: res.error })
-                    setMsg({ tone: "info", text: "New webhook secret generated. Update the Workiz automation header." })
-                    router.refresh()
-                  })
-                }
-              >
-                <KeyRound className="h-4 w-4" />
-                {workiz.hasWebhookSecret ? "Rotate" : "Generate"}
-              </Button>
-            </div>
-          </div>
-          <div className="flex flex-col gap-1">
-            <Label className="text-xs">Body (JSON)</Label>
-            <Input readOnly value='{"UUID": "{{job.UUID}}"}' className="font-mono text-xs" />
-          </div>
-          <p className="text-xs text-muted-foreground">
-            Scheduled reconcile: <span className="font-mono">0 */6 * * *</span> →{" "}
-            {cronConfigured ? "CRON_SECRET is set." : "Add a CRON_SECRET environment variable so Vercel Cron can authenticate."}
-          </p>
-        </CardContent>
-      </Card>
+      <WebhookSetupCard workiz={workiz} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />
 
       <ColorSealCatalog catalog={catalog} />
     </div>

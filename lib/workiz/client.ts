@@ -1,16 +1,20 @@
 /**
  * Thin, typed wrapper over the Workiz REST API (https://developer.workiz.com/).
  *
- * Verified from the published OpenAPI document (developer.workiz.com/api.json):
+ * Verified from the published OpenAPI document (developer.workiz.com/api.json,
+ * 20 paths) and live responses:
  *   - Base URL:      https://api.workiz.com/api/v1/{token}/
- *   - Read calls:    GET  job/all/, job/get/{UUID}/, team/all/
- *   - Write calls:   POST job/update/, job/addPayment/{UUID}/, job/assign/,
- *                    job/note/ (require the `api_secret` header)
- *   - Job payload:   UUID, SerialId, JobDateTime, JobEndDateTime, Status, SubStatus,
- *                    PaymentDueDate, JobTotal, SubTotal, ClientId, FirstName, LastName,
- *                    Address/City/State/PostalCode, Phone, Email, JobType, JobSource,
- *                    Team[] ({id, Name}), Tags[], Comments, JobNotes, plus optional
- *                    Items[] / Payments[] arrays on job/get/ when the account exposes them.
+ *   - Read calls:    GET  job/all/, job/get/{UUID}/, team/all/, team/get/{USER_ID}
+ *   - Write calls:   POST job/create/, job/update/, job/addPayment/{UUID}/, job/assign/,
+ *                    job/unassign/ (require the `api_secret` header)
+ *   - Job payload:   UUID, SerialId, JobDateTime, JobEndDateTime, LastStatusUpdate, Status,
+ *                    SubStatus, PaymentDueDate, JobTotalPrice, SubTotal, JobAmountDue, ClientId,
+ *                    FirstName, LastName, Address/City/State/PostalCode, Phone, Email, JobType,
+ *                    JobSource, Team[] ({id, Name}), Tags[], Comments, JobNotes,
+ *                    LineItems[] ({Id, Name, Description, Price, Quantity, Type, Taxable}).
+ *   - NOT provided:  per-payment records (method, date), Discount, TaxAmount, InvoiceStatus.
+ *   - NOT published: any job-note or SMS endpoint. `addJobNote` below targets an
+ *                    undocumented path and is unverified; do not rely on it for delivery.
  *
  * Every response shape is treated as untrusted and normalised in `normalize.ts`.
  */
@@ -32,6 +36,29 @@ export class WorkizApiError extends Error {
     super(message)
     this.name = "WorkizApiError"
   }
+}
+
+/** Workiz's own error text from a failed response, when it sent one. */
+function workizMessage(body: unknown): string | null {
+  if (!body || typeof body !== "object") return typeof body === "string" && body.trim() ? body.trim().slice(0, 200) : null
+  const b = body as Record<string, unknown>
+  const msg = [b.message, b.error, b.msg].find((v) => typeof v === "string" && v.trim())
+  return msg ? String(msg).trim() : null
+}
+
+/**
+ * Human-readable failure text. Workiz answers every bad or unknown token with
+ * 403 "Invalid API path or malformed API key", so a credential problem is
+ * called out explicitly rather than looking like a permissions issue on one
+ * endpoint.
+ */
+function describeFailure(method: string, path: string, status: number, body: unknown): string {
+  const detail = workizMessage(body)
+  const base = `Workiz ${method} ${path} failed with ${status}${detail ? `: ${detail}` : ""}`
+  if (status === 401 || status === 403) {
+    return `${base}. Workiz rejected the API token itself, so every endpoint will fail until it is fixed. Re-copy the API token (it starts with "api_") from Workiz → Settings → Integrations → Developer and save it in the API token field.`
+  }
+  return base
 }
 
 export type WorkizTeamMember = {
@@ -75,10 +102,13 @@ export class WorkizClient {
       if (!this.creds.apiSecret) throw new Error("Workiz API secret is required for write calls")
       headers["api_secret"] = this.creds.apiSecret
     }
+    // The published request bodies (e.g. addPaymentBody) carry the secret as `auth_secret`;
+    // the header is kept for compatibility. Live-verified: a body `auth_secret` is accepted.
+    const body = opts?.body && method === "POST" ? { auth_secret: this.creds.apiSecret, ...(opts.body as Record<string, unknown>) } : opts?.body
     const res = await fetch(this.url(path, opts?.query), {
       method,
       headers,
-      body: opts?.body ? JSON.stringify(opts.body) : undefined,
+      body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
     })
     const text = await res.text()
@@ -89,7 +119,7 @@ export class WorkizClient {
       json = text
     }
     if (!res.ok) {
-      throw new WorkizApiError(`Workiz ${method} ${path} failed with ${res.status}`, res.status, path, json)
+      throw new WorkizApiError(describeFailure(method, path, res.status, json), res.status, path, json)
     }
     // Workiz wraps payloads as { flag: boolean, data: ..., has_more?: boolean }.
     if (json && typeof json === "object" && "flag" in json && (json as { flag: unknown }).flag === false) {
@@ -103,7 +133,12 @@ export class WorkizClient {
     return json as T
   }
 
-  /** GET job/all/ — paginated list. Workiz caps `records` at 100. */
+  /**
+   * GET job/all/ — paginated list. Workiz caps `records` at 100.
+   * `only_open` defaults to TRUE on the Workiz side and hides Done/Canceled jobs
+   * (verified live: 15 jobs without it vs 80 with only_open=false), so it is
+   * always sent explicitly.
+   */
   async listJobs(params: ListJobsParams = {}) {
     const res = await this.request<{ flag: boolean; data: WorkizRawJob[]; has_more?: boolean; found?: number }>(
       "GET",
@@ -113,7 +148,7 @@ export class WorkizClient {
           start_date: params.startDate,
           offset: params.offset ?? 0,
           records: Math.min(params.records ?? 100, 100),
-          only_open: params.onlyOpen ? "true" : undefined,
+          only_open: params.onlyOpen ? "true" : "false",
         },
       },
     )
@@ -147,14 +182,18 @@ export class WorkizClient {
   }
 
   /**
-   * POST job/note/ — append an internal note to a job. Used as the default
-   * technician notification channel because Workiz automations can forward a
-   * job note to the assigned tech via SMS/push, and the note is visible in the
-   * job timeline for audit.
+   * POST job/addNote/ — append an internal note to a job.
+   *
+   * Not in the published OpenAPI document, but live-verified on 2026-09-19 with a
+   * non-existent UUID: `job/note/` (the previous target) answers 404 "Invalid end
+   * point", while `job/addNote/` validates `UUID` (required) and `JobNote` and
+   * answers 204 with an empty body, so a success carries no delivery receipt.
+   * This is an internal job note, not an SMS. Sending stays disabled by default
+   * and every attempt is recorded in `notifications` with its result.
    */
   async addJobNote(uuid: string, note: string) {
-    return this.request<{ flag: boolean; data?: unknown }>("POST", "job/note/", {
-      body: { UUID: uuid, Note: note },
+    return this.request<unknown>("POST", "job/addNote/", {
+      body: { UUID: uuid, JobNote: note },
     })
   }
 

@@ -1,3 +1,4 @@
+import { sql } from "drizzle-orm"
 import {
   boolean,
   integer,
@@ -141,19 +142,25 @@ export const payouts = pgTable(
   (t) => [uniqueIndex("payouts_job_profile_unique").on(t.jobUuid, t.profileId)],
 )
 
-export const notifications = pgTable("notifications", {
-  id: serial("id").primaryKey(),
-  payoutId: integer("payout_id").notNull(),
-  profileId: integer("profile_id").notNull(),
-  jobUuid: text("job_uuid").notNull(),
-  channel: text("channel").notNull().default("workiz_note"),
-  status: text("status").notNull().default("previewed"),
-  message: text("message").notNull(),
-  providerResponse: jsonb("provider_response"),
-  error: text("error"),
-  createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
-  sentAt: timestamp("sent_at", { withTimezone: true }),
-})
+export const notifications = pgTable(
+  "notifications",
+  {
+    id: serial("id").primaryKey(),
+    payoutId: integer("payout_id").notNull(),
+    profileId: integer("profile_id").notNull(),
+    jobUuid: text("job_uuid").notNull(),
+    channel: text("channel").notNull().default("workiz_note"),
+    /** previewed | sending | sent | resent | failed */
+    status: text("status").notNull().default("previewed"),
+    message: text("message").notNull(),
+    providerResponse: jsonb("provider_response"),
+    error: text("error"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+  },
+  // One in-flight or completed delivery per payout: the guard against duplicate texts.
+  (t) => [uniqueIndex("notifications_payout_delivery_unique").on(t.payoutId).where(sql`${t.status} in ('sending', 'sent')`)],
+)
 
 export const appSettings = pgTable("app_settings", {
   key: text("key").primaryKey(),
@@ -177,10 +184,15 @@ export type NormalizedLineItem = {
   name: string
   /** Secondary text field from Workiz (Description/Notes) when it differs from the name; searched for technician markers. */
   description?: string | null
+  /** Workiz item `Type` ("service", "product", "DISCOUNT_TYPE"). */
+  type?: string | null
   quantity: number
   unitPrice: number
+  /** Extended amount (unit price x quantity). Negative for discount lines. */
   total: number
   isColorSeal: boolean
+  /** True for Workiz discount lines, which arrive with a positive price and `Type: "DISCOUNT_TYPE"`. */
+  isDiscount?: boolean
   matchedBy: "catalog" | "keyword" | "none"
 }
 

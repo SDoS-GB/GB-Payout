@@ -73,10 +73,13 @@ const round2 = (n: number) => Math.round(n * 100) / 100
 const BALANCE_TOLERANCE = 0.011
 
 /**
- * A profile's marker is a short list of tokens (`T, Tim`). Dispatch decorates a
- * token however they like when typing the line item, so `*T*`, `*T`, `T`, `(T)`,
- * `[Tim]`, `T:` and `T -` are all the same marker. Decoration typed into the
- * profile field is ignored: `*T*` and `T` configure the same token.
+ * A profile's marker is a short list of tokens (`T, Tim`). A Workiz line item
+ * belongs to that technician only when it carries the literal asterisk-wrapped
+ * token, `*T*` (or `*Tim*`), in its Name or Description. A bare `T`, `(T)` or a
+ * word that merely starts with T never counts: live Workiz descriptions contain
+ * text like "*Important Notice: ..." that a looser match would misread.
+ * Decoration typed into the profile field is ignored: `*T*` and `T` configure
+ * the same token.
  */
 export function parseMarkerTokens(marker: string | null | undefined): string[] {
   if (!marker) return []
@@ -100,27 +103,15 @@ export function markerLabel(marker: string | null | undefined): string | null {
 }
 
 const escapeRegExp = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
-/** A regex character class from literal characters; only `\ ] ^ -` are special inside brackets. */
-const charClass = (chars: string) => `[${chars.replace(/[\\\]^-]/g, "\\$&")}]`
 
-const OPENERS = charClass("*([{<")
-const WRAP_CLOSERS = charClass("*)]}>")
-const TERMINATORS = charClass("*)]}>:.,|-\u2013\u2014")
+const patternCache = new Map<string, RegExp>()
 
-const patternCache = new Map<string, { prefix: RegExp; wrapped: RegExp }>()
-
-function patternsFor(token: string) {
+/** The literal wrapped marker: an asterisk, the token, an asterisk (`*T*`). Case-insensitive so `*t*` still counts. */
+function patternFor(token: string): RegExp {
   const key = token.toLowerCase()
   let p = patternCache.get(key)
   if (!p) {
-    const t = escapeRegExp(token)
-    p = {
-      // Start of the text: optional opener(s), the token, then a terminator, whitespace or the end.
-      // The terminator is what keeps `T` from matching "Tile" and `Tim` from matching "Tim's".
-      prefix: new RegExp(`^\\s*${OPENERS}*\\s*${t}(?=\\s*(?:${TERMINATORS}|\\s|$))`, "i"),
-      // Fully wrapped forms (`*T*`, `(Tim)`) are unambiguous, so accept them anywhere in the text.
-      wrapped: new RegExp(`${OPENERS}\\s*${t}\\s*${WRAP_CLOSERS}`, "i"),
-    }
+    p = new RegExp(`\\*${escapeRegExp(token)}\\*`, "i")
     patternCache.set(key, p)
   }
   return p
@@ -128,8 +119,7 @@ function patternsFor(token: string) {
 
 function textHasToken(text: string | null | undefined, token: string): boolean {
   if (!text) return false
-  const { prefix, wrapped } = patternsFor(token)
-  return prefix.test(text) || wrapped.test(text)
+  return patternFor(token).test(text)
 }
 
 /**

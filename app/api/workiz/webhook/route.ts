@@ -1,84 +1,99 @@
 import { NextResponse } from "next/server"
-import { safeEqual } from "@/lib/security/crypto"
 import { getWorkizSettings } from "@/lib/settings"
-import { logSyncEvent, syncJobByUuid } from "@/lib/workiz/sync"
+import { getWorkizClient, logSyncEvent, syncJobByUuid } from "@/lib/workiz/sync"
+import { parseRawBody, parseWebhookBody, webhookAuthorized } from "@/lib/workiz/webhook"
 
 export const runtime = "nodejs"
 export const dynamic = "force-dynamic"
 
+const NO_STORE = { "Cache-Control": "no-store" }
+
 /**
- * Receiver for a Workiz Automation "Send webhook" action.
+ * Receiver for the Workiz Automation "post webhook" action.
  *
- * Configure the automation in Workiz as:
- *   Trigger:  Job status changed (to your payable status, e.g. "Done")
- *   Action:   Webhook → POST https://<your-domain>/api/workiz/webhook
- *   Header:   Authorization: Bearer <webhook secret from Admin → Workiz settings>
- *   Body:     JSON including the job UUID, e.g. {"UUID":"{{job.uuid}}"}
+ * In Workiz: Automations → Add automation → "this happens": a job trigger (status
+ * changed to Done) and, separately, an invoice/payment trigger → "do this": post
+ * webhook → URL = this route, Auth key = the secret from Admin → Workiz.
  *
- * The payload is treated only as a hint: we always refetch the job through
- * the REST API before calculating anything, so a spoofed body cannot inject
- * amounts. Authentication is a shared secret compared in constant time.
+ * The payload is only a hint: the job is always re-fetched through the REST API
+ * before anything is calculated, so a spoofed body cannot inject amounts.
  */
 export async function POST(req: Request) {
   const settings = await getWorkizSettings()
   if (!settings.webhookSecret) {
-    return NextResponse.json({ ok: false, error: "Webhook secret not configured" }, { status: 503 })
+    return NextResponse.json({ ok: false, error: "Webhook secret not configured. Generate one in Admin → Workiz." }, { status: 503, headers: NO_STORE })
   }
 
-  const auth = req.headers.get("authorization") ?? ""
-  const bearer = auth.toLowerCase().startsWith("bearer ") ? auth.slice(7).trim() : null
-  const headerSecret = req.headers.get("x-webhook-secret")
   const url = new URL(req.url)
-  const querySecret = url.searchParams.get("secret")
-
-  if (!safeEqual(bearer, settings.webhookSecret) && !safeEqual(headerSecret, settings.webhookSecret) && !safeEqual(querySecret, settings.webhookSecret)) {
-    await logSyncEvent("webhook", { ok: false, summary: "Rejected webhook: bad secret" })
-    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401 })
+  if (!webhookAuthorized(req.headers, url.searchParams, settings.webhookSecret)) {
+    await logSyncEvent("webhook", { ok: false, summary: "Rejected webhook: auth key does not match. Re-copy the key from Admin → Workiz into the automation." })
+    return NextResponse.json({ ok: false, error: "Unauthorized" }, { status: 401, headers: NO_STORE })
   }
 
-  let body: unknown = null
-  const text = await req.text()
-  try {
-    body = text ? JSON.parse(text) : null
-  } catch {
-    // Some automations post form-encoded bodies.
-    body = Object.fromEntries(new URLSearchParams(text))
+  const parsed = parseWebhookBody(parseRawBody(await req.text()), url.searchParams)
+  const via = [parsed.triggerType ?? "unknown trigger", parsed.ruleName ? `rule "${parsed.ruleName}"` : null].filter(Boolean).join(" · ")
+
+  if (parsed.kind === "ignored") {
+    // Lead and estimate events never affect a payout; acknowledge so Workiz does not retry.
+    await logSyncEvent("webhook", { ok: true, summary: `Ignored ${via} (not a job or invoice event)`, details: { trigger: parsed.triggerType, serialId: parsed.serialId } })
+    return NextResponse.json({ ok: true, ignored: true, trigger: parsed.triggerType }, { headers: NO_STORE })
   }
 
-  const uuid = extractUuid(body) ?? url.searchParams.get("uuid")
-  if (!uuid) {
-    await logSyncEvent("webhook", { ok: false, summary: "Webhook without job UUID", details: { keys: body && typeof body === "object" ? Object.keys(body as object) : typeof body } })
-    return NextResponse.json({ ok: false, error: "Missing job UUID" }, { status: 400 })
+  if (parsed.uuidCandidates.length === 0) {
+    await logSyncEvent("webhook", { ok: false, summary: `Webhook (${via}) had no job UUID`, details: { trigger: parsed.triggerType, serialId: parsed.serialId } })
+    return NextResponse.json({ ok: false, error: "Missing job UUID" }, { status: 400, headers: NO_STORE })
   }
 
-  try {
-    const result = await syncJobByUuid(uuid, "webhook")
-    return NextResponse.json({
-      ok: true,
-      uuid: result.uuid,
-      status: result.normalized.status,
-      payouts: result.engine,
-      notifications: result.notifications.map((n) => ({ payoutId: n.payoutId, status: n.status, reason: n.reason })),
-    })
-  } catch (err) {
-    const error = err instanceof Error ? err.message : String(err)
-    await logSyncEvent("webhook", { jobUuid: uuid, ok: false, summary: `Webhook processing failed: ${error}` })
-    return NextResponse.json({ ok: false, error }, { status: 502 })
+  if (parsed.kind === "self_test") {
+    // Sent by the admin "Test endpoint" button: prove reachability, auth and Workiz API
+    // access without touching payouts or pretending Workiz called us.
+    try {
+      const { client } = await getWorkizClient(settings)
+      const job = await client.getJob(parsed.uuidCandidates[0])
+      const summary = job
+        ? `Self-test OK: endpoint reachable, auth key accepted, Workiz job #${job.SerialId ?? parsed.uuidCandidates[0]} fetched`
+        : `Self-test: endpoint reachable and auth key accepted, but Workiz returned no job for ${parsed.uuidCandidates[0]}`
+      await logSyncEvent("webhook", { jobUuid: parsed.uuidCandidates[0], ok: Boolean(job), summary, details: { selfTest: true } })
+      return NextResponse.json({ ok: Boolean(job), selfTest: true, summary }, { headers: NO_STORE })
+    } catch (err) {
+      const error = err instanceof Error ? err.message : String(err)
+      await logSyncEvent("webhook", { ok: false, summary: `Self-test failed: ${error}`, details: { selfTest: true } })
+      return NextResponse.json({ ok: false, selfTest: true, error }, { status: 502, headers: NO_STORE })
+    }
   }
+
+  // Workiz's invoice example carries the job's uuid, but if an invoice ever has its own
+  // code the later candidates (legacy body keys, ?uuid=) get a turn before giving up.
+  let lastError: string | null = null
+  for (const uuid of parsed.uuidCandidates) {
+    try {
+      const result = await syncJobByUuid(uuid, "webhook", { via })
+      return NextResponse.json(
+        {
+          ok: true,
+          trigger: parsed.triggerType,
+          uuid: result.uuid,
+          status: result.normalized.status,
+          payouts: result.engine,
+          notifications: result.notifications.map((n) => ({ payoutId: n.payoutId, status: n.status, reason: n.reason })),
+        },
+        { headers: NO_STORE },
+      )
+    } catch (err) {
+      lastError = err instanceof Error ? err.message : String(err)
+      if (!/not found/i.test(lastError)) break
+    }
+  }
+
+  await logSyncEvent("webhook", {
+    jobUuid: parsed.uuidCandidates[0],
+    ok: false,
+    summary: `Webhook (${via}) for ${parsed.serialId ? `#${parsed.serialId}` : parsed.uuidCandidates[0]} failed: ${lastError}`,
+    details: { trigger: parsed.triggerType, candidates: parsed.uuidCandidates, serialId: parsed.serialId, status: parsed.status },
+  })
+  return NextResponse.json({ ok: false, error: lastError }, { status: 502, headers: NO_STORE })
 }
 
 export async function GET() {
-  return NextResponse.json({ ok: true, message: "Workiz webhook endpoint. POST with Authorization: Bearer <secret>." })
-}
-
-function extractUuid(body: unknown): string | null {
-  if (!body || typeof body !== "object") return null
-  const b = body as Record<string, unknown>
-  const direct = b.UUID ?? b.uuid ?? b.Uuid ?? b.job_uuid ?? b.jobUuid ?? b.JobUUID
-  if (typeof direct === "string" && direct.length > 0) return direct
-  for (const nested of [b.job, b.Job, b.data, b.Data, b.payload]) {
-    const found = extractUuid(nested)
-    if (found) return found
-  }
-  return null
+  return NextResponse.json({ ok: true, message: "Workiz webhook endpoint. Configure a Workiz Automation to POST here with your Auth key." }, { headers: NO_STORE })
 }

@@ -14,6 +14,7 @@ import {
 } from "@/lib/db/schema"
 import { notifyPayout } from "@/lib/notifications/send"
 import { buildTemplateContext, renderTemplate } from "@/lib/notifications/template"
+import { releaseBlocker } from "@/lib/payout/engine"
 import { listProfiles } from "@/lib/payout/profiles"
 import {
   DEFAULT_BUSINESS_TIMEZONE,
@@ -23,9 +24,11 @@ import {
   type PayoutQuery,
 } from "@/lib/payout/presentation"
 import { parseMarkerTokens } from "@/lib/payout/segments"
+import { getWebhookUrl } from "@/lib/public-origin"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
 import {
+  DEFAULT_WORKIZ_SETTINGS,
   getNotificationSettings,
   getWorkizSettings,
   saveAdminSettings,
@@ -33,7 +36,7 @@ import {
   saveWorkizSettings,
   type NotificationSettings,
 } from "@/lib/settings"
-import { WorkizClient } from "@/lib/workiz/client"
+import { WorkizApiError, WorkizClient } from "@/lib/workiz/client"
 import { parseWorkizDate } from "@/lib/workiz/time"
 import { logSyncEvent, reconcileRecentJobs, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
 
@@ -68,7 +71,7 @@ export async function updateWorkizSettings(form: {
       colorSealKeywords: splitList(form.colorSealKeywords),
       cardMethodKeywords: splitList(form.cardMethodKeywords),
       tipKeywords: splitList(form.tipKeywords),
-      reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || 14))),
+      reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || DEFAULT_WORKIZ_SETTINGS.reconcileLookbackDays))),
     }
     if (form.businessTimezone !== undefined) {
       const tz = form.businessTimezone.trim() || DEFAULT_BUSINESS_TIMEZONE
@@ -102,6 +105,61 @@ export async function rotateWebhookSecret(): Promise<Result<{ secret: string }>>
   }
 }
 
+/**
+ * Posts a Workiz-shaped `self_test` event to the public webhook URL exactly as the
+ * automation would, using the most recently synced job's UUID. Proves the route is
+ * deployed, reachable, that the auth key matches and that the Workiz API answers —
+ * without touching any payout.
+ */
+export async function testWebhookEndpoint(): Promise<Result<{ summary: string }>> {
+  try {
+    await requireAdmin()
+    const settings = await getWorkizSettings()
+    if (!settings.webhookSecret) throw new Error("Generate an auth key first.")
+    const [latest] = await db.select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId }).from(workizJobs).orderBy(desc(workizJobs.lastSeenAt)).limit(1)
+    if (!latest) throw new Error("No synced job to test with yet. Run Sync now first.")
+
+    const url = await getWebhookUrl()
+    if (!url.startsWith("http")) throw new Error("Public URL unknown in this environment. Test from the deployed site.")
+
+    const controller = new AbortController()
+    const timer = setTimeout(() => controller.abort(), 15_000)
+    let res: Response
+    try {
+      res = await fetch(url, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", Authorization: `Bearer ${settings.webhookSecret}` },
+        body: JSON.stringify({
+          trigger: { type: "self_test", timestamp: new Date().toISOString() },
+          data: { uuid: latest.uuid, serialId: latest.serialId },
+          metadata: { ruleName: "Admin self-test" },
+        }),
+        cache: "no-store",
+        signal: controller.signal,
+      })
+    } finally {
+      clearTimeout(timer)
+    }
+    const body = (await res.json().catch(() => null)) as { ok?: boolean; summary?: string; error?: string } | null
+    if (!res.ok || !body?.ok) throw new Error(body?.error ?? body?.summary ?? `Endpoint answered HTTP ${res.status}`)
+    revalidatePath("/admin")
+    return { ok: true, data: { summary: body.summary ?? "Self-test passed" } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/** Newest webhook that Workiz itself sent (self-tests excluded), for the setup status badge. */
+async function latestWorkizWebhook() {
+  const [row] = await db
+    .select({ createdAt: syncEvents.createdAt, ok: syncEvents.ok, summary: syncEvents.summary, kind: syncEvents.kind })
+    .from(syncEvents)
+    .where(and(inArray(syncEvents.kind, ["webhook", "job:webhook"]), sql`coalesce(${syncEvents.details}->>'selfTest', 'false') <> 'true'`))
+    .orderBy(desc(syncEvents.createdAt))
+    .limit(1)
+  return row ?? null
+}
+
 export async function probeWorkiz(): Promise<Result<Awaited<ReturnType<WorkizClient["probe"]>>>> {
   try {
     await requireAdmin()
@@ -111,7 +169,8 @@ export async function probeWorkiz(): Promise<Result<Awaited<ReturnType<WorkizCli
     await logSyncEvent("probe", { ok: true, summary: `Workiz reachable in ${data.latencyMs}ms · ${data.teamCount} team members`, details: data })
     return { ok: true, data }
   } catch (err) {
-    await logSyncEvent("probe", { ok: false, summary: `Workiz probe failed: ${err instanceof Error ? err.message : String(err)}` })
+    const details = err instanceof WorkizApiError ? { status: err.status, endpoint: err.endpoint, response: err.body ?? null } : undefined
+    await logSyncEvent("probe", { ok: false, summary: `Workiz probe failed: ${err instanceof Error ? err.message : String(err)}`, details })
     return fail(err)
   }
 }
@@ -310,10 +369,21 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
     const set: Partial<typeof payouts.$inferInsert> = { updatedAt: now, reviewedAt: now, reviewedBy: "admin" }
     if (note !== undefined) set.adminNote = note.trim() || null
     switch (action) {
-      case "release":
+      case "release": {
+        const [payout] = await db.select({ jobUuid: payouts.jobUuid, status: payouts.status }).from(payouts).where(eq(payouts.id, id)).limit(1)
+        if (!payout) throw new Error("Payout not found")
+        if (payout.status === "paid" || payout.status === "void") throw new Error(`Payout is already ${payout.status}; use Reopen first`)
+        const [job] = await db
+          .select({ status: workizJobs.status, fullyPaid: workizJobs.fullyPaid, jobTotal: workizJobs.jobTotal })
+          .from(workizJobs)
+          .where(eq(workizJobs.uuid, payout.jobUuid))
+          .limit(1)
+        const blocker = releaseBlocker(job ? { status: job.status, fullyPaid: job.fullyPaid, jobTotal: Number(job.jobTotal) } : null, await getWorkizSettings())
+        if (blocker) throw new Error(`Cannot release: ${blocker}`)
         set.status = "ready"
         set.holdReason = null
         break
+      }
       case "hold":
         set.status = "hold"
         set.holdReason = note?.trim() || "Held by admin"
@@ -330,9 +400,14 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
         set.status = "pending"
         set.paidAt = null
         set.paidBy = null
+        // Force the next sync to recompute and re-gate instead of matching the old fingerprint.
+        set.inputHash = null
         break
     }
     await db.update(payouts).set(set).where(eq(payouts.id, id))
+    // A release makes the payout ready, so it gets the same ready-to-pay message a sync would
+    // produce; notifyPayout only previews unless sending is enabled and never delivers twice.
+    if (action === "release") await notifyPayout(id)
     revalidatePath("/admin")
     revalidatePath("/payouts")
     return { ok: true }
@@ -501,6 +576,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
         updatedAt: workizJobs.updatedAt,
         lastStatusUpdate: sql<string | null>`${workizJobs.raw}->>'LastStatusUpdate'`,
         amountDue: sql<string | null>`${workizJobs.raw}->>'JobAmountDue'`,
+        invoiceTotal: sql<string | null>`${workizJobs.raw}->>'JobTotalPrice'`,
       },
     })
     .from(payouts)
@@ -531,6 +607,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
           ...raw,
           lastStatusUpdate: parseWorkizDate(raw.lastStatusUpdate, timeZone),
           amountDue: raw.amountDue === null || raw.amountDue === undefined || raw.amountDue === "" ? null : Number(raw.amountDue),
+          invoiceTotal: raw.invoiceTotal === null || raw.invoiceTotal === undefined || raw.invoiceTotal === "" ? null : Number(raw.invoiceTotal),
         }
       : null
     return {
@@ -590,7 +667,7 @@ async function unmappedTeamImpact(teamIds: string[]) {
 
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
@@ -599,6 +676,7 @@ export async function loadAdminDashboard() {
     db.select().from(syncEvents).orderBy(desc(syncEvents.createdAt)).limit(40),
     payoutStatusCounts(),
     queryPayouts(DEFAULT_PAYOUT_QUERY),
+    latestWorkizWebhook(),
   ])
 
   const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
@@ -626,8 +704,12 @@ export async function loadAdminDashboard() {
     workiz: {
       hasApiToken: Boolean(workiz.apiToken),
       hasApiSecret: Boolean(workiz.apiSecret),
+      // Format-only checks so the UI can flag a paste into the wrong box without exposing the values.
+      apiTokenLooksValid: /^api_[A-Za-z0-9]{8,}$/.test(workiz.apiToken),
+      apiSecretLooksValid: /^sec_[A-Za-z0-9]{8,}$/.test(workiz.apiSecret),
       hasWebhookSecret: Boolean(workiz.webhookSecret),
       webhookSecret: workiz.webhookSecret,
+      lastWebhook,
       payableStatuses: workiz.payableStatuses,
       colorSealKeywords: workiz.colorSealKeywords,
       cardMethodKeywords: workiz.cardMethodKeywords,

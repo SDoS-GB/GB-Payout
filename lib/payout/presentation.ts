@@ -141,6 +141,22 @@ export function explainPayoutStatus(input: {
       action: "Collect the remaining balance in Workiz, then re-sync the job.",
     }
   }
+  if (/^payment method unknown/i.test(reason)) {
+    return {
+      headline: "On hold: confirm how the customer paid",
+      detail:
+        "Workiz's API returns the job balance but no payment records, so the sync cannot tell card from check/cash/Zelle. The amount shown assumes no card fee.",
+      action:
+        "Check the payment in Workiz. If it was check, cash or Zelle, Release. If any of it was paid by card, do not release as-is: the 3.5% card deduction still has to be applied.",
+    }
+  }
+  if (/invoice total .* less than the service total/i.test(reason)) {
+    return {
+      headline: "On hold: invoice lower than service total",
+      detail: reason,
+      action: "Compare the Workiz invoice with its line items (discount or write-off?), fix the job in Workiz, then re-sync.",
+    }
+  }
   if (/unmapped team members?/i.test(reason)) {
     const ids = reason.match(/\(([^)]+)\)/)?.[1]
     return {
