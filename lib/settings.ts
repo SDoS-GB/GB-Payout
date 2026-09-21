@@ -25,6 +25,13 @@ export type WorkizSettings = {
   reconcileLookbackDays: number
   /** IANA timezone used to display job, completion and payment dates. */
   businessTimezone: string
+  /**
+   * When true, a job gets `payoutReadyTag` added in Workiz the first time it has a payout in
+   * status "ready". A Workiz automation on that tag is what texts the admin. See lib/workiz/tags.ts.
+   */
+  payoutReadyTagEnabled: boolean
+  /** Exact name of an existing Workiz job tag; the API silently drops unknown tag names. */
+  payoutReadyTag: string
 }
 
 export type NotificationSettings = {
@@ -50,6 +57,8 @@ export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
   tipKeywords: ["tip", "gratuity"],
   reconcileLookbackDays: 60,
   businessTimezone: "America/New_York",
+  payoutReadyTagEnabled: false,
+  payoutReadyTag: "Payout Ready",
 }
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {

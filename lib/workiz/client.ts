@@ -199,9 +199,8 @@ export class WorkizClient {
 
   /**
    * POST job/update/ — partial update. Only `UUID` plus the fields being changed are sent.
-   * The published schema (developer.workiz.com/api.json → updateResponse) lists `Tags` as a
-   * plain string array; whether it replaces or merges is verified live by
-   * tests/live-workiz-tags.probe.test.ts and encoded in lib/workiz/tags.ts.
+   * `Tags` MERGES with the job's existing tags and unknown tag names are silently dropped;
+   * see lib/workiz/tags.ts for the verified semantics before using this for anything else.
    */
   async updateJob(uuid: string, fields: { Tags?: string[]; SubStatus?: string }) {
     return this.request<{ flag?: boolean; data?: unknown }>("POST", "job/update/", {

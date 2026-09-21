@@ -1,19 +1,95 @@
-import { eq } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { db } from "@/lib/db"
-import { colorSealItems, syncEvents, workizJobs, workizTeamMappings } from "@/lib/db/schema"
+import { colorSealItems, payouts, syncEvents, workizJobs, workizTeamMappings } from "@/lib/db/schema"
 import { notifyPayout, type NotifyOutcome } from "@/lib/notifications/send"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
 import { getWorkizSettings, type WorkizSettings } from "@/lib/settings"
 import { WorkizClient, type WorkizRawJob } from "./client"
 import { normalizeJob, type ColorSealCatalog, type NormalizedJob } from "./normalize"
+import { explainNotApplied, planPayoutReadyTag, verifyTagApplied, type TagSkipReason, type TagVerdict } from "./tags"
 
 export type SyncSource = "rest" | "webhook"
+
+export type TagOutcome =
+  | { action: "skip"; reason: TagSkipReason | "no-client" }
+  | { action: "add"; tag: string; verdict: TagVerdict }
+  | { action: "add"; tag: string; error: string }
 
 export type JobSyncResult = {
   uuid: string
   normalized: NormalizedJob
   engine: EngineResult
   notifications: NotifyOutcome[]
+  tag: TagOutcome
+}
+
+async function jobHasReadyPayout(jobUuid: string): Promise<boolean> {
+  const [row] = await db
+    .select({ id: payouts.id })
+    .from(payouts)
+    .where(and(eq(payouts.jobUuid, jobUuid), eq(payouts.status, "ready")))
+    .limit(1)
+  return Boolean(row)
+}
+
+/**
+ * Add the payout-ready tag to a job in Workiz so the admin's Workiz automation can text them.
+ * Idempotent: the tag already being on the job is the "done" marker. Never throws — a tagging
+ * problem must not fail the payout sync — but every attempt is written to sync_events.
+ */
+export async function applyPayoutReadyTag(args: {
+  client: WorkizClient
+  uuid: string
+  serialId: string | null
+  existingTags: readonly string[]
+  settings: WorkizSettings
+  /** Admin self-test: tag even without a ready payout and even when the feature is off. */
+  force?: boolean
+  via?: string
+}): Promise<TagOutcome> {
+  const { client, uuid, serialId, existingTags, settings } = args
+  const label = serialId ?? uuid
+  const enabled = Boolean(args.force) || settings.payoutReadyTagEnabled
+  if (!enabled) return { action: "skip", reason: "disabled" }
+  const plan = planPayoutReadyTag({
+    enabled,
+    tag: settings.payoutReadyTag,
+    existingTags,
+    hasReadyPayout: Boolean(args.force) || (await jobHasReadyPayout(uuid)),
+  })
+  if (plan.action === "skip") return plan
+
+  try {
+    await client.updateJob(uuid, { Tags: plan.tags })
+    const fresh = await client.getJob(uuid)
+    const after = Array.isArray(fresh?.Tags) ? (fresh.Tags as unknown[]).map(String) : []
+    const verdict = verifyTagApplied(after, plan.tag)
+    await logSyncEvent("job:tag", {
+      jobUuid: uuid,
+      ok: verdict === "applied",
+      summary:
+        verdict === "applied"
+          ? `Tagged ${label} with "${plan.tag}"${args.via ? ` · via ${args.via}` : ""}`
+          : `Tag "${plan.tag}" not applied to ${label} — create it in Workiz first`,
+      details: { tag: plan.tag, before: existingTags, after, verdict, via: args.via ?? null, forced: Boolean(args.force) },
+    })
+    return { action: "add", tag: plan.tag, verdict }
+  } catch (err) {
+    const error = err instanceof Error ? err.message : String(err)
+    await logSyncEvent("job:tag", {
+      jobUuid: uuid,
+      ok: false,
+      summary: `Tagging ${label} failed: ${error}`,
+      details: { tag: plan.tag, before: existingTags, error, via: args.via ?? null, forced: Boolean(args.force) },
+    })
+    return { action: "add", tag: plan.tag, error }
+  }
+}
+
+export function describeTagOutcome(outcome: TagOutcome): string {
+  if (outcome.action === "skip") return `skipped (${outcome.reason})`
+  if ("error" in outcome) return `failed: ${outcome.error}`
+  return outcome.verdict === "applied" ? `applied "${outcome.tag}"` : explainNotApplied(outcome.tag)
 }
 
 export async function logSyncEvent(kind: string, opts: { jobUuid?: string | null; ok?: boolean; summary?: string; details?: unknown } = {}) {
@@ -86,7 +162,7 @@ export async function saveJobSnapshot(job: NormalizedJob, raw: WorkizRawJob, sou
 export async function processRawJob(
   raw: WorkizRawJob,
   source: SyncSource,
-  ctx?: { settings?: WorkizSettings; catalog?: ColorSealCatalog; via?: string },
+  ctx?: { settings?: WorkizSettings; catalog?: ColorSealCatalog; client?: WorkizClient; via?: string },
 ): Promise<JobSyncResult> {
   const settings = ctx?.settings ?? (await getWorkizSettings())
   const catalog = ctx?.catalog ?? (await loadColorSealCatalog())
@@ -101,14 +177,25 @@ export async function processRawJob(
     for (const id of engine.payoutIds) notifications.push(await notifyPayout(id))
   }
 
+  const tag: TagOutcome = ctx?.client
+    ? await applyPayoutReadyTag({
+        client: ctx.client,
+        uuid: normalized.uuid,
+        serialId: normalized.serialId,
+        existingTags: normalized.tags,
+        settings,
+        via: ctx.via ?? source,
+      })
+    : { action: "skip", reason: "no-client" }
+
   await logSyncEvent(`job:${source}`, {
     jobUuid: normalized.uuid,
     ok: true,
-    summary: `${normalized.serialId ?? normalized.uuid} · ${normalized.status ?? "?"} · total ${normalized.jobTotal.toFixed(2)} · payouts +${engine.created}/~${engine.updated}/=${engine.unchanged}${engine.held ? ` · held ${engine.held}` : ""}${ctx?.via ? ` · via ${ctx.via}` : ""}`,
-    details: { engine, warnings: normalized.warnings, via: ctx?.via ?? null, notifications: notifications.map((n) => ({ id: n.notificationId, status: n.status, reason: n.reason })) },
+    summary: `${normalized.serialId ?? normalized.uuid} · ${normalized.status ?? "?"} · total ${normalized.jobTotal.toFixed(2)} · payouts +${engine.created}/~${engine.updated}/=${engine.unchanged}${engine.held ? ` · held ${engine.held}` : ""}${tag.action === "add" ? ` · tag ${"verdict" in tag ? tag.verdict : "error"}` : ""}${ctx?.via ? ` · via ${ctx.via}` : ""}`,
+    details: { engine, warnings: normalized.warnings, via: ctx?.via ?? null, tag, notifications: notifications.map((n) => ({ id: n.notificationId, status: n.status, reason: n.reason })) },
   })
 
-  return { uuid: normalized.uuid, normalized, engine, notifications }
+  return { uuid: normalized.uuid, normalized, engine, notifications, tag }
 }
 
 /** Fetch a single job from Workiz by UUID and process it. */
@@ -117,7 +204,7 @@ export async function syncJobByUuid(uuid: string, source: SyncSource = "rest", o
   const raw = await client.getJob(uuid)
   if (!raw) throw new Error(`Workiz job ${uuid} not found`)
   const catalog = await loadColorSealCatalog()
-  return processRawJob(raw, source, { settings, catalog, via: opts?.via })
+  return processRawJob(raw, source, { settings, catalog, client, via: opts?.via })
 }
 
 export type ReconcileSummary = {
@@ -158,7 +245,7 @@ export async function reconcileRecentJobs(opts: { lookbackDays?: number; maxJobs
       const uuid = typeof listed.UUID === "string" ? listed.UUID : null
       try {
         const detail = uuid ? await client.getJob(uuid) : null
-        const result = await processRawJob(detail ?? listed, "rest", { settings, catalog })
+        const result = await processRawJob(detail ?? listed, "rest", { settings, catalog, client, via: "reconcile" })
         summary.processed++
         summary.created += result.engine.created
         summary.updated += result.engine.updated
