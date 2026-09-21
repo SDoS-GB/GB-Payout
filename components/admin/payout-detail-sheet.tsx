@@ -164,7 +164,8 @@ function PayoutDetail({
   const fromWorkiz = hasWorkizPaymentRecords(payments)
   // Offer the confirmation form only where it is the missing piece: an unpaid-to-tech payout
   // whose payment type Workiz did not supply (or that an admin already transcribed).
-  const canConfirmPayments = Boolean(job) && (p.status === "pending" || p.status === "hold") && !fromWorkiz
+  const unpaidToTech = p.status === "pending" || p.status === "hold" || p.status === "ready"
+  const canConfirmPayments = Boolean(job) && unpaidToTech && !fromWorkiz && (p.status !== "ready" || manualPayments.length > 0)
   const jobTotal = num(job?.jobTotal)
   const tax = job?.taxAmount == null ? null : num(job.taxAmount)
   // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
@@ -470,6 +471,7 @@ function PayoutDetail({
           )}
           {canConfirmPayments && (
             <PaymentConfirmationForm
+              key={manualPayments.map((x) => `${x.method}:${x.amount}:${x.date ?? ""}`).join("|")}
               jobUuid={p.jobUuid}
               invoiceTotal={workizInvoiceTotal}
               existing={manualPayments}
