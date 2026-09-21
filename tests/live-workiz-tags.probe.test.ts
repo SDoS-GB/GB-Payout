@@ -12,7 +12,7 @@ import { describe, expect, it } from "vitest"
 import { getWorkizClient } from "@/lib/workiz/sync"
 import { db } from "@/lib/db"
 import { workizJobs } from "@/lib/db/schema"
-import { and, desc, eq, sql } from "drizzle-orm"
+import { eq, sql } from "drizzle-orm"
 
 const enabled = process.env.LIVE_WORKIZ_TAG_PROBE === "1"
 const PROBE_TAG = process.env.LIVE_WORKIZ_TAG_NAME ?? "Payout Ready"
@@ -20,15 +20,17 @@ const PROBE_TAG = process.env.LIVE_WORKIZ_TAG_NAME ?? "Payout Ready"
 const tagsOf = (raw: Record<string, unknown> | null) => (Array.isArray(raw?.Tags) ? (raw!.Tags as unknown[]).map(String) : [])
 
 describe.skipIf(!enabled)("live Workiz job/update Tags", () => {
-  it("adds and removes a tag on one paid Done job", async () => {
+  it("adds and removes a tag on one job", async () => {
     const { client } = await getWorkizClient()
+    // Prefer an explicit UUID; otherwise the job with the oldest scheduled date (least likely to be edited right now).
+    const pinned = process.env.LIVE_WORKIZ_TAG_UUID
     const [job] = await db
       .select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId, status: workizJobs.status })
       .from(workizJobs)
-      .where(and(eq(workizJobs.fullyPaid, true), sql`lower(${workizJobs.status}) in ('done','completed')`))
-      .orderBy(desc(workizJobs.lastSeenAt))
+      .where(pinned ? eq(workizJobs.uuid, pinned) : sql`true`)
+      .orderBy(sql`${workizJobs.raw}->>'JobDateTime' asc`)
       .limit(1)
-    expect(job, "need at least one paid Done job").toBeTruthy()
+    expect(job, "need at least one synced job").toBeTruthy()
     console.log(`[probe] job #${job.serialId} (${job.uuid}) status=${job.status}`)
 
     const before = tagsOf(await client.getJob(job.uuid))
