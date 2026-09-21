@@ -29,7 +29,7 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
   const dirty = enabled !== workiz.payoutReadyTagEnabled || cleanTag !== workiz.payoutReadyTag
   const status = alertStatus(workiz)
   const tagApplied = Boolean(workiz.lastTagEvent?.ok)
-  const messageTemplate = `[Job description] Mark paid: ${dashboardUrl}`
+  const messageTemplate = `Mark paid: ${dashboardUrl}`
   const previewBlock = ["PAYOUT READY (GB app)", "Pay Arthur $95.00", "Job #924738 - Grout Cleaning - Milano", "Paid $475.00 by Card on Sep 21, 2:45 PM", "Tip $20.00 (Arthur gets $10.00)"].join("\n")
 
   const copyTemplate = async () => {
@@ -128,9 +128,10 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
                 select yourself. Not <span className="font-medium">Post webhook</span> — a webhook never texts anyone.
               </li>
               <li>
-                Message: paste the template below, then replace <span className="font-mono">[Job description]</span> with the{" "}
-                <span className="font-medium">Job description</span> short code from the <span className="font-mono">{"{...}"}</span> library. Workiz has no
-                short code for payment method, tip or payout, so the app puts them in the description for you.
+                Message: select the <span className="font-mono">{"{...}"}</span> button and choose <span className="font-medium">Job description</span> (it
+                lands as a chip, not typed text), then paste the line below after it. Never type placeholders like{" "}
+                <span className="font-mono">[Job ID]</span> by hand — Workiz sends typed text exactly as written. Workiz has no short code for payment
+                method, tip or payout, so the app puts them in the description for you.
               </li>
               <li>
                 Select <span className="font-medium">Add automation</span>.
