@@ -40,3 +40,13 @@ export function legacyProfileOptions(name: string) {
 export const LINE_ITEM_MARKERS: Partial<Record<ContractorName, string>> = {
   Tim: "T, Tim",
 }
+
+/**
+ * Technicians who are on every job of another technician without being assigned
+ * in Workiz (companion -> the technician they always work with). Denis goes out
+ * with Vadim on every job while Workiz only lists Vadim. Only seeded for new
+ * profiles; admins change it in the Technicians tab.
+ */
+export const COMPANIONS: Partial<Record<ContractorName, ContractorName>> = {
+  Denis: "Vadim",
+}

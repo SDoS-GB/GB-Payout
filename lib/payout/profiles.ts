@@ -2,7 +2,7 @@ import { asc, eq } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { technicianProfiles, type TechnicianProfile } from "@/lib/db/schema"
 import { hashSecret, verifySecret } from "@/lib/security/crypto"
-import { CONTRACTORS, LINE_ITEM_MARKERS, legacyProfileOptions, type ContractorName } from "./contractors"
+import { COMPANIONS, CONTRACTORS, LINE_ITEM_MARKERS, legacyProfileOptions, type ContractorName } from "./contractors"
 import type { ProfileOptions, Rates } from "./calculator"
 
 export type ProfileRates = Rates & ProfileOptions
@@ -42,6 +42,17 @@ export async function ensureProfilesSeeded(): Promise<void> {
       }
     }),
   )
+
+  // Pairings need the primary's row id, which only exists after the insert above.
+  const paired = missing.filter((name) => COMPANIONS[name])
+  if (paired.length === 0) return
+  const rows = await db.select({ id: technicianProfiles.id, name: technicianProfiles.name }).from(technicianProfiles)
+  const idByName = new Map(rows.map((r) => [r.name, r.id]))
+  for (const name of paired) {
+    const primaryId = idByName.get(COMPANIONS[name] as string)
+    if (primaryId == null) continue
+    await db.update(technicianProfiles).set({ worksWithProfileId: primaryId }).where(eq(technicianProfiles.name, name))
+  }
 }
 
 export async function listProfiles(): Promise<TechnicianProfile[]> {

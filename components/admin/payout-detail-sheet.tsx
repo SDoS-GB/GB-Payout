@@ -64,6 +64,8 @@ type Snapshot = Partial<{
   }>
   job: Partial<{ jobTotal: number; colorSealTotal: number; discountAmount: number; cardServiceAmount: number; markers: string[] }>
   verification: Partial<{ balanced: boolean; assignedItemCount: number; itemCount: number; doubleCountedItems: number }>
+  /** Set when this technician was added because they always work with someone Workiz assigned. */
+  companionOf: { id: number; name: string } | null
 }>
 
 const pct = (v: string | number | null | undefined) => `${(Number(v ?? 0) * 100).toFixed(Number(v ?? 0) * 100 % 1 === 0 ? 0 : 1)}%`
@@ -292,6 +294,7 @@ function PayoutDetail({
               ["Workiz job status", job?.status ? `${job.status}${job.subStatus ? ` · ${job.subStatus}` : ""}` : "Unavailable"],
               job?.jobType ? ["Job type", job.jobType] : null,
               ["Team on job", job?.teamNames?.length ? job.teamNames.join(", ") : job?.teamIds?.length ? job.teamIds.join(", ") : "Unavailable"],
+              snap.companionOf ? ["Why this technician", `${p.profileName} always works with ${snap.companionOf.name}; added although Workiz does not list them on this job`] : null,
             ]}
           />
           {p.siblings.length > 0 && (
