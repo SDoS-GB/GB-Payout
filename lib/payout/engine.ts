@@ -1,5 +1,5 @@
 import { createHash } from "node:crypto"
-import { and, eq, inArray, isNotNull } from "drizzle-orm"
+import { and, eq, inArray } from "drizzle-orm"
 import { db } from "@/lib/db"
 import {
   payouts,
@@ -10,6 +10,7 @@ import {
 import type { WorkizSettings } from "@/lib/settings"
 import { isBlockingWarning, isPayableStatus, type NormalizedJob } from "@/lib/workiz/normalize"
 import { CALC_VERSION, CARD_FEE_MULTIPLIER, calcPayoutWithPaymentSplit, type SplitPayoutBreakdown } from "./calculator"
+import { addCompanions, describeCompanion } from "./companions"
 import { profileToRates } from "./profiles"
 import { planSegments, type JobSegment, type MarkerOwner } from "./segments"
 
@@ -152,11 +153,13 @@ async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook") {
   return { profiles, unmapped, mappingByProfile }
 }
 
-async function loadMarkerOwners(): Promise<MarkerOwner[]> {
-  return db
-    .select({ id: technicianProfiles.id, name: technicianProfiles.name, lineItemMarker: technicianProfiles.lineItemMarker })
-    .from(technicianProfiles)
-    .where(and(eq(technicianProfiles.active, true), isNotNull(technicianProfiles.lineItemMarker)))
+/** Every active technician: the source for line-item marker owners and for companions who are never assigned in Workiz. */
+async function loadActiveRoster(): Promise<TechnicianProfile[]> {
+  return db.select().from(technicianProfiles).where(eq(technicianProfiles.active, true))
+}
+
+function markerOwnersOf(roster: TechnicianProfile[]): MarkerOwner[] {
+  return roster.filter((p) => p.lineItemMarker != null).map((p) => ({ id: p.id, name: p.name, lineItemMarker: p.lineItemMarker }))
 }
 
 const money = (n: number) => `$${n.toFixed(2)}`
@@ -183,15 +186,27 @@ export async function upsertPayoutsForJob(
     notes: [],
   }
 
-  const { profiles, unmapped, mappingByProfile } = await resolveTeam(job, source)
+  const { profiles: assigned, unmapped, mappingByProfile } = await resolveTeam(job, source)
   result.unmappedTeamIds = unmapped
   if (unmapped.length) result.notes.push(`Unmapped Workiz team ids: ${unmapped.join(", ")}`)
-  if (profiles.length === 0) {
+  if (assigned.length === 0) {
     result.notes.push("No mapped technicians on this job")
     return result
   }
 
-  const plan = planSegments(job, profiles, await loadMarkerOwners())
+  const existing = await db.select().from(payouts).where(eq(payouts.jobUuid, job.uuid))
+  const existingByProfile = new Map(existing.map((p) => [p.profileId, p]))
+  const roster = await loadActiveRoster()
+
+  // Technicians who ride along on every job of an assigned tech (Denis with Vadim) but whom Workiz never lists.
+  const { profiles, added: companions } = addCompanions(assigned, roster, {
+    settledPrimaryIds: new Set(existing.filter((p) => p.status === "paid" || p.status === "void").map((p) => p.profileId)),
+    existingPayoutProfileIds: new Set(existing.map((p) => p.profileId)),
+  })
+  const companionPrimary = new Map(companions.map((c) => [c.companion.id, { id: c.primary.id, name: c.primary.name }]))
+  for (const c of companions) result.notes.push(`${describeCompanion(c)}; added to this job although Workiz does not list them`)
+
+  const plan = planSegments(job, profiles, markerOwnersOf(roster))
   if (plan.segmentation.segments.length > 1) {
     result.notes.push(
       plan.segmentation.segments
@@ -202,8 +217,6 @@ export async function upsertPayoutsForJob(
   result.notes.push(...plan.warnings)
 
   const baseGate = gateReason(job, settings, plan.warnings)
-  const existing = await db.select().from(payouts).where(eq(payouts.jobUuid, job.uuid))
-  const existingByProfile = new Map(existing.map((p) => [p.profileId, p]))
 
   for (const profile of profiles) {
     const segment = plan.segmentFor.get(profile.id) ?? plan.segmentation.segments[0]
@@ -262,6 +275,7 @@ export async function upsertPayoutsForJob(
         cardFeeAdjustment,
         calcVersion: CALC_VERSION,
         warnings: [...job.warnings, ...plan.warnings],
+        companionOf: companionPrimary.get(profile.id) ?? null,
         segment: {
           kind: segment.kind,
           marker: segment.marker,

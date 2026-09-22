@@ -25,6 +25,12 @@ export const technicianProfiles = pgTable("technician_profiles", {
    * that item exclusively to this technician. Null for regular crew members.
    */
   lineItemMarker: text("line_item_marker"),
+  /**
+   * Technician this one works every job with. When that technician is on a
+   * Workiz job, this profile is added to the job too, even though Workiz never
+   * lists them (Denis rides with Vadim). Null for everyone else.
+   */
+  worksWithProfileId: integer("works_with_profile_id"),
   active: boolean("active").notNull().default(true),
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
   updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),

@@ -9,6 +9,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
+import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { InlineMessage } from "./shared"
 
 type Profile = AdminDashboardData["profiles"][number]
@@ -23,24 +24,26 @@ export function ProfilesTab({ profiles }: { profiles: Profile[] }) {
             Rates are fractions (0.25 = 25%). Tip share is the technician&apos;s share of a tip (0.5 when two techs split). &quot;Separate color seal&quot; off means the whole job is
             paid at the non-color rate, exactly like the calculator does for Tim. Line-item marker tokens (e.g. <code className="font-mono">T, Tim</code>) assign a Workiz item that starts with one of them to
             this technician only; <code className="font-mono">*T*</code>, <code className="font-mono">*T</code>, <code className="font-mono">T</code>, <code className="font-mono">(T)</code> and{" "}
-            <code className="font-mono">(Tim)</code> all count. The crew is paid on the rest and keeps the tips. PINs are stored hashed; enter a new one only to change it.
+            <code className="font-mono">(Tim)</code> all count. The crew is paid on the rest and keeps the tips. &quot;Always works with&quot; adds this technician to every job of the chosen
+            technician even when Workiz does not list them (Denis with Vadim); each is paid on the whole job at their own rates and both appear in the payout text. PINs are stored
+            hashed; enter a new one only to change it.
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2">
           {profiles.map((p) => (
-            <ProfileCard key={p.id} profile={p} />
+            <ProfileCard key={p.id} profile={p} profiles={profiles} />
           ))}
         </CardContent>
       </Card>
       <div className="grid gap-4 md:grid-cols-2">
-        <NewProfileCard />
+        <NewProfileCard profiles={profiles} />
         <AdminPasswordCard />
       </div>
     </div>
   )
 }
 
-function ProfileCard({ profile }: { profile: Profile }) {
+function ProfileCard({ profile, profiles }: { profile: Profile; profiles: Profile[] }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [form, setForm] = useState({
@@ -49,9 +52,11 @@ function ProfileCard({ profile }: { profile: Profile }) {
     tipShare: Number(profile.tipShare),
     separateColorSeal: profile.separateColorSeal,
     lineItemMarker: profile.lineItemMarker ?? "",
+    worksWithProfileId: profile.worksWithProfileId ?? null,
     active: profile.active,
     newPin: "",
   })
+  const companions = profiles.filter((p) => p.worksWithProfileId === profile.id && p.active)
   const [msg, setMsg] = useState<{ tone: "ok" | "error"; text: string } | null>(null)
 
   return (
@@ -88,6 +93,13 @@ function ProfileCard({ profile }: { profile: Profile }) {
         </label>
         <MarkerField id={`marker-${profile.id}`} value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
       </div>
+      <WorksWithField
+        id={`works-with-${profile.id}`}
+        value={form.worksWithProfileId}
+        onChange={(v) => setForm({ ...form, worksWithProfileId: v })}
+        options={profiles.filter((p) => p.id !== profile.id)}
+        hint={companions.length ? `${companions.map((c) => c.name).join(", ")} ${companions.length === 1 ? "is" : "are"} added to every job of ${profile.name}` : undefined}
+      />
       <div className="flex items-end gap-2">
         <div className="flex flex-1 flex-col gap-1">
           <Label htmlFor={`pin-${profile.id}`} className="text-xs">
@@ -101,6 +113,45 @@ function ProfileCard({ profile }: { profile: Profile }) {
       </div>
       {msg && <InlineMessage tone={msg.tone}>{msg.text}</InlineMessage>}
     </form>
+  )
+}
+
+const NO_PAIRING = "none"
+
+function WorksWithField({
+  id,
+  value,
+  onChange,
+  options,
+  hint,
+}: {
+  id: string
+  value: number | null
+  onChange: (v: number | null) => void
+  options: Profile[]
+  hint?: string
+}) {
+  return (
+    <div className="flex flex-col gap-1">
+      <Label htmlFor={id} className="text-xs">
+        Always works with
+      </Label>
+      <Select value={value == null ? NO_PAIRING : String(value)} onValueChange={(v) => onChange(v === NO_PAIRING ? null : Number(v))}>
+        <SelectTrigger id={id} className="w-full" aria-label="Technician this profile is always on the job with">
+          <SelectValue />
+        </SelectTrigger>
+        <SelectContent>
+          <SelectItem value={NO_PAIRING}>Nobody (only jobs assigned in Workiz)</SelectItem>
+          {options.map((p) => (
+            <SelectItem key={p.id} value={String(p.id)}>
+              {p.name}
+              {!p.active ? " (inactive)" : ""}
+            </SelectItem>
+          ))}
+        </SelectContent>
+      </Select>
+      {hint && <p className="text-xs text-muted-foreground">{hint}</p>}
+    </div>
   )
 }
 
@@ -124,9 +175,18 @@ function MarkerField({ id, value, onChange }: { id: string; value: string; onCha
   )
 }
 
-const NEW_PROFILE = { name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true, lineItemMarker: "" }
+const NEW_PROFILE: {
+  name: string
+  pin: string
+  nonColorRate: number
+  colorRate: number
+  tipShare: number
+  separateColorSeal: boolean
+  lineItemMarker: string
+  worksWithProfileId: number | null
+} = { name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true, lineItemMarker: "", worksWithProfileId: null }
 
-function NewProfileCard() {
+function NewProfileCard({ profiles }: { profiles: Profile[] }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [form, setForm] = useState(NEW_PROFILE)
@@ -175,6 +235,7 @@ function NewProfileCard() {
             </label>
             <MarkerField id="marker-new" value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
           </div>
+          <WorksWithField id="works-with-new" value={form.worksWithProfileId} onChange={(v) => setForm({ ...form, worksWithProfileId: v })} options={profiles} />
           <Button type="submit" size="sm" disabled={pending} className="self-start">
             Add technician
           </Button>

@@ -393,9 +393,28 @@ function normalizeMarker(input: string | null | undefined): string | null {
   return tokens.join(", ")
 }
 
+/** The technician this profile always works with; must be a different, existing profile. Null when unpaired. */
+async function normalizeWorksWith(selfId: number | null, value: number | null | undefined): Promise<number | null> {
+  if (value == null) return null
+  if (!Number.isInteger(value)) throw new Error("Choose a technician from the list")
+  if (selfId != null && value === selfId) throw new Error("A technician cannot always work with themselves")
+  const [target] = await db.select({ id: technicianProfiles.id }).from(technicianProfiles).where(eq(technicianProfiles.id, value)).limit(1)
+  if (!target) throw new Error("That technician profile no longer exists")
+  return target.id
+}
+
 export async function updateProfile(
   id: number,
-  patch: { nonColorRate: number; colorRate: number; tipShare: number; separateColorSeal: boolean; active: boolean; lineItemMarker?: string | null; newPin?: string },
+  patch: {
+    nonColorRate: number
+    colorRate: number
+    tipShare: number
+    separateColorSeal: boolean
+    active: boolean
+    lineItemMarker?: string | null
+    worksWithProfileId?: number | null
+    newPin?: string
+  },
 ): Promise<Result> {
   try {
     await requireAdmin()
@@ -409,6 +428,7 @@ export async function updateProfile(
       tipShare: rate(patch.tipShare),
       separateColorSeal: patch.separateColorSeal,
       lineItemMarker: normalizeMarker(patch.lineItemMarker),
+      worksWithProfileId: await normalizeWorksWith(id, patch.worksWithProfileId),
       active: patch.active,
       updatedAt: new Date(),
     }
@@ -432,6 +452,7 @@ export async function createProfile(input: {
   tipShare: number
   separateColorSeal: boolean
   lineItemMarker?: string | null
+  worksWithProfileId?: number | null
 }): Promise<Result> {
   try {
     await requireAdmin()
@@ -446,6 +467,7 @@ export async function createProfile(input: {
       tipShare: input.tipShare.toString(),
       separateColorSeal: input.separateColorSeal,
       lineItemMarker: normalizeMarker(input.lineItemMarker),
+      worksWithProfileId: await normalizeWorksWith(null, input.worksWithProfileId),
       active: true,
     })
     revalidatePath("/admin")
