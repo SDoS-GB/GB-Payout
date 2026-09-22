@@ -180,8 +180,10 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
               </Button>
             </form>
             <p className="text-xs text-muted-foreground">
-              Adds the tag and the payout summary to that job for real and, if the automation is live, texts you within a minute. The app cannot
-              remove tags, so use a job that is already paid out. A job that already has the tag will not trigger a second text.
+              Adds the tag and the payout summary to that job for real. If your Workiz automation triggers on the tag, the text arrives within a
+              minute; if it triggers on the Done status, this test only writes the tag and summary (open the job in Workiz to see the block) and the
+              text comes with the next real job. The app cannot remove tags, so use a job that is already paid out. A job that already has the tag
+              will not trigger a second text.
             </p>
           </SetupStep>
         </ol>
