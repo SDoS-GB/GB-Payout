@@ -1,19 +1,23 @@
 import { and, eq, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
-import { colorSealItems, jobPayments, payouts, syncEvents, workizJobs, workizTeamMappings, type NormalizedPayment } from "@/lib/db/schema"
+import { colorSealItems, jobPayments, payouts, syncEvents, technicianProfiles, workizJobs, workizTeamMappings, type NormalizedPayment } from "@/lib/db/schema"
 import { notifyPayout, type NotifyOutcome } from "@/lib/notifications/send"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
 import { getWorkizSettings, type WorkizSettings } from "@/lib/settings"
 import { WorkizClient, type WorkizRawJob } from "./client"
 import { normalizeJob, type ColorSealCatalog, type NormalizedJob } from "./normalize"
 import { externalRowsToPayments, type ExternalPaymentInput, type InvoiceWebhookPayments, type ManualPaymentEntry } from "./payments"
+import { buildPayoutNote, hasPayoutNote, mergePayoutNote, type PayoutNoteInput } from "./payout-note"
 import { explainNotApplied, planPayoutReadyTag, verifyTagApplied, type TagSkipReason, type TagVerdict } from "./tags"
 
 export type SyncSource = "rest" | "webhook"
 
+/** Whether the payout summary reached the job's Workiz description alongside the tag. */
+export type DescriptionVerdict = "written" | "not-written" | "skipped"
+
 export type TagOutcome =
   | { action: "skip"; reason: TagSkipReason | "no-client" }
-  | { action: "add"; tag: string; verdict: TagVerdict }
+  | { action: "add"; tag: string; verdict: TagVerdict; description: DescriptionVerdict }
   | { action: "add"; tag: string; error: string }
 
 export type JobSyncResult = {
@@ -33,8 +37,44 @@ async function jobHasReadyPayout(jobUuid: string): Promise<boolean> {
   return Boolean(row)
 }
 
+/** The job snapshot plus its ready payouts, shaped for the description block. Null when the job was never synced. */
+async function loadPayoutNoteInput(uuid: string, settings: WorkizSettings): Promise<PayoutNoteInput | null> {
+  const [job] = await db.select().from(workizJobs).where(eq(workizJobs.uuid, uuid)).limit(1)
+  if (!job) return null
+  const ready = await db
+    .select({
+      name: technicianProfiles.name,
+      total: payouts.totalPayout,
+      tip: payouts.tipPayout,
+      segmentKind: payouts.segmentKind,
+      segmentMarker: payouts.segmentMarker,
+    })
+    .from(payouts)
+    .innerJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
+    .where(and(eq(payouts.jobUuid, uuid), eq(payouts.status, "ready")))
+    .orderBy(payouts.id)
+  return {
+    serialId: job.serialId,
+    uuid,
+    jobType: job.jobType,
+    clientName: job.clientName,
+    jobTotal: Number(job.jobTotal),
+    tipTotal: Number(job.cardTipAmount) + Number(job.nonCardTipAmount),
+    payments: Array.isArray(job.payments) ? job.payments : [],
+    techs: ready.map((r) => ({ name: r.name, total: Number(r.total), tip: Number(r.tip), segmentKind: r.segmentKind, segmentMarker: r.segmentMarker })),
+    timeZone: settings.businessTimezone,
+  }
+}
+
+function jobDescriptionOf(raw: WorkizRawJob | null | undefined): string | null {
+  const v = raw?.JobNotes
+  return typeof v === "string" ? v : null
+}
+
 /**
- * Add the payout-ready tag to a job in Workiz so the admin's Workiz automation can text them.
+ * Add the payout-ready tag to a job in Workiz so the admin's Workiz automation can text them,
+ * and in the same update write the payout summary into the job's description so that text
+ * can carry who to pay, how much, for what, how the client paid and when.
  * Idempotent: the tag already being on the job is the "done" marker. Never throws — a tagging
  * problem must not fail the payout sync — but every attempt is written to sync_events.
  */
@@ -43,45 +83,78 @@ export async function applyPayoutReadyTag(args: {
   uuid: string
   serialId: string | null
   existingTags: readonly string[]
+  /**
+   * The job's current Workiz description. Pass it when a fresh payload is at hand; leave it
+   * undefined to have the job re-read first, since `JobNotes` replaces the whole field and a
+   * stale copy would erase what the office typed since the last sync.
+   */
+  existingDescription?: string | null
   settings: WorkizSettings
   /** Admin self-test: tag even without a ready payout and even when the feature is off. */
   force?: boolean
   via?: string
 }): Promise<TagOutcome> {
-  const { client, uuid, serialId, existingTags, settings } = args
+  const { client, uuid, serialId, settings } = args
   const label = serialId ?? uuid
   const enabled = Boolean(args.force) || settings.payoutReadyTagEnabled
   if (!enabled) return { action: "skip", reason: "disabled" }
+  const hasReadyPayout = await jobHasReadyPayout(uuid)
   const plan = planPayoutReadyTag({
     enabled,
     tag: settings.payoutReadyTag,
-    existingTags,
-    hasReadyPayout: Boolean(args.force) || (await jobHasReadyPayout(uuid)),
+    existingTags: args.existingTags,
+    hasReadyPayout: Boolean(args.force) || hasReadyPayout,
   })
   if (plan.action === "skip") return plan
 
+  let before: readonly string[] = args.existingTags
+  let tags = plan.tags
   try {
-    await client.updateJob(uuid, { Tags: plan.tags })
+    let existingDescription = args.existingDescription
+    if (existingDescription === undefined) {
+      const current = await client.getJob(uuid)
+      existingDescription = jobDescriptionOf(current)
+      if (Array.isArray(current?.Tags)) {
+        before = (current.Tags as unknown[]).map(String)
+        tags = Array.from(new Set([...before, plan.tag]))
+      }
+    }
+
+    let note: string | null = null
+    let noteError: string | null = null
+    try {
+      const input = await loadPayoutNoteInput(uuid, settings)
+      note = input ? buildPayoutNote(input) : null
+    } catch (err) {
+      noteError = err instanceof Error ? err.message : String(err)
+    }
+
+    const fields: { Tags: string[]; JobNotes?: string } = { Tags: tags }
+    if (note) fields.JobNotes = mergePayoutNote(existingDescription, note)
+
+    await client.updateJob(uuid, fields)
     const fresh = await client.getJob(uuid)
     const after = Array.isArray(fresh?.Tags) ? (fresh.Tags as unknown[]).map(String) : []
     const verdict = verifyTagApplied(after, plan.tag)
+    const description: DescriptionVerdict = !note ? "skipped" : hasPayoutNote(jobDescriptionOf(fresh)) ? "written" : "not-written"
+    const descriptionSummary = description === "written" ? " · summary written to description" : description === "not-written" ? " · summary NOT in description" : noteError ? " · summary skipped (build failed)" : ""
     await logSyncEvent("job:tag", {
       jobUuid: uuid,
       ok: verdict === "applied",
       summary:
         verdict === "applied"
-          ? `Tagged ${label} with "${plan.tag}"${args.via ? ` · via ${args.via}` : ""}`
+          ? `Tagged ${label} with "${plan.tag}"${descriptionSummary}${args.via ? ` · via ${args.via}` : ""}`
           : `Tag "${plan.tag}" not applied to ${label} — create it in Workiz first`,
-      details: { tag: plan.tag, before: existingTags, after, verdict, via: args.via ?? null, forced: Boolean(args.force) },
+      details: { tag: plan.tag, before, after, verdict, description, note, noteError, via: args.via ?? null, forced: Boolean(args.force) },
     })
-    return { action: "add", tag: plan.tag, verdict }
+    return { action: "add", tag: plan.tag, verdict, description }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
     await logSyncEvent("job:tag", {
       jobUuid: uuid,
       ok: false,
       summary: `Tagging ${label} failed: ${error}`,
-      details: { tag: plan.tag, before: existingTags, error, via: args.via ?? null, forced: Boolean(args.force) },
+      details: { tag: plan.tag, before, error, via: args.via ?? null, forced: Boolean(args.force) },
     })
     return { action: "add", tag: plan.tag, error }
   }
@@ -90,7 +163,8 @@ export async function applyPayoutReadyTag(args: {
 export function describeTagOutcome(outcome: TagOutcome): string {
   if (outcome.action === "skip") return `skipped (${outcome.reason})`
   if ("error" in outcome) return `failed: ${outcome.error}`
-  return outcome.verdict === "applied" ? `applied "${outcome.tag}"` : explainNotApplied(outcome.tag)
+  if (outcome.verdict !== "applied") return explainNotApplied(outcome.tag)
+  return outcome.description === "written" ? `applied "${outcome.tag}" and wrote the payout summary to the job description` : `applied "${outcome.tag}"`
 }
 
 export async function logSyncEvent(kind: string, opts: { jobUuid?: string | null; ok?: boolean; summary?: string; details?: unknown } = {}) {
@@ -273,6 +347,7 @@ export async function processRawJob(
         uuid: normalized.uuid,
         serialId: normalized.serialId,
         existingTags: normalized.tags,
+        existingDescription: typeof raw.JobNotes === "string" ? raw.JobNotes : null,
         settings,
         via: ctx.via ?? source,
       })

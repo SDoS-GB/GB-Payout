@@ -29,7 +29,8 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
   const dirty = enabled !== workiz.payoutReadyTagEnabled || cleanTag !== workiz.payoutReadyTag
   const status = alertStatus(workiz)
   const tagApplied = Boolean(workiz.lastTagEvent?.ok)
-  const messageTemplate = `Payout ready: job #[Job ID] for [Client name] ([Job total]). Review and pay: ${dashboardUrl}`
+  const messageTemplate = `Mark paid: ${dashboardUrl}`
+  const previewBlock = ["PAYOUT READY (GB app)", "Pay Arthur $105.00 (total and tip included)", "Job #924738 - Grout Cleaning - Milano", "Paid $475.00 by Card on Sep 21, 2:45 PM", "Tip $20.00"].join("\n")
 
   const copyTemplate = async () => {
     try {
@@ -65,7 +66,8 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
             <CardTitle className="text-base">Text me when a payout is ready</CardTitle>
             <CardDescription>
               Workiz sends the text from your own account. The first time a job has a payout that is ready to pay, this app adds a tag to the job in
-              Workiz; a Workiz automation on that tag texts you. One text per job, no extra SMS service.
+              Workiz and writes a payout summary at the top of the job&apos;s description (who to pay, how much, for what, how the client paid and
+              when). A Workiz automation on that tag texts you the description. One text per job, no extra SMS service.
             </CardDescription>
           </div>
           <Badge variant={status.variant} className="shrink-0">
@@ -104,26 +106,35 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
             </p>
           </SetupStep>
 
-          <SetupStep n={2} title="Create the automation in Workiz">
+          <SetupStep n={2} title="Create a separate text automation in Workiz">
+            <p className="text-xs text-muted-foreground">
+              This is a second automation, not the webhook one. The webhook automation (Job status → Post webhook) must have{" "}
+              <span className="font-medium">no tag condition</span>: it is what tells this app the job is done, and the tag does not exist yet at that
+              moment.
+            </p>
             <ol className="flex list-decimal flex-col gap-1 pl-5 text-sm leading-relaxed">
               <li>
                 Open <span className="font-medium">Automations</span> and select <span className="font-medium">Add automation</span>.
               </li>
               <li>
                 <span className="font-medium">This happens</span>: choose the job trigger for a tag being added and pick{" "}
-                <span className="font-mono">{cleanTag || "Payout Ready"}</span>. If your Workiz plan only offers status triggers, use{" "}
-                <span className="font-medium">Job is updated</span> and add the condition <span className="font-medium">Job tag = {cleanTag || "Payout Ready"}</span>.
+                <span className="font-mono">{cleanTag || "Payout Ready"}</span>. If your plan only offers status triggers, use{" "}
+                <span className="font-medium">Job has a status of {"Done"}</span>, set the timing to <span className="font-medium">10 minutes after</span>{" "}
+                <span className="font-medium">last status change date</span>, and add the condition <span className="font-medium">Job tag = {cleanTag || "Payout Ready"}</span>{" "}
+                so the tag has time to arrive before Workiz checks it.
               </li>
               <li>
                 <span className="font-medium">Do this</span>: choose <span className="font-medium">Send text message</span> → <span className="font-medium">Team member</span> and
-                select yourself.
+                select yourself. Not <span className="font-medium">Post webhook</span> — a webhook never texts anyone.
               </li>
               <li>
-                Message: paste the template below, then replace each bracketed part with the matching short code from the <span className="font-mono">{"{...}"}</span>{" "}
-                library (Job ID, Client name, Job total).
+                Message: select the <span className="font-mono">{"{...}"}</span> button and choose <span className="font-medium">Job description</span> (it
+                lands as a chip, not typed text), then paste the line below after it. Never type placeholders like{" "}
+                <span className="font-mono">[Job ID]</span> by hand — Workiz sends typed text exactly as written. Workiz has no short code for payment
+                method, tip or payout, so the app puts them in the description for you.
               </li>
               <li>
-                Set the timing to <span className="font-medium">Immediately</span> and select <span className="font-medium">Add automation</span>.
+                Select <span className="font-medium">Add automation</span>.
               </li>
             </ol>
             <div className="flex items-center gap-2">
@@ -131,6 +142,13 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
               <Button type="button" size="icon" variant="outline" onClick={copyTemplate} aria-label="Copy message template">
                 {copied ? <Check className="h-4 w-4" /> : <Copy className="h-4 w-4" />}
               </Button>
+            </div>
+            <div className="flex flex-col gap-1">
+              <p className="text-xs text-muted-foreground">What the description (and so the text) will contain, for example:</p>
+              <pre className="overflow-x-auto rounded-md border border-border bg-muted/40 p-3 font-mono text-xs leading-relaxed text-foreground">{previewBlock}</pre>
+              <p className="text-xs text-muted-foreground">
+                Whatever the office typed in the description stays below this block. Technicians who open the job in Workiz will see it too.
+              </p>
             </div>
           </SetupStep>
 
@@ -162,8 +180,10 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
               </Button>
             </form>
             <p className="text-xs text-muted-foreground">
-              Adds the tag to that job for real and, if the automation is live, texts you within a minute. The app cannot remove tags, so use a job
-              that is already paid out. A job that already has the tag will not trigger a second text.
+              Adds the tag and the payout summary to that job for real. If your Workiz automation triggers on the tag, the text arrives within a
+              minute; if it triggers on the Done status, this test only writes the tag and summary (open the job in Workiz to see the block) and the
+              text comes with the next real job. The app cannot remove tags, so use a job that is already paid out. A job that already has the tag
+              will not trigger a second text.
             </p>
           </SetupStep>
         </ol>

@@ -182,7 +182,8 @@ export async function tagJobForPayoutTest(jobRef: string): Promise<Result<{ summ
     const fresh = await client.getJob(job.uuid)
     if (!fresh) throw new Error(`Workiz job ${job.uuid} not found`)
     const existingTags = Array.isArray(fresh.Tags) ? (fresh.Tags as unknown[]).map(String) : []
-    const outcome = await applyPayoutReadyTag({ client, uuid: job.uuid, serialId: job.serialId, existingTags, settings, force: true, via: "admin-test" })
+    const existingDescription = typeof fresh.JobNotes === "string" ? fresh.JobNotes : null
+    const outcome = await applyPayoutReadyTag({ client, uuid: job.uuid, serialId: job.serialId, existingTags, existingDescription, settings, force: true, via: "admin-test" })
     revalidatePath("/admin")
 
     const label = job.serialId ? `#${job.serialId}` : job.uuid
@@ -192,7 +193,13 @@ export async function tagJobForPayoutTest(jobRef: string): Promise<Result<{ summ
     }
     if ("error" in outcome) throw new Error(outcome.error)
     if (outcome.verdict !== "applied") throw new Error(explainNotApplied(outcome.tag))
-    return { ok: true, data: { summary: `Tagged job ${label} with "${outcome.tag}". If your Workiz automation is live, the text is on its way.` } }
+    const descriptionNote =
+      outcome.description === "written"
+        ? " The payout summary is now at the top of that job's description, so a text built from the Job description short code will carry it."
+        : outcome.description === "not-written"
+          ? " Warning: the tag stuck but the payout summary did not appear in the job description — check Activity for details."
+          : ""
+    return { ok: true, data: { summary: `Tagged job ${label} with "${outcome.tag}".${descriptionNote} If your Workiz automation is live, the text is on its way.` } }
   } catch (err) {
     return fail(err)
   }

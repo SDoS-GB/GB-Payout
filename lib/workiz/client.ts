@@ -204,8 +204,10 @@ export class WorkizClient {
    * POST job/update/ — partial update. Only `UUID` plus the fields being changed are sent.
    * `Tags` MERGES with the job's existing tags and unknown tag names are silently dropped;
    * see lib/workiz/tags.ts for the verified semantics before using this for anything else.
+   * `JobNotes` is the Job description shown in Workiz and REPLACES the whole field (verified
+   * live 2026-09-21), so callers must send the merged text, never just the addition.
    */
-  async updateJob(uuid: string, fields: { Tags?: string[]; SubStatus?: string }) {
+  async updateJob(uuid: string, fields: { Tags?: string[]; SubStatus?: string; JobNotes?: string }) {
     return this.request<{ flag?: boolean; data?: unknown }>("POST", "job/update/", {
       body: { UUID: uuid, ...fields },
     })
