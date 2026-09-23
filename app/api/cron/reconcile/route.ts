@@ -25,7 +25,9 @@ export async function GET(req: Request) {
 
   try {
     const summary = await reconcileRecentJobs()
-    return NextResponse.json({ ok: true, ...summary })
+    // Per-job outbox results are already in the reconcile sync_event; the response stays a compact status line.
+    const { outbox, ...rest } = summary
+    return NextResponse.json({ ok: true, ...rest, outbox: { considered: outbox.considered, accepted: outbox.accepted, failed: outbox.failed, skipped: outbox.skipped, notEligible: outbox.notEligible } })
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
     await logSyncEvent("reconcile", { ok: false, summary: `Reconcile failed: ${error}` })

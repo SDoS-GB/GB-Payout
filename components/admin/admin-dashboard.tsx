@@ -14,7 +14,7 @@ import { PayoutsTab } from "./payouts-tab"
 import { WorkizSettingsTab } from "./workiz-settings-tab"
 import { TeamMappingTab } from "./team-mapping-tab"
 import { ProfilesTab } from "./profiles-tab"
-import { NotificationsTab } from "./notifications-tab"
+import { OwnerTextsTab } from "./owner-texts-tab"
 import { ActivityTab } from "./activity-tab"
 import { money } from "./shared"
 
@@ -36,6 +36,8 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
     })
 
   const unmappedPeople = data.mappings.filter((m) => m.profileId == null && !m.excluded)
+  // Failed texts and webhook payloads the app could not attach to a job both need a human look.
+  const ownerAttention = data.ownerTexts.rows.filter((r) => r.status === "failed").length + (data.ownerTexts.webhookCounts.unresolved ?? 0) + (data.ownerTexts.webhookCounts.failed ?? 0)
   const selectedProfile = payoutQuery.profileId != null ? data.profiles.find((p) => p.id === payoutQuery.profileId) ?? null : null
 
   // Individual payout-record counts from the same table + status definitions the list queries.
@@ -153,7 +155,14 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
               )}
             </TabsTrigger>
             <TabsTrigger value="profiles">Technicians</TabsTrigger>
-            <TabsTrigger value="notifications">Messages</TabsTrigger>
+            <TabsTrigger value="notifications">
+              Owner texts
+              {ownerAttention > 0 && (
+                <Badge variant="secondary" className="ml-2">
+                  {ownerAttention}
+                </Badge>
+              )}
+            </TabsTrigger>
             <TabsTrigger value="workiz">Workiz</TabsTrigger>
             <TabsTrigger value="activity">Activity</TabsTrigger>
           </TabsList>
@@ -184,7 +193,7 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
             <ProfilesTab profiles={data.profiles} />
           </TabsContent>
           <TabsContent value="notifications">
-            <NotificationsTab settings={data.notifications} payouts={data.payouts} />
+            <OwnerTextsTab data={data.ownerTexts} lastWebhook={data.workiz.lastWebhook} timezone={data.workiz.businessTimezone} onOpenWorkizTab={() => setTab("workiz")} />
           </TabsContent>
           <TabsContent value="workiz">
             <WorkizSettingsTab workiz={data.workiz} catalog={data.catalog} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />

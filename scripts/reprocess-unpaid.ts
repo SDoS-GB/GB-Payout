@@ -79,7 +79,7 @@ async function main() {
       if (!raw) throw new Error("not found in Workiz")
       const result = await processRawJob(raw, "rest", { settings, catalog, client, via: VIA })
       const e = result.engine
-      console.log(`  #${result.normalized.serialId ?? uuid} ${result.normalized.status ?? "?"} · +${e.created}/~${e.updated}/=${e.unchanged}${e.held ? ` held ${e.held}` : ""} · tag ${result.tag.action}${result.normalized.warnings.length ? ` · ${result.normalized.warnings.length} warning(s)` : ""}`)
+      console.log(`  #${result.normalized.serialId ?? uuid} ${result.normalized.status ?? "?"} · +${e.created}/~${e.updated}/=${e.unchanged}${e.held ? ` held ${e.held}` : ""} · owner text ${result.owner?.row.status ?? "n/a"}${result.normalized.warnings.length ? ` · ${result.normalized.warnings.length} warning(s)` : ""}`)
       for (const n of e.notes) console.log(`      note: ${n}`)
       for (const w of result.normalized.warnings) console.log(`      warn: ${w.slice(0, 160)}`)
     } catch (err) {

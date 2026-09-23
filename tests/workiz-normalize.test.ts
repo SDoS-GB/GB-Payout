@@ -2,7 +2,6 @@ import { describe, expect, it } from "vitest"
 import { calcLegacyJobPayout, calcPayoutWithPaymentSplit } from "@/lib/payout/calculator"
 import { DEFAULT_WORKIZ_SETTINGS } from "@/lib/settings"
 import { isPayableStatus, normalizeJob } from "@/lib/workiz/normalize"
-import { renderTemplate } from "@/lib/notifications/template"
 
 const settings = DEFAULT_WORKIZ_SETTINGS
 const noCatalog = new Map<string, boolean>()
@@ -220,27 +219,5 @@ describe("payable status gating", () => {
     expect(isPayableStatus("Completed", settings)).toBe(true)
     expect(isPayableStatus("Submitted", settings)).toBe(false)
     expect(isPayableStatus(null, settings)).toBe(false)
-  })
-})
-
-describe("notification template", () => {
-  it("renders placeholders and leaves unknown ones visible", () => {
-    const out = renderTemplate("Hi {{technician}}: {{totalPayout}} {{unknownKey}}", {
-      technician: "Vadim",
-      jobSerial: "1",
-      jobUuid: "u",
-      clientName: "c",
-      jobTotal: "$1.00",
-      segmentLine: "",
-      discountLine: "",
-      colorSealLine: "",
-      tipLine: "",
-      basePayout: "$0.20",
-      tipPayout: "$0.00",
-      totalPayout: "$0.20",
-      status: "ready",
-      holdReason: "",
-    })
-    expect(out).toBe("Hi Vadim: $0.20 {{unknownKey}}")
   })
 })

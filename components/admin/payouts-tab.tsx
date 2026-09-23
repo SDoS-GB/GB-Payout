@@ -5,7 +5,7 @@ import { useRouter } from "next/navigation"
 import useSWR, { SWRConfig, unstable_serialize, useSWRConfig } from "swr"
 import { ChevronLeft, ChevronRight, RefreshCw, Search, X } from "lucide-react"
 import type { PayoutPage, PayoutRecord, AdminDashboardData } from "@/app/actions/admin"
-import { bulkMarkPaid, clearConfirmedPayments, confirmJobPayments, queryPayouts, reviewPayout, runReconcile, syncSingleJob } from "@/app/actions/admin"
+import { bulkMarkPaid, clearConfirmedPayments, confirmJobPayments, queryPayouts, reviewPayout, runReconcile, sendPayoutToOwner, syncSingleJob } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -16,7 +16,7 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { segmentLabel } from "@/lib/payout/segments"
 import { DEFAULT_PAYOUT_QUERY, PAYOUT_STATUS_FILTERS, paymentMethodsSummary, type PayoutQuery, type PayoutStatusFilter } from "@/lib/payout/presentation"
 import { PayoutDetailSheet } from "./payout-detail-sheet"
-import { InlineMessage, StatusBadge, money, zonedDate } from "./shared"
+import { InlineMessage, OwnerTextBadge, StatusBadge, money, zonedDate } from "./shared"
 
 type Profile = AdminDashboardData["profiles"][number]
 
@@ -322,7 +322,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                     <TableHead>Status / reason</TableHead>
                     <TableHead>Completed</TableHead>
                     <TableHead>Customer paid by</TableHead>
-                    <TableHead>Message</TableHead>
+                    <TableHead>Owner text</TableHead>
                     <TableHead className="w-8">
                       <span className="sr-only">Open details</span>
                     </TableHead>
@@ -425,6 +425,13 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
           onConfirmPayments: (jobUuid, entries) => act(() => confirmJobPayments(jobUuid, entries), "Payments confirmed and job re-synced"),
           onClearPayments: (jobUuid) => act(() => clearConfirmedPayments(jobUuid), "Payment confirmation cleared and job re-synced"),
         }}
+        onSendOwnerText={async (jobUuid, force) => {
+          const res = await sendPayoutToOwner(jobUuid, force)
+          if (!res.ok) return { tone: "error", text: res.error }
+          const d = res.data!
+          await refreshAll()
+          return { tone: d.outcome === "provider_accepted" ? "ok" : d.outcome === "failed" ? "error" : "info", text: d.detail }
+        }}
       />
     </div>
   )
@@ -511,7 +518,9 @@ function PayoutRow({
         <span className={methods.count === 0 ? "text-muted-foreground" : ""}>{methods.label}</span>
         {methods.mixed && <span className="ml-1 rounded bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground">Mixed</span>}
       </TableCell>
-      <TableCell>{p.lastNotification ? <StatusBadge status={p.lastNotification.status} /> : <span className="text-xs text-muted-foreground">—</span>}</TableCell>
+      <TableCell>
+        <OwnerTextBadge status={p.ownerText?.status} />
+      </TableCell>
       <TableCell className="text-muted-foreground">
         <ChevronRight className="h-4 w-4" aria-hidden="true" />
       </TableCell>

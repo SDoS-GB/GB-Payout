@@ -909,7 +909,7 @@ async function ownerTextRows(limit = 100) {
     .leftJoin(workizJobs, eq(ownerNotifications.jobUuid, workizJobs.uuid))
     .orderBy(desc(ownerNotifications.updatedAt))
     .limit(limit)
-  return rows.map((r) => ({ ...r.row, job: r.job.serialId === null && r.job.clientName === null && r.job.status === null ? null : r.job, paymentSource: paymentSourceSummary(r.job.payments) }))
+  return rows.map((r) => ({ ...r.row, job: r.job, paymentSource: paymentSourceSummary(r.job?.payments) }))
 }
 
 function paymentSourceSummary(payments: unknown): string {

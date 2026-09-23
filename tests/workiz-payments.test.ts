@@ -6,7 +6,7 @@ import { PAYMENT_DETAILS_UNAVAILABLE, explainPayoutStatus, paymentMethodsSummary
 import { DEFAULT_WORKIZ_SETTINGS } from "@/lib/settings"
 import { WorkizClient } from "@/lib/workiz/client"
 import { PAYMENT_METHOD_UNKNOWN_PREFIX, isBlockingWarning, normalizeJob, normalizePayments } from "@/lib/workiz/normalize"
-import { classifyPaymentMethod, extractInvoiceWebhookPayments, externalRowsToPayments, mergePayments, paymentEvidenceState, validateManualPayments } from "@/lib/workiz/payments"
+import { TIP_INCLUSION_RAW_KEY, classifyPaymentMethod, extractInvoiceWebhookPayments, externalRowsToPayments, inferTipInclusion, mergePayments, paymentEvidenceState, validateManualPayments } from "@/lib/workiz/payments"
 import { parseWebhookBody } from "@/lib/workiz/webhook"
 
 const settings = DEFAULT_WORKIZ_SETTINGS
@@ -277,13 +277,32 @@ describe("invoice webhooks carry the payment type", () => {
     ])
   })
 
-  it("splits a payment with an attached tip into service and tip records", () => {
-    const rows = [{ id: 7, externalId: "PAY-2", source: "invoice-webhook", method: "Cash", amount: "110.00", tipAmount: "10.00", paidAt: null, recordedBy: null }]
-    const payments = externalRowsToPayments(rows, settings.cardMethodKeywords)
-    expect(payments).toEqual([
-      expect.objectContaining({ id: "PAY-2", amount: 100, isTip: false, source: "invoice-webhook" }),
-      expect.objectContaining({ id: "PAY-2", amount: 10, isTip: true }),
+  it("splits a payment with an attached tip into service and tip records, keeping the tip's own id", () => {
+    const included = [{ id: 7, externalId: "PAY-2", source: "invoice-webhook", method: "Cash", amount: "110.00", tipAmount: "10.00", paidAt: null, recordedBy: null, raw: { [TIP_INCLUSION_RAW_KEY]: "included" } }]
+    expect(externalRowsToPayments(included, settings.cardMethodKeywords)).toEqual([
+      expect.objectContaining({ id: "PAY-2", amount: 100, isTip: false, source: "invoice-webhook", tipAmbiguous: undefined }),
+      expect.objectContaining({ id: "PAY-2:tip", amount: 10, isTip: true }),
     ])
+
+    // Default verdict is "separate": the amount is the service payment and the tip sits on top.
+    const separate = [{ id: 8, externalId: "PAY-3", source: "invoice-webhook", method: "Cash", amount: "100.00", tipAmount: "10.00", paidAt: null, recordedBy: null, raw: null }]
+    expect(externalRowsToPayments(separate, settings.cardMethodKeywords)).toEqual([
+      expect.objectContaining({ id: "PAY-3", amount: 100, isTip: false }),
+      expect.objectContaining({ id: "PAY-3:tip", amount: 10, isTip: true }),
+    ])
+
+    // "unknown" keeps the smaller card-fee base but flags both records so the payout is held.
+    const unknown = [{ id: 9, externalId: "PAY-4", source: "invoice-webhook", method: "Credit Card", amount: "100.00", tipAmount: "10.00", paidAt: null, recordedBy: null, raw: { [TIP_INCLUSION_RAW_KEY]: "unknown" } }]
+    expect(externalRowsToPayments(unknown, settings.cardMethodKeywords).every((p) => p.tipAmbiguous === true)).toBe(true)
+  })
+
+  it("decides whether webhook amounts include their tips from the document totals", () => {
+    const pays = [{ amount: 100, tipAmount: 10 }]
+    expect(inferTipInclusion(pays, 100, 0)).toBe("separate")
+    expect(inferTipInclusion(pays, 90, 0)).toBe("included")
+    expect(inferTipInclusion(pays, 95, 0)).toBe("unknown")
+    expect(inferTipInclusion(pays, null, 0)).toBe("unknown")
+    expect(inferTipInclusion([{ amount: 100, tipAmount: 0 }], null, null)).toBe("separate")
   })
 
   it("job events never carry payments", () => {

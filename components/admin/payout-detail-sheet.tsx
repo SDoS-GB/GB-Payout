@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useState } from "react"
-import { AlertTriangle, ExternalLink } from "lucide-react"
+import { useEffect, useState, useTransition } from "react"
+import { AlertTriangle, ExternalLink, Send } from "lucide-react"
 import type { PayoutRecord, reviewPayout } from "@/app/actions/admin"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -22,7 +22,7 @@ import {
 } from "@/lib/payout/presentation"
 import type { ManualPaymentEntry } from "@/lib/workiz/payments"
 import { PaymentConfirmationForm } from "./payment-confirmation-form"
-import { InlineMessage, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
+import { InlineMessage, OwnerTextBadge, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
 
 type ReviewAction = Parameters<typeof reviewPayout>[1]
 
@@ -120,6 +120,8 @@ function snapshotMismatches(p: PayoutRecord, snap: Snapshot): string[] {
   return out
 }
 
+export type OwnerSendResult = { tone: "ok" | "error" | "info"; text: string }
+
 export function PayoutDetailSheet({
   record,
   open,
@@ -128,6 +130,7 @@ export function PayoutDetailSheet({
   pending,
   onAction,
   payments,
+  onSendOwnerText,
 }: {
   record: PayoutRecord | null
   open: boolean
@@ -136,11 +139,12 @@ export function PayoutDetailSheet({
   pending: boolean
   onAction: (id: number, action: ReviewAction, note?: string) => void
   payments: PaymentHandlers
+  onSendOwnerText: (jobUuid: string, force: boolean) => Promise<OwnerSendResult>
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl">
-        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} paymentHandlers={payments} />}
+        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} paymentHandlers={payments} onSendOwnerText={onSendOwnerText} />}
       </SheetContent>
     </Sheet>
   )
@@ -152,15 +156,24 @@ function PayoutDetail({
   pending,
   onAction,
   paymentHandlers,
+  onSendOwnerText,
 }: {
   p: PayoutRecord
   timezone: string
   pending: boolean
   onAction: (id: number, action: ReviewAction, note?: string) => void
   paymentHandlers: PaymentHandlers
+  onSendOwnerText: (jobUuid: string, force: boolean) => Promise<OwnerSendResult>
 }) {
   const [note, setNote] = useState(p.adminNote ?? "")
   useEffect(() => setNote(p.adminNote ?? ""), [p.adminNote])
+  const [ownerPending, startOwner] = useTransition()
+  const [ownerResult, setOwnerResult] = useState<OwnerSendResult | null>(null)
+  const sendOwner = (force: boolean) =>
+    startOwner(async () => {
+      setOwnerResult(null)
+      setOwnerResult(await onSendOwnerText(p.jobUuid, force))
+    })
 
   const job = p.job
   const snap = (p.breakdown ?? {}) as Snapshot
@@ -307,17 +320,19 @@ function PayoutDetail({
           <Facts
             rows={[
               ["Technician paid", p.status === "paid" ? `Yes · ${zonedDateTime(p.paidAt, timezone)}${p.paidBy ? ` by ${p.paidBy}` : ""}` : "Not yet"],
-              ["Message to technician", p.lastNotification ? <span className="inline-flex flex-wrap items-center gap-2"><StatusBadge status={p.lastNotification.status} />{p.lastNotification.sentAt ? <span className="text-xs text-muted-foreground">sent {zonedDateTime(p.lastNotification.sentAt, timezone)}</span> : null}</span> : "None rendered yet"],
+              [
+                "Owner payout text (whole job)",
+                <span className="inline-flex flex-wrap items-center gap-2">
+                  <OwnerTextBadge status={p.ownerText?.status} />
+                  {p.ownerText?.sentAt ? <span className="text-xs text-muted-foreground">accepted by Workiz {zonedDateTime(p.ownerText.sentAt, timezone)}</span> : null}
+                  {p.ownerText?.deliveredAt ? <span className="text-xs text-muted-foreground">· received {zonedDateTime(p.ownerText.deliveredAt, timezone)}</span> : null}
+                </span>,
+              ],
               p.adminNote ? ["Admin note", p.adminNote] : null,
               p.reviewedAt ? ["Last reviewed", `${zonedDateTime(p.reviewedAt, timezone)}${p.reviewedBy ? ` by ${p.reviewedBy}` : ""}`] : null,
             ]}
           />
-          {p.lastNotification && (
-            <p className="rounded border bg-muted/40 p-2 text-xs">
-              {p.lastNotification.message}
-              {p.lastNotification.error && <span className="text-destructive"> · {p.lastNotification.error}</span>}
-            </p>
-          )}
+          <OwnerTextPanel p={p} pending={pending || ownerPending} onSend={sendOwner} result={ownerResult} />
         </Section>
 
         <Section title="Job and customer">
@@ -624,6 +639,54 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
       <Separator className="mt-1" />
     </section>
   )
+}
+
+/**
+ * The job-level owner text as it stands, with the one button that pushes it to Workiz now.
+ * The server re-evaluates eligibility before sending, so the button is always safe to press.
+ */
+function OwnerTextPanel({ p, pending, onSend, result }: { p: PayoutRecord; pending: boolean; onSend: (force: boolean) => void; result: OwnerSendResult | null }) {
+  const t = p.ownerText
+  const accepted = t?.status === "provider_accepted" || t?.status === "delivered"
+  const stale = Boolean(t?.sentSnapshotHash && t?.snapshotHash && t.sentSnapshotHash !== t.snapshotHash)
+  const reason = t && !accepted ? t.blockReason : null
+  return (
+    <div className="flex flex-col gap-2 rounded border bg-muted/40 p-2">
+      <div className="flex flex-wrap items-start justify-between gap-2">
+        <p className="text-xs text-muted-foreground">
+          {t ? describeState(t.status) : "This job has not been evaluated for the owner text yet; syncing it will do that."}
+          {reason ? ` ${reason}.` : ""}
+          {t?.status === "failed" && t.lastError ? ` Last error: ${t.lastError}` : ""}
+          {stale ? " The payouts changed after the text went out; re-send to update the owner." : ""}
+        </p>
+        <Button size="sm" variant={accepted && !stale ? "outline" : "default"} disabled={pending} onClick={() => onSend(accepted)}>
+          <Send className="h-4 w-4" />
+          {accepted ? "Re-send payout to owner" : "Send payout to owner"}
+        </Button>
+      </div>
+      {t?.message ? <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed">{t.message}</pre> : null}
+      {result && <InlineMessage tone={result.tone}>{result.text}</InlineMessage>}
+    </div>
+  )
+}
+
+function describeState(status: string): string {
+  switch (status) {
+    case "provider_accepted":
+      return "Workiz accepted the tag and payout summary; your Workiz automation sends the SMS."
+    case "delivered":
+      return "The owner confirmed receiving this text."
+    case "queued":
+      return "Eligible; it goes out on the next webhook, cron run, or when you send it now."
+    case "sending":
+      return "A delivery attempt is in progress."
+    case "failed":
+      return "Workiz rejected or timed out; the cron retries on a back-off schedule."
+    case "preview_only":
+      return "Owner texts are switched off, so this message is stored but not sent."
+    default:
+      return "Not eligible yet."
+  }
 }
 
 function Facts({ rows }: { rows: Array<[string, React.ReactNode] | null> }) {

@@ -30,7 +30,7 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
   const status = alertStatus(workiz)
   const tagApplied = Boolean(workiz.lastTagEvent?.ok)
   const messageTemplate = `Mark paid: ${dashboardUrl}`
-  const previewBlock = ["PAYOUT READY (GB app)", "Pay Arthur $105.00 (total and tip included)", "Job #924738 - Grout Cleaning - Milano", "Paid $475.00 by Card on Sep 21, 2:45 PM", "Tip $20.00"].join("\n")
+  const previewBlock = ["PAYOUT READY (GB app)", "Job #924738 - Milano", "Completed Sep 21, 2026", "Client payments: Card $475.00", "Card fee applied proportionally.", "Tip $20.00 (Arthur $10.00, Vadim $10.00)", "Arthur: $105.00 (crew work)", "Vadim: $98.50 (crew work)"].join("\n")
 
   const copyTemplate = async () => {
     try {
@@ -65,9 +65,10 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
           <div>
             <CardTitle className="text-base">Text me when a payout is ready</CardTitle>
             <CardDescription>
-              Workiz sends the text from your own account. The first time a job has a payout that is ready to pay, this app adds a tag to the job in
-              Workiz and writes a payout summary at the top of the job&apos;s description (who to pay, how much, for what, how the client paid and
-              when). A Workiz automation on that tag texts you the description. One text per job, no extra SMS service.
+              Workiz sends the text from your own account. Once every payout on a job is ready, this app adds a tag to the job in Workiz and writes
+              a payout summary at the top of the job&apos;s description (each technician&apos;s own amount, how the client paid, tip and completion
+              date). A Workiz automation on that tag texts you the description. One text per job, no extra SMS service. Pick who receives it and
+              watch each job&apos;s text in the <span className="font-medium">Owner texts</span> tab.
             </CardDescription>
           </div>
           <Badge variant={status.variant} className="shrink-0">
@@ -180,10 +181,10 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
               </Button>
             </form>
             <p className="text-xs text-muted-foreground">
-              Adds the tag and the payout summary to that job for real. If your Workiz automation triggers on the tag, the text arrives within a
-              minute; if it triggers on the Done status, this test only writes the tag and summary (open the job in Workiz to see the block) and the
-              text comes with the next real job. The app cannot remove tags, so use a job that is already paid out. A job that already has the tag
-              will not trigger a second text.
+              Adds the tag and a clearly marked TEST block to that job for real; it is never recorded as a payout text. If your Workiz automation
+              triggers on the tag, the text arrives within a minute; if it triggers on the Done status, this test only writes the tag and block
+              (open the job in Workiz to see it) and the text comes with the next real job. The app cannot remove tags, so use a job that is already
+              paid out. A job that already has the tag will not trigger a second text.
             </p>
           </SetupStep>
         </ol>
@@ -196,8 +197,8 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
           </p>
         )}
         <p className="text-xs text-muted-foreground">
-          Payouts on hold are not tagged until you release them. When you turn this on, every job that already has a ready payout is tagged on the
-          next sync, so expect one text per such job the first time.
+          A job is texted only when every payout on it is ready (none pending or on hold) and the client has paid in full. When you turn this on,
+          every job already in that state is tagged on the next sync, so expect one text per such job the first time.
         </p>
       </CardContent>
     </Card>
