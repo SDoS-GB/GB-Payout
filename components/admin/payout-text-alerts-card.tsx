@@ -51,9 +51,7 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
       setTag(savedTag)
       setMsg({
         tone: "ok",
-        text: enabled
-          ? `Saved. From the next sync on, every job with a ready payout gets tagged "${savedTag}" once.`
-          : "Saved. Jobs will not be tagged until you turn this back on.",
+        text: `${enabled ? `Saved. Every job with a ready payout gets tagged "${savedTag}" once.` : "Saved. Jobs will not be tagged until you turn this back on."} ${res.data?.effect ?? ""}`.trim(),
       })
       router.refresh()
     })

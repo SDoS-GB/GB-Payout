@@ -12,7 +12,7 @@ import {
   workizJobs,
   workizTeamMappings,
 } from "@/lib/db/schema"
-import { confirmOwnerDelivered, getOwnerNotification, loadOwnerInput, refreshOwnerNotification, sendOwnerNotificationNow, sendOwnerTest } from "@/lib/notifications/owner"
+import { confirmOwnerDelivered, describeReevaluation, getOwnerNotification, loadOwnerInput, reevaluateOpenOwnerNotifications, refreshOwnerNotification, sendOwnerNotificationNow, sendOwnerTest } from "@/lib/notifications/owner"
 import { evaluateOwnerNotification } from "@/lib/notifications/owner-message"
 import { releaseBlocker } from "@/lib/payout/engine"
 import { listProfiles } from "@/lib/payout/profiles"
@@ -153,15 +153,16 @@ export async function testWebhookEndpoint(): Promise<Result<{ summary: string }>
   }
 }
 
-export async function updatePayoutTagSettings(form: { enabled: boolean; tag: string }): Promise<Result<{ tag: string }>> {
+export async function updatePayoutTagSettings(form: { enabled: boolean; tag: string }): Promise<Result<{ tag: string; effect: string }>> {
   try {
     await requireAdmin()
     const tag = normalizeTagName(form.tag) || DEFAULT_PAYOUT_READY_TAG
     if (tag.length > 60) throw new Error("Tag name is too long (max 60 characters).")
     await saveWorkizSettings({ payoutReadyTagEnabled: Boolean(form.enabled), payoutReadyTag: tag }, "admin")
-    await logSyncEvent("settings", { ok: true, summary: `Payout-ready tagging ${form.enabled ? "enabled" : "disabled"} · tag "${tag}"` })
+    const effect = await reevaluateOpenOwnerNotifications({ deliver: Boolean(form.enabled), via: "settings · sending toggled" })
+    await logSyncEvent("settings", { ok: true, summary: `Payout-ready tagging ${form.enabled ? "enabled" : "disabled"} · tag "${tag}" · ${describeReevaluation(effect)}`, details: effect })
     revalidatePath("/admin")
-    return { ok: true, data: { tag } }
+    return { ok: true, data: { tag, effect: describeReevaluation(effect) } }
   } catch (err) {
     return fail(err)
   }
@@ -621,23 +622,26 @@ export async function listOwnerRecipientCandidates(): Promise<Result<OwnerRecipi
   }
 }
 
-export async function setOwnerRecipient(workizTeamId: string | null): Promise<Result<{ name: string | null }>> {
+export async function setOwnerRecipient(workizTeamId: string | null): Promise<Result<{ name: string | null; effect: string }>> {
   try {
     await requireAdmin()
     if (!workizTeamId) {
       await saveNotificationSettings({ ownerRecipient: null }, "admin")
-      await logSyncEvent("settings", { ok: true, summary: "Owner text recipient cleared" })
+      const effect = await reevaluateOpenOwnerNotifications({ deliver: false, via: "settings · recipient cleared" })
+      await logSyncEvent("settings", { ok: true, summary: `Owner text recipient cleared · ${describeReevaluation(effect)}`, details: effect })
       revalidatePath("/admin")
-      return { ok: true, data: { name: null } }
+      return { ok: true, data: { name: null, effect: describeReevaluation(effect) } }
     }
     const { client } = await getWorkizClient()
     const member = (await client.listTeam()).find((m) => m.id === workizTeamId)
     if (!member) throw new Error("That team member is not in Workiz any more; refresh the list.")
     const phoneMasked = maskPhone(member.phone)
     await saveNotificationSettings({ ownerRecipient: { workizTeamId: member.id, name: member.name, phoneMasked } }, "admin")
-    await logSyncEvent("settings", { ok: true, summary: `Owner text recipient set to ${member.name}${phoneMasked ? ` (${phoneMasked})` : " (no phone on the Workiz profile)"}` })
+    // Sending is already switched on in the Workiz tab when this matters, so ready texts go out now.
+    const effect = await reevaluateOpenOwnerNotifications({ deliver: true, via: "settings · recipient set" })
+    await logSyncEvent("settings", { ok: true, summary: `Owner text recipient set to ${member.name}${phoneMasked ? ` (${phoneMasked})` : " (no phone on the Workiz profile)"} · ${describeReevaluation(effect)}`, details: effect })
     revalidatePath("/admin")
-    return { ok: true, data: { name: member.name } }
+    return { ok: true, data: { name: member.name, effect: describeReevaluation(effect) } }
   } catch (err) {
     return fail(err)
   }
@@ -890,9 +894,32 @@ async function reconcileDiagnostics() {
   const [last] = await db.select({ createdAt: syncEvents.createdAt, ok: syncEvents.ok, summary: syncEvents.summary, details: syncEvents.details }).from(syncEvents).where(eq(syncEvents.kind, "reconcile")).orderBy(desc(syncEvents.createdAt)).limit(1)
   const [lastOk] = await db.select({ createdAt: syncEvents.createdAt, summary: syncEvents.summary }).from(syncEvents).where(and(eq(syncEvents.kind, "reconcile"), eq(syncEvents.ok, true))).orderBy(desc(syncEvents.createdAt)).limit(1)
   const [lastJobSync] = await db.select({ createdAt: syncEvents.createdAt }).from(syncEvents).where(inArray(syncEvents.kind, ["job:rest", "job:webhook"])).orderBy(desc(syncEvents.createdAt)).limit(1)
-  const d = (last?.details ?? null) as { lookbackDays?: number; revisited?: number; outbox?: { considered: number; accepted: number; failed: number } } | null
+  const d = (last?.details ?? null) as {
+    lookbackDays?: number
+    revisited?: number
+    unchanged?: number
+    detailFetches?: number
+    detailBudget?: number
+    deferred?: number
+    quotaHit?: boolean
+    outbox?: { considered: number; accepted: number; failed: number }
+  } | null
   return {
-    last: last ? { createdAt: last.createdAt, ok: last.ok, summary: last.summary, lookbackDays: d?.lookbackDays ?? null, revisited: d?.revisited ?? null, outbox: d?.outbox ?? null } : null,
+    last: last
+      ? {
+          createdAt: last.createdAt,
+          ok: last.ok,
+          summary: last.summary,
+          lookbackDays: d?.lookbackDays ?? null,
+          revisited: d?.revisited ?? null,
+          unchanged: d?.unchanged ?? null,
+          detailFetches: d?.detailFetches ?? null,
+          detailBudget: d?.detailBudget ?? null,
+          deferred: d?.deferred ?? null,
+          quotaHit: d?.quotaHit ?? false,
+          outbox: d?.outbox ?? null,
+        }
+      : null,
     lastSuccessfulAt: lastOk?.createdAt ?? null,
     lastJobSyncAt: lastJobSync?.createdAt ?? null,
   }

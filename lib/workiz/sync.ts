@@ -4,8 +4,9 @@ import { colorSealItems, jobPayments, payouts, syncEvents, workizJobs, workizTea
 import { openOwnerNotificationJobUuids, processOwnerOutbox, refreshOwnerNotification, type OutboxSummary, type OwnerRefreshResult } from "@/lib/notifications/owner"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
 import { getWorkizSettings, type WorkizSettings } from "@/lib/settings"
-import { WorkizClient, type WorkizRawJob } from "./client"
+import { WorkizApiError, WorkizClient, type WorkizRawJob } from "./client"
 import { bumpWebhookEventAttempt, markWebhookEvent, pendingUnresolvedEvents, rememberJobIds, resolveJobUuid } from "./events"
+import { compareListing } from "./listing-diff"
 import { normalizeJob, type ColorSealCatalog, type NormalizedJob } from "./normalize"
 import { TIP_INCLUSION_RAW_KEY, externalRowsToPayments, type ExternalPaymentInput, type InvoiceWebhookPayments, type ManualPaymentEntry, type TipInclusion } from "./payments"
 import { parseWebhookBody, type ParsedWebhook } from "./webhook"
@@ -22,6 +23,22 @@ export type JobSyncResult = {
 
 /** The cron must never look back less than this: `job/all?start_date` filters on the scheduled date, and jobs are paid weeks later. */
 export const MIN_RECONCILE_LOOKBACK_DAYS = 30
+
+/**
+ * `job/get` calls one reconcile may spend. Listing a page of 100 jobs is one call; each detail
+ * fetch is another, and the Workiz account quota is shared with webhooks, owner-text deliveries
+ * (three calls each) and the admin UI. Observed live 2026-09-23: two runs were cut off by 429
+ * after 30 and 29 consecutive job/get calls, so the whole run must stay well under 30.
+ * Anything left over waits for the next run, stalest first.
+ */
+export const DEFAULT_RECONCILE_DETAIL_BUDGET = 20
+/** Open jobs (payout pending/hold/ready or owner text not yet out) re-fetched per run even when their listing looks unchanged. */
+export const DEFAULT_RECONCILE_MAX_REVISITS = 10
+
+/** Workiz answers 429 once the account's API quota is used up; nothing else will succeed until it resets. */
+export function isWorkizQuotaError(err: unknown): boolean {
+  return err instanceof WorkizApiError && err.status === 429
+}
 
 export async function logSyncEvent(kind: string, opts: { jobUuid?: string | null; ok?: boolean; summary?: string; details?: unknown } = {}) {
   await db.insert(syncEvents).values({
@@ -307,10 +324,16 @@ export async function syncDocumentWebhook(args: { parsed: Pick<ParsedWebhook, "u
  * Replay parked document events whose JOB-… id has since been learned (or for one internal id
  * right after a job event taught it). Bounded; each event is attempted at most a few times.
  */
-export async function replayUnresolvedEvents(opts: { internalId?: string; limit?: number; via?: string } = {}): Promise<{ replayed: number; resolved: number; stillUnresolved: number; failed: number }> {
-  const summary = { replayed: 0, resolved: 0, stillUnresolved: 0, failed: 0 }
+export type ReplaySummary = { replayed: number; resolved: number; stillUnresolved: number; failed: number; quotaHit: boolean }
+
+export async function replayUnresolvedEvents(opts: { internalId?: string; limit?: number; via?: string } = {}): Promise<ReplaySummary> {
+  const summary: ReplaySummary = { replayed: 0, resolved: 0, stillUnresolved: 0, failed: 0, quotaHit: false }
   const pending = await pendingUnresolvedEvents({ internalId: opts.internalId, limit: opts.limit ?? 25 })
   for (const ev of pending) {
+    if (summary.quotaHit) {
+      summary.stillUnresolved++
+      continue
+    }
     summary.replayed++
     try {
       await bumpWebhookEventAttempt(ev.id)
@@ -324,6 +347,12 @@ export async function replayUnresolvedEvents(opts: { internalId?: string; limit?
         if (ev.attempts + 1 >= 20) await markWebhookEvent(ev.id, "failed", { error: `Gave up after ${ev.attempts + 1} attempts: ${outcome.reason}` })
       }
     } catch (err) {
+      if (isWorkizQuotaError(err)) {
+        // A quota blip is not the event's fault: leave it parked for the next run.
+        summary.quotaHit = true
+        summary.stillUnresolved++
+        continue
+      }
       summary.failed++
       await markWebhookEvent(ev.id, "failed", { error: err instanceof Error ? err.message : String(err) })
     }
@@ -342,39 +371,58 @@ export type ReconcileSummary = {
   errors: Array<{ uuid: string | null; error: string }>
   startDate: string
   lookbackDays: number
-  /** Jobs with open payouts / open owner texts outside the window that were re-synced by UUID. */
+  /** Open jobs (payout pending/hold/ready or owner text not out) re-fetched by UUID, stalest first. */
   revisited: number
+  /** Listed jobs whose status, money, dates, tags and crew matched the stored snapshot; not re-fetched. */
+  unchanged: number
+  /** `job/get` calls spent this run: the Workiz quota cost. */
+  detailFetches: number
+  detailBudget: number
+  /** Jobs that were due but left for the next run because the budget ran out or Workiz returned 429. */
+  deferred: number
+  /** Workiz answered 429 (account API quota); the run stopped calling Workiz and left the rest for next time. */
+  quotaHit: boolean
+  /** Open owner texts on unchanged jobs re-evaluated from the database without a Workiz call. */
+  ownerReevaluated: number
   outbox: OutboxSummary
-  replay: Awaited<ReturnType<typeof replayUnresolvedEvents>>
+  replay: ReplaySummary
 }
 
-/** Jobs that still need attention regardless of when they were scheduled. */
+/** Jobs that still owe something (an open payout or an owner text not yet out), stalest detail fetch first. */
 async function openJobUuids(limit: number): Promise<string[]> {
-  const rows = await db
+  const fromPayouts = await db
     .select({ uuid: payouts.jobUuid })
     .from(payouts)
     .where(inArray(payouts.status, ["pending", "hold", "ready"]))
     .groupBy(payouts.jobUuid)
-    .limit(limit)
-  const fromOwner = await openOwnerNotificationJobUuids(limit)
-  return Array.from(new Set([...rows.map((r) => r.uuid), ...fromOwner])).slice(0, limit)
+  const fromOwner = await openOwnerNotificationJobUuids(500)
+  const open = Array.from(new Set([...fromPayouts.map((r) => r.uuid), ...fromOwner]))
+  if (!open.length) return []
+  const rows = await db.select({ uuid: workizJobs.uuid, updatedAt: workizJobs.updatedAt }).from(workizJobs).where(inArray(workizJobs.uuid, open))
+  const fetchedAt = new Map(rows.map((r) => [r.uuid, r.updatedAt.getTime()]))
+  return open.sort((a, b) => (fetchedAt.get(a) ?? 0) - (fetchedAt.get(b) ?? 0)).slice(0, limit)
 }
 
 /**
- * Scheduled reconciliation (Vercel Cron → /api/cron/reconcile), in four bounded phases:
- *  1. every job scheduled in the lookback window (floored at 30 days), re-fetched with job/get;
- *  2. every job with an open payout or open owner text that phase 1 did not touch — old deposits,
- *     jobs scheduled long ago and finished today, held jobs waiting for payment details;
- *  3. parked estimate/invoice events whose job id has since been learned;
- *  4. the owner-text outbox: queued and retry-due rows, whether or not any payout changed.
+ * Scheduled reconciliation (Vercel Cron → /api/cron/reconcile), in four bounded phases that
+ * together spend at most `maxDetailFetches` job/get calls and stop at the first 429:
+ *  1. the owner-text outbox first — queued and retry-due rows are the calls that matter most,
+ *     so they get the quota before any re-fetch (each send re-evaluates from the database);
+ *  2. list every job scheduled in the lookback window (floored at 30 days; one call per 100 jobs)
+ *     and re-fetch only the ones that are new or whose listing differs from the stored snapshot.
+ *     Unchanged jobs with an open owner text are re-evaluated from the database instead;
+ *  3. re-fetch open jobs the listing did not refresh, stalest first — old deposits, jobs
+ *     scheduled long ago and finished today, held jobs waiting for payment details;
+ *  4. parked estimate/invoice events whose job id has since been learned.
  */
-export async function reconcileRecentJobs(opts: { lookbackDays?: number; maxJobs?: number; maxRevisits?: number } = {}): Promise<ReconcileSummary> {
+export async function reconcileRecentJobs(opts: { lookbackDays?: number; maxJobs?: number; maxRevisits?: number; maxDetailFetches?: number } = {}): Promise<ReconcileSummary> {
   const { client, settings } = await getWorkizClient()
   const catalog = await loadColorSealCatalog()
   const lookback = Math.max(MIN_RECONCILE_LOOKBACK_DAYS, opts.lookbackDays ?? settings.reconcileLookbackDays)
   const start = new Date(Date.now() - lookback * 24 * 60 * 60 * 1000)
   const startDate = start.toISOString().slice(0, 10)
   const maxJobs = opts.maxJobs ?? 300
+  const budget = Math.max(1, opts.maxDetailFetches ?? DEFAULT_RECONCILE_DETAIL_BUDGET)
 
   const summary: ReconcileSummary = {
     scanned: 0,
@@ -388,15 +436,21 @@ export async function reconcileRecentJobs(opts: { lookbackDays?: number; maxJobs
     startDate,
     lookbackDays: lookback,
     revisited: 0,
+    unchanged: 0,
+    detailFetches: 0,
+    detailBudget: budget,
+    deferred: 0,
+    quotaHit: false,
+    ownerReevaluated: 0,
     outbox: { considered: 0, accepted: 0, failed: 0, skipped: 0, notEligible: 0, results: [] },
-    replay: { replayed: 0, resolved: 0, stillUnresolved: 0, failed: 0 },
+    replay: { replayed: 0, resolved: 0, stillUnresolved: 0, failed: 0, quotaHit: false },
   }
   const unmapped = new Set<string>()
-  const seen = new Set<string>()
+  const refreshed = new Set<string>()
 
   const handle = async (raw: WorkizRawJob, via: string) => {
     const result = await processRawJob(raw, "rest", { settings, catalog, client, via })
-    seen.add(result.uuid)
+    refreshed.add(result.uuid)
     summary.processed++
     summary.created += result.engine.created
     summary.updated += result.engine.updated
@@ -404,54 +458,125 @@ export async function reconcileRecentJobs(opts: { lookbackDays?: number; maxJobs
     result.engine.unmappedTeamIds.forEach((id) => unmapped.add(id))
   }
 
+  const noteQuota = (uuid: string | null, err: unknown) => {
+    if (summary.quotaHit) return
+    summary.quotaHit = true
+    summary.errors.push({ uuid, error: `${err instanceof Error ? err.message : String(err)} — the run stopped calling Workiz; everything left over is picked up next run.` })
+  }
+
+  /** One job/get inside the budget. `fallback` is the listing payload, used only when Workiz returns no detail. */
+  const fetchDetail = async (uuid: string, via: string, fallback?: WorkizRawJob): Promise<"fetched" | "deferred" | "failed"> => {
+    if (summary.quotaHit || summary.detailFetches >= budget) {
+      summary.deferred++
+      return "deferred"
+    }
+    summary.detailFetches++
+    try {
+      const detail = await client.getJob(uuid)
+      const raw = detail ?? fallback
+      if (raw) await handle(raw, via)
+      return "fetched"
+    } catch (err) {
+      if (isWorkizQuotaError(err)) {
+        noteQuota(uuid, err)
+        summary.deferred++
+        return "deferred"
+      }
+      summary.failed++
+      summary.errors.push({ uuid, error: err instanceof Error ? err.message : String(err) })
+      return "failed"
+    }
+  }
+
+  // Phase 1: the outbox, so texts already owed get the quota before any re-fetch.
+  try {
+    summary.outbox = await processOwnerOutbox({ settings, client, via: "reconcile" })
+    const quotaFailure = summary.outbox.results.find((r) => r.outcome === "failed" && /429|quota/i.test(r.detail))
+    if (quotaFailure) noteQuota(quotaFailure.jobUuid, new Error(quotaFailure.detail))
+  } catch (err) {
+    if (isWorkizQuotaError(err)) noteQuota(null, err)
+    else summary.errors.push({ uuid: null, error: `Owner outbox failed: ${err instanceof Error ? err.message : String(err)}` })
+  }
+
+  // Phase 2: list the window (cheap), then fetch only what is new or changed.
+  const listed: Array<{ uuid: string; raw: WorkizRawJob }> = []
   let offset = 0
   let hasMore = true
   while (hasMore && summary.scanned < maxJobs) {
-    const page = await client.listJobs({ startDate, offset, records: 100 })
-    for (const listed of page.jobs) {
+    let page: Awaited<ReturnType<typeof client.listJobs>>
+    try {
+      page = await client.listJobs({ startDate, offset, records: 100 })
+    } catch (err) {
+      if (!isWorkizQuotaError(err)) throw err
+      noteQuota(null, err)
+      break
+    }
+    for (const job of page.jobs) {
       if (summary.scanned >= maxJobs) break
       summary.scanned++
-      const uuid = typeof listed.UUID === "string" ? listed.UUID : null
-      try {
-        const detail = uuid ? await client.getJob(uuid) : null
-        await handle(detail ?? listed, "reconcile")
-      } catch (err) {
-        summary.failed++
-        summary.errors.push({ uuid, error: err instanceof Error ? err.message : String(err) })
-      }
+      if (typeof job.UUID === "string" && job.UUID) listed.push({ uuid: job.UUID, raw: job })
     }
     hasMore = page.hasMore && page.jobs.length > 0
     offset += page.jobs.length
   }
 
-  for (const uuid of await openJobUuids(opts.maxRevisits ?? 60)) {
-    if (seen.has(uuid)) continue
-    summary.revisited++
-    try {
-      const detail = await client.getJob(uuid)
-      if (detail) await handle(detail, "reconcile-revisit")
-    } catch (err) {
-      summary.failed++
-      summary.errors.push({ uuid, error: err instanceof Error ? err.message : String(err) })
+  const storedRaw = new Map<string, WorkizRawJob | null>()
+  if (listed.length) {
+    const rows = await db
+      .select({ uuid: workizJobs.uuid, raw: workizJobs.raw })
+      .from(workizJobs)
+      .where(inArray(workizJobs.uuid, listed.map((l) => l.uuid)))
+    for (const row of rows) storedRaw.set(row.uuid, (row.raw ?? null) as WorkizRawJob | null)
+  }
+  const openOwnerTexts = new Set(await openOwnerNotificationJobUuids(500))
+
+  const unchanged: string[] = []
+  for (const { uuid, raw } of listed) {
+    const verdict = compareListing(raw, storedRaw.get(uuid))
+    if (verdict.verdict === "unchanged") {
+      summary.unchanged++
+      unchanged.push(uuid)
+      continue
+    }
+    await fetchDetail(uuid, "reconcile", raw)
+  }
+
+  if (unchanged.length) {
+    await db.update(workizJobs).set({ lastSeenAt: new Date() }).where(inArray(workizJobs.uuid, unchanged))
+    // Settings can change what an unchanged job owes the owner (recipient picked, sending switched on).
+    for (const uuid of unchanged) {
+      if (!openOwnerTexts.has(uuid)) continue
+      try {
+        await refreshOwnerNotification(uuid, { settings, client: summary.quotaHit ? null : client, deliver: !summary.quotaHit, via: "reconcile" })
+        summary.ownerReevaluated++
+      } catch (err) {
+        if (isWorkizQuotaError(err)) noteQuota(uuid, err)
+        else summary.errors.push({ uuid, error: `Owner text re-evaluation failed: ${err instanceof Error ? err.message : String(err)}` })
+      }
     }
   }
 
-  try {
-    summary.replay = await replayUnresolvedEvents({ via: "reconcile" })
-  } catch (err) {
-    summary.errors.push({ uuid: null, error: `Replay of parked events failed: ${err instanceof Error ? err.message : String(err)}` })
+  // Phase 3: open jobs the listing did not refresh, stalest first.
+  for (const uuid of await openJobUuids(opts.maxRevisits ?? DEFAULT_RECONCILE_MAX_REVISITS)) {
+    if (refreshed.has(uuid)) continue
+    const outcome = await fetchDetail(uuid, "reconcile-revisit")
+    if (outcome !== "deferred") summary.revisited++
   }
 
-  try {
-    summary.outbox = await processOwnerOutbox({ settings, client, via: "reconcile" })
-  } catch (err) {
-    summary.errors.push({ uuid: null, error: `Owner outbox failed: ${err instanceof Error ? err.message : String(err)}` })
+  // Phase 4: parked estimate/invoice events.
+  if (!summary.quotaHit) {
+    try {
+      summary.replay = await replayUnresolvedEvents({ via: "reconcile" })
+      if (summary.replay.quotaHit) noteQuota(null, new Error("Workiz API quota reached while replaying parked webhook events"))
+    } catch (err) {
+      summary.errors.push({ uuid: null, error: `Replay of parked events failed: ${err instanceof Error ? err.message : String(err)}` })
+    }
   }
 
   summary.unmappedTeamIds = Array.from(unmapped)
   await logSyncEvent("reconcile", {
-    ok: summary.failed === 0,
-    summary: `Scanned ${summary.scanned} (${lookback}d), revisited ${summary.revisited}, processed ${summary.processed}, failed ${summary.failed}, payouts +${summary.created}/~${summary.updated}, held ${summary.held} · owner texts: ${summary.outbox.accepted} handed to Workiz, ${summary.outbox.failed} failed, ${summary.outbox.considered} considered · parked events replayed ${summary.replay.replayed}`,
+    ok: summary.failed === 0 && !summary.quotaHit,
+    summary: `Listed ${summary.scanned} (${lookback}d): ${summary.unchanged} unchanged, fetched ${summary.detailFetches}/${budget}, revisited ${summary.revisited}, deferred ${summary.deferred}, failed ${summary.failed}${summary.quotaHit ? " · WORKIZ QUOTA HIT" : ""} · payouts +${summary.created}/~${summary.updated}, held ${summary.held} · owner texts: ${summary.outbox.accepted} handed to Workiz, ${summary.outbox.failed} failed, ${summary.outbox.considered} considered, ${summary.ownerReevaluated} re-evaluated · parked events replayed ${summary.replay.replayed}`,
     details: summary,
   })
   return summary

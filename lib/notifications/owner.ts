@@ -3,7 +3,7 @@ import { db } from "@/lib/db"
 import { ownerNotifications, payouts, syncEvents, technicianProfiles, workizJobs, workizTeamMappings, type NormalizedPayment, type OwnerNotificationRow } from "@/lib/db/schema"
 import { sha256 } from "@/lib/security/crypto"
 import { getNotificationSettings, getWorkizSettings, type NotificationSettings, type WorkizSettings } from "@/lib/settings"
-import { WorkizClient, type WorkizRawJob } from "@/lib/workiz/client"
+import { WorkizApiError, WorkizClient, type WorkizRawJob } from "@/lib/workiz/client"
 import { hasPayoutNote, mergePayoutNote, PAYOUT_NOTE_HEADER } from "@/lib/workiz/payout-note"
 import { explainNotApplied, hasTag, normalizeTagName } from "@/lib/workiz/tags"
 import { MAX_ATTEMPTS, OWNER_MESSAGE_HEADER, evaluateOwnerNotification, nextRetryAt, type OwnerNotificationDecision, type OwnerNotificationInput } from "./owner-message"
@@ -24,6 +24,8 @@ import { MAX_ATTEMPTS, OWNER_MESSAGE_HEADER, evaluateOwnerNotification, nextRetr
  */
 
 const STALE_SENDING_MS = 10 * 60_000
+/** How long to wait after Workiz answers 429 before the outbox tries the same text again. */
+const QUOTA_RETRY_MS = 20 * 60_000
 const ACTIVE_STATES = ["provider_accepted", "delivered"] as const
 
 export type DeliveryOutcome =
@@ -299,6 +301,16 @@ export async function attemptDelivery(rowId: number, ctx: Ctx & { client: Workiz
     return { outcome: "provider_accepted", reconciled: false, descriptionWritten: result.descriptionWritten }
   } catch (err) {
     const error = err instanceof Error ? err.message : String(err)
+    if (err instanceof WorkizApiError && err.status === 429) {
+      // The account quota, not this text, failed: hand the attempt back and try again soon.
+      const retryAt = new Date(now.getTime() + QUOTA_RETRY_MS)
+      await db
+        .update(ownerNotifications)
+        .set({ status: "failed", attempts: sql`greatest(${ownerNotifications.attempts} - 1, 0)`, lastError: error, nextAttemptAt: retryAt, snapshotHash, message, updatedAt: new Date() })
+        .where(eq(ownerNotifications.id, rowId))
+      await log("job:tag", { jobUuid: claimed.jobUuid, ok: false, summary: `Owner text for ${jobLabel} postponed: Workiz API quota reached · retry at ${retryAt.toISOString()} (attempt not counted) · via ${via}`, details: { ownerNotificationId: rowId, error, retryAt, quota: true } })
+      return { outcome: "failed", error, retryAt }
+    }
     const retryAt = nextRetryAt(claimed.attempts, now)
     await db.update(ownerNotifications).set({ status: "failed", lastError: error, nextAttemptAt: retryAt, snapshotHash, message, updatedAt: new Date() }).where(eq(ownerNotifications.id, rowId))
     await log("job:tag", { jobUuid: claimed.jobUuid, ok: false, summary: `Owner text for ${jobLabel} failed (attempt ${claimed.attempts}): ${error}${retryAt ? ` · retry at ${retryAt.toISOString()}` : " · retries exhausted"} · via ${via}`, details: { ownerNotificationId: rowId, error, attempts: claimed.attempts, retryAt } })
@@ -355,6 +367,41 @@ export async function openOwnerNotificationJobUuids(limit = 100): Promise<string
     .orderBy(desc(ownerNotifications.updatedAt))
     .limit(limit)
   return rows.map((r) => r.jobUuid)
+}
+
+export type ReevaluateSummary = { considered: number; accepted: number; failed: number; queued: number; blocked: number; previewOnly: number }
+
+/**
+ * Re-run the decision for every open row from the database alone — no job/get — right after a
+ * settings change (recipient picked, sending switched on or off), so the admin does not wait for
+ * the next cron to see the effect. Rows that become ready go out at once when `deliver` is set.
+ */
+export async function reevaluateOpenOwnerNotifications(ctx: Ctx & { deliver?: boolean; limit?: number } = {}): Promise<ReevaluateSummary> {
+  const { settings, notificationSettings, client } = await ctxOf(ctx)
+  const summary: ReevaluateSummary = { considered: 0, accepted: 0, failed: 0, queued: 0, blocked: 0, previewOnly: 0 }
+  for (const jobUuid of await openOwnerNotificationJobUuids(ctx.limit ?? 200)) {
+    summary.considered++
+    const result = await refreshOwnerNotification(jobUuid, { settings, notificationSettings, client, deliver: ctx.deliver ?? false, via: ctx.via ?? "settings" })
+    if (!result) continue
+    if (result.delivery?.outcome === "provider_accepted") summary.accepted++
+    else if (result.delivery?.outcome === "failed") summary.failed++
+    else if (result.row.status === "queued") summary.queued++
+    else if (result.row.status === "preview_only") summary.previewOnly++
+    else if (result.row.status === "blocked") summary.blocked++
+  }
+  return summary
+}
+
+/** One line for the admin toast: what the re-evaluation did to the open owner texts. */
+export function describeReevaluation(s: ReevaluateSummary): string {
+  if (!s.considered) return "No open owner texts to re-check."
+  const parts: string[] = []
+  if (s.accepted) parts.push(`${s.accepted} handed to Workiz now`)
+  if (s.queued) parts.push(`${s.queued} queued for the next run`)
+  if (s.failed) parts.push(`${s.failed} failed (retried automatically)`)
+  if (s.previewOnly) parts.push(`${s.previewOnly} preview only`)
+  if (s.blocked) parts.push(`${s.blocked} still waiting on the job`)
+  return `${s.considered} open owner text(s) re-checked: ${parts.join(", ")}.`
 }
 
 /**

@@ -50,7 +50,10 @@ function RecipientCard({ data, onOpenWorkizTab }: { data: OwnerTexts; onOpenWork
       setMsg(null)
       const res = await setOwnerRecipient(id)
       if (!res.ok) return setMsg({ tone: "error", text: res.error })
-      setMsg({ tone: "ok", text: res.data?.name ? `Owner texts are addressed to ${res.data.name}. Make sure the Workiz automation texts the same person.` : "Recipient cleared. Owner texts stay blocked until you pick one." })
+      setMsg({
+        tone: "ok",
+        text: `${res.data?.name ? `Owner texts are addressed to ${res.data.name}. Make sure the Workiz automation texts the same person.` : "Recipient cleared. Owner texts stay blocked until you pick one."} ${res.data?.effect ?? ""}`.trim(),
+      })
       setCandidates(null)
       router.refresh()
     })
@@ -166,9 +169,14 @@ function DiagnosticsCard({ data, lastWebhook, timezone }: { data: OwnerTexts; la
       const res = await runReconcile()
       if (!res.ok) return setMsg({ tone: "error", text: res.error })
       const d = res.data!
+      const quota = d.quotaHit
+        ? ` Workiz API quota reached: the run stopped early and left ${d.deferred} job(s) for the next scheduled run; nothing was lost.`
+        : d.deferred
+          ? ` ${d.deferred} job(s) deferred to the next run to stay inside the Workiz quota.`
+          : ""
       setMsg({
-        tone: d.failed ? "info" : "ok",
-        text: `Scanned ${d.scanned} jobs since ${d.startDate} (${d.lookbackDays}-day window), revisited ${d.revisited} open job(s), replayed ${d.replay.replayed} webhook event(s) (${d.replay.resolved} resolved). Owner texts: ${d.outbox.accepted} accepted, ${d.outbox.failed} failed, ${d.outbox.notEligible} not eligible.`,
+        tone: d.quotaHit ? "error" : d.failed ? "info" : "ok",
+        text: `Listed ${d.scanned} jobs since ${d.startDate} (${d.lookbackDays}-day window): ${d.unchanged} unchanged, ${d.detailFetches} fetched from Workiz (budget ${d.detailBudget}), ${d.revisited} open job(s) revisited, ${d.replay.replayed} webhook event(s) replayed (${d.replay.resolved} resolved). Owner texts: ${d.outbox.accepted} accepted, ${d.outbox.failed} failed, ${d.outbox.notEligible} not eligible, ${d.ownerReevaluated} re-checked.${quota}`,
       })
       router.refresh()
     })
@@ -194,8 +202,21 @@ function DiagnosticsCard({ data, lastWebhook, timezone }: { data: OwnerTexts; la
           <Fact
             label="Last scheduled reconcile"
             value={r.last ? zonedDateTime(r.last.createdAt, timezone) : "Never"}
-            detail={r.last ? `${r.last.ok ? "OK" : "Failed"} · ${r.last.lookbackDays ?? data.reconcile.last?.lookbackDays ?? "?"}-day window · revisited ${r.last.revisited ?? 0} · owner texts ${r.last.outbox ? `${r.last.outbox.accepted} accepted / ${r.last.outbox.failed} failed` : "—"}` : "Vercel Cron runs it on the schedule in vercel.json."}
-            tone={r.last && !r.last.ok ? "error" : undefined}
+            detail={
+              r.last
+                ? [
+                    r.last.quotaHit ? "Stopped early: Workiz API quota" : r.last.ok ? "OK" : "Failed",
+                    r.last.lookbackDays ? `${r.last.lookbackDays}-day window` : null,
+                    r.last.detailFetches !== null ? `${r.last.detailFetches}/${r.last.detailBudget ?? "?"} Workiz fetches` : null,
+                    `revisited ${r.last.revisited ?? 0}`,
+                    r.last.deferred ? `${r.last.deferred} deferred to next run` : null,
+                    r.last.outbox ? `owner texts ${r.last.outbox.accepted} accepted / ${r.last.outbox.failed} failed` : "owner texts not part of this run",
+                  ]
+                    .filter(Boolean)
+                    .join(" · ")
+                : "Vercel Cron runs it on the schedule in vercel.json."
+            }
+            tone={r.last && r.last.quotaHit ? "warn" : r.last && !r.last.ok ? "error" : undefined}
           />
           <Fact label="Last successful reconcile" value={r.lastSuccessfulAt ? zonedDateTime(r.lastSuccessfulAt, timezone) : "Never"} detail="If this is old while the last run failed, the error is in the Activity tab." />
           <Fact
