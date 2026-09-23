@@ -84,7 +84,7 @@ export function TeamMappingTab({
                 <Button size="sm" variant={view === "unmapped" ? "secondary" : "ghost"} aria-pressed={view === "unmapped"} onClick={() => onViewChange("unmapped")}>
                   Unmapped only
                   {unmapped.length > 0 && (
-                    <Badge variant="outline" className="ml-1 border-amber-500/40 text-amber-700 dark:text-amber-300">
+                    <Badge variant="outline" className="ml-1 border-warning/60 bg-warning/10 text-warning-foreground">
                       {unmapped.length}
                     </Badge>
                   )}
@@ -139,7 +139,7 @@ export function TeamMappingTab({
                     <TableRow>
                       <TableCell colSpan={7} className="whitespace-normal py-12 text-center">
                         <div className="mx-auto flex max-w-md flex-col items-center gap-2">
-                          <CheckCircle2 className="h-6 w-6 text-emerald-600 dark:text-emerald-400" aria-hidden="true" />
+                          <CheckCircle2 className="h-6 w-6 text-primary" aria-hidden="true" />
                           <p className="text-sm font-medium">Every Workiz team member is mapped</p>
                           <p className="text-sm text-muted-foreground">
                             New ids appear here automatically when a synced job references someone you have not linked yet. Payouts for those jobs are held until the person is mapped or excluded.
@@ -163,13 +163,13 @@ export function TeamMappingTab({
                     const needsAttention = m.profileId == null && !m.excluded
                     const jobs = impact[m.workizTeamId] ?? []
                     return (
-                      <TableRow key={m.id} className={needsAttention ? "bg-amber-500/5" : undefined}>
+                      <TableRow key={m.id} className={needsAttention ? "bg-warning/10" : undefined}>
                         <TableCell className="font-mono text-xs">{m.workizTeamId}</TableCell>
                         <TableCell className="whitespace-normal">
                           <div className="flex flex-col gap-1">
                             <div className="flex items-center gap-2">
                               {m.workizName ?? <span className="text-muted-foreground">Name not returned by Workiz</span>}
-                              {needsAttention && <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-300">Unmapped</Badge>}
+                              {needsAttention && <Badge variant="outline" className="border-warning/60 bg-warning/10 text-warning-foreground">Unmapped</Badge>}
                             </div>
                             {needsAttention && <span className="text-xs text-muted-foreground">Payouts on this person&apos;s jobs are not calculated until mapped.</span>}
                           </div>

@@ -246,7 +246,7 @@ function PayoutDetail({
       <SheetHeader className="gap-2 border-b bg-card p-5">
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge status={p.status} />
-          {provisional && <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-300">Provisional amount</Badge>}
+          {provisional && <Badge variant="outline" className="border-warning/60 bg-warning/10 text-warning-foreground">Provisional amount</Badge>}
           {p.status === "paid" && p.paidAt && <span className="text-xs text-muted-foreground">Paid {zonedDateTime(p.paidAt, timezone)}</span>}
         </div>
         <SheetTitle className="text-lg">
@@ -273,12 +273,12 @@ function PayoutDetail({
 
       <div className="flex flex-col gap-6 p-5">
         {(mismatches.length > 0 || warnings.length > 0) && (
-          <section aria-label="Warnings" className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
-            <p className="flex items-center gap-2 font-medium text-amber-800 dark:text-amber-200">
+          <section aria-label="Warnings" className="flex flex-col gap-2 rounded-md border border-warning/50 bg-warning/10 p-3 text-sm">
+            <p className="flex items-center gap-2 font-medium text-warning-foreground">
               <AlertTriangle className="h-4 w-4" aria-hidden="true" />
               {mismatches.length ? "Latest Workiz data differs from this saved payout" : "Sync warnings saved with this payout"}
             </p>
-            <ul className="list-disc pl-5 text-amber-900/90 dark:text-amber-100/90">
+            <ul className="list-disc pl-5 text-foreground/90">
               {mismatches.map((m) => (
                 <li key={m}>{m}</li>
               ))}
@@ -287,7 +287,7 @@ function PayoutDetail({
               ))}
             </ul>
             {mismatches.length > 0 && (
-              <p className="text-xs text-amber-900/80 dark:text-amber-100/80">
+              <p className="text-xs text-muted-foreground">
                 {p.status === "paid" || p.status === "void"
                   ? "Paid and voided payouts are never rewritten by a sync; review manually if the difference matters."
                   : "Re-sync the job to recalculate from the latest Workiz data."}
