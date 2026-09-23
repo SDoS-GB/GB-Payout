@@ -215,7 +215,7 @@ function SummaryCard({
   onClick: () => void
   description: string
 }) {
-  const toneClass = tone === "primary" ? "text-primary" : tone === "warn" ? "text-amber-600 dark:text-amber-400" : "text-foreground"
+  const toneClass = tone === "primary" ? "text-primary" : tone === "warn" ? "text-warning-foreground" : "text-foreground"
   return (
     <button
       type="button"

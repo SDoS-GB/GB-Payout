@@ -84,9 +84,16 @@ describe("calcLegacyJobPayout is bit-identical to the original calcJobPayout", (
               // The page derives showColorSeal from the logged-in contractor; for every
               // real login that is the technician being calculated (or Vadim viewing Denis,
               // where both are non-Tim). Use the technician's own flag.
-              const expected = legacyCalcJobPayout(job, name, name)
               const actual = calcLegacyJobPayout(job, CONTRACTORS[name], legacyProfileOptions(name))
+              // The one deliberate departure from the frozen oracle (2026-09-23 correction):
+              // Tim receives no share of any tip, so his expectation is the oracle with the
+              // tip zeroed while the tip itself is still parsed and shown.
+              const expected =
+                name === "Tim"
+                  ? { ...legacyCalcJobPayout({ ...job, tip: "0" }, name, name), tipNum: Math.max(0, Number.parseFloat(tip) || 0) }
+                  : legacyCalcJobPayout(job, name, name)
               expect(actual).toStrictEqual(expected)
+              if (name === "Tim") expect(actual.tipPayout).toBe(0)
               // Display strings must also match (toFixed(2) as the UI shows them).
               expect(formatCurrency(actual.totalPayout)).toBe(formatCurrency(expected.totalPayout))
               checked++
@@ -208,7 +215,7 @@ describe("calcPayoutWithPaymentSplit", () => {
     expect(r.nonColorPayout).toBeCloseTo(200, 10)
   })
 
-  it("solo profile (Tim-style) keeps the whole job as non-color and full tip", () => {
+  it("solo profile (Tim-style) keeps the whole job as non-color and receives no tip", () => {
     const r = calcPayoutWithPaymentSplit(
       { jobTotal: 1000, colorSealTotal: 400, cardServiceAmount: 500, cardTip: 40, nonCardOwedTip: 0 },
       CONTRACTORS.Tim,
@@ -216,6 +223,9 @@ describe("calcPayoutWithPaymentSplit", () => {
     )
     expect(r.colorAmount).toBe(0)
     expect(r.nonColorAmount).toBe(1000)
-    expect(r.cardTipPayout).toBeCloseTo(40 * 0.965, 10)
+    expect(r.cardTipPayout).toBe(0)
+    expect(r.tipNum).toBe(40)
+    // 1000 x (1 - 0.5 x 0.035) x 0.8 = 1000 x 0.9825 x 0.8
+    expect(r.totalPayout).toBeCloseTo(786, 9)
   })
 })

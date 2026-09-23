@@ -26,6 +26,13 @@ export const technicianProfiles = pgTable("technician_profiles", {
    */
   lineItemMarker: text("line_item_marker"),
   /**
+   * Workiz Work Type (the job's `JobType`, e.g. "Tim's Job") whose jobs belong
+   * wholly to this technician: the entire discounted service subtotal is paid
+   * at their rates and the regular crew earns no service commission on it.
+   * Compared case-, whitespace- and apostrophe-insensitively. Null for everyone else.
+   */
+  ownedWorkType: text("owned_work_type"),
+  /**
    * Technician this one works every job with. When that technician is on a
    * Workiz job, this profile is added to the job too, even though Workiz never
    * lists them (Denis rides with Vadim). Null for everyone else.

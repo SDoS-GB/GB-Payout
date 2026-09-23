@@ -20,13 +20,23 @@ export function ProfilesTab({ profiles }: { profiles: Profile[] }) {
       <Card>
         <CardHeader className="pb-3">
           <CardTitle className="text-base">Technician profiles</CardTitle>
-          <CardDescription>
-            Rates are fractions (0.25 = 25%). Tip share is the technician&apos;s share of a tip (0.5 when two techs split). &quot;Separate color seal&quot; off means the whole job is
-            paid at the non-color rate, exactly like the calculator does for Tim. Line-item marker tokens (e.g. <code className="font-mono">T, Tim</code>) assign a Workiz item that starts with one of them to
-            this technician only; <code className="font-mono">*T*</code>, <code className="font-mono">*T</code>, <code className="font-mono">T</code>, <code className="font-mono">(T)</code> and{" "}
-            <code className="font-mono">(Tim)</code> all count. The crew is paid on the rest and keeps the tips. &quot;Always works with&quot; adds this technician to every job of the chosen
-            technician even when Workiz does not list them (Denis with Vadim); each is paid on the whole job at their own rates and both appear in the payout text. PINs are stored
-            hashed; enter a new one only to change it.
+          <CardDescription className="flex flex-col gap-2">
+            <span>
+              Rates are fractions (0.20 = 20%, 0.25 = 25%, 0.80 = 80%) applied to each technician&apos;s eligible service amount after discounts and the invoice-wide
+              card deduction. Every regular technician on a job earns their own commission on the crew work; amounts are never divided by head count.
+            </span>
+            <span>
+              <strong>Who owns the work.</strong> First the job&apos;s Workiz <em>Work Type</em>: a job whose Work Type matches a technician&apos;s &quot;Owns Work Type&quot; (e.g.{" "}
+              <code className="font-mono">Tim&apos;s Job</code>) belongs entirely to that technician, color sealing included, and the crew earns no service commission on it.
+              Then the <em>marker</em>: a line item whose <em>name</em> contains the literal <code className="font-mono">*T*</code> (spaces inside the asterisks allowed:{" "}
+              <code className="font-mono">* T *</code>) belongs only to the technician with marker token <code className="font-mono">T</code>. A plain T, the word Tim, or a word
+              starting with T never counts, and markers typed into the item description are flagged, not trusted. Everything else is regular crew work.
+            </span>
+            <span>
+              <strong>Tips.</strong> The tip the business holds is split equally among the regular technicians on the job (a paired technician included). A technician with a
+              marker or an owned Work Type never receives a tip share; a tip with nobody eligible is held for review. &quot;Always works with&quot; adds this technician to every
+              job of the chosen technician even when Workiz does not list them (Denis with Vadim). PINs are stored hashed; enter a new one only to change it.
+            </span>
           </CardDescription>
         </CardHeader>
         <CardContent className="grid gap-3 md:grid-cols-2">
@@ -43,15 +53,19 @@ export function ProfilesTab({ profiles }: { profiles: Profile[] }) {
   )
 }
 
+function tipRule(marker: string, ownedWorkType: string): string {
+  return marker.trim() || ownedWorkType.trim() ? "None: paid on own work only, never shares tips" : "Equal split with the other regular technicians on the job"
+}
+
 function ProfileCard({ profile, profiles }: { profile: Profile; profiles: Profile[] }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [form, setForm] = useState({
     nonColorRate: Number(profile.nonColorRate),
     colorRate: Number(profile.colorRate),
-    tipShare: Number(profile.tipShare),
     separateColorSeal: profile.separateColorSeal,
     lineItemMarker: profile.lineItemMarker ?? "",
+    ownedWorkType: profile.ownedWorkType ?? "",
     worksWithProfileId: profile.worksWithProfileId ?? null,
     active: profile.active,
     newPin: "",
@@ -81,18 +95,21 @@ function ProfileCard({ profile, profiles }: { profile: Profile; profiles: Profil
           Active
         </label>
       </div>
-      <div className="grid grid-cols-3 gap-2">
-        <RateField label="Non-color" value={form.nonColorRate} onChange={(v) => setForm({ ...form, nonColorRate: v })} />
-        <RateField label="Color" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
-        <RateField label="Tip share" value={form.tipShare} onChange={(v) => setForm({ ...form, tipShare: v })} />
+      <div className="grid grid-cols-2 gap-2">
+        <RateField label="Regular services" value={form.nonColorRate} onChange={(v) => setForm({ ...form, nonColorRate: v })} />
+        <RateField label="Color sealing" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
       </div>
-      <div className="flex items-end gap-3">
-        <label className="flex flex-1 items-center gap-2 text-sm">
-          <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
-          Separate color seal rate
-        </label>
+      <label className="flex items-center gap-2 text-sm">
+        <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
+        Separate color-sealing rate (off = whole amount at the regular rate)
+      </label>
+      <div className="grid grid-cols-2 gap-2">
         <MarkerField id={`marker-${profile.id}`} value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
+        <WorkTypeField id={`work-type-${profile.id}`} value={form.ownedWorkType} onChange={(v) => setForm({ ...form, ownedWorkType: v })} />
       </div>
+      <p className="text-xs text-muted-foreground">
+        <span className="font-medium text-foreground">Tip share:</span> {tipRule(form.lineItemMarker, form.ownedWorkType)}
+      </p>
       <WorksWithField
         id={`works-with-${profile.id}`}
         value={form.worksWithProfileId}
@@ -166,11 +183,22 @@ function RateField({ label, value, onChange }: { label: string; value: number; o
 
 function MarkerField({ id, value, onChange }: { id: string; value: string; onChange: (v: string) => void }) {
   return (
-    <div className="flex w-40 flex-col gap-1">
+    <div className="flex flex-col gap-1">
       <Label htmlFor={id} className="text-xs">
-        Marker tokens
+        Marker token (items named <span className="font-mono">*T*</span>)
       </Label>
-      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none (e.g. T, Tim)" className="font-mono" maxLength={60} spellCheck={false} />
+      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none (e.g. T)" className="font-mono" maxLength={60} spellCheck={false} />
+    </div>
+  )
+}
+
+function WorkTypeField({ id, value, onChange }: { id: string; value: string; onChange: (v: string) => void }) {
+  return (
+    <div className="flex flex-col gap-1">
+      <Label htmlFor={id} className="text-xs">
+        Owns Work Type (whole job)
+      </Label>
+      <Input id={id} value={value} onChange={(e) => onChange(e.target.value)} placeholder="none (e.g. Tim's Job)" maxLength={60} />
     </div>
   )
 }
@@ -180,11 +208,11 @@ const NEW_PROFILE: {
   pin: string
   nonColorRate: number
   colorRate: number
-  tipShare: number
   separateColorSeal: boolean
   lineItemMarker: string
+  ownedWorkType: string
   worksWithProfileId: number | null
-} = { name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, tipShare: 0.5, separateColorSeal: true, lineItemMarker: "", worksWithProfileId: null }
+} = { name: "", pin: "", nonColorRate: 0.2, colorRate: 0.25, separateColorSeal: true, lineItemMarker: "", ownedWorkType: "", worksWithProfileId: null }
 
 function NewProfileCard({ profiles }: { profiles: Profile[] }) {
   const router = useRouter()
@@ -196,7 +224,7 @@ function NewProfileCard({ profiles }: { profiles: Profile[] }) {
     <Card>
       <CardHeader className="pb-3">
         <CardTitle className="text-base">Add technician</CardTitle>
-        <CardDescription>New profiles also appear in the calculator&apos;s technician list.</CardDescription>
+        <CardDescription>New profiles also appear in the calculator&apos;s technician list. Defaults are the regular 20% / 25% rates.</CardDescription>
       </CardHeader>
       <CardContent>
         <form
@@ -223,18 +251,21 @@ function NewProfileCard({ profiles }: { profiles: Profile[] }) {
               <Input inputMode="numeric" value={form.pin} onChange={(e) => setForm({ ...form, pin: e.target.value.replace(/\D/g, "") })} maxLength={8} required />
             </div>
           </div>
-          <div className="grid grid-cols-3 gap-2">
-            <RateField label="Non-color" value={form.nonColorRate} onChange={(v) => setForm({ ...form, nonColorRate: v })} />
-            <RateField label="Color" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
-            <RateField label="Tip share" value={form.tipShare} onChange={(v) => setForm({ ...form, tipShare: v })} />
+          <div className="grid grid-cols-2 gap-2">
+            <RateField label="Regular services" value={form.nonColorRate} onChange={(v) => setForm({ ...form, nonColorRate: v })} />
+            <RateField label="Color sealing" value={form.colorRate} onChange={(v) => setForm({ ...form, colorRate: v })} />
           </div>
-          <div className="flex items-end gap-3">
-            <label className="flex flex-1 items-center gap-2 text-sm">
-              <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
-              Separate color seal rate
-            </label>
+          <label className="flex items-center gap-2 text-sm">
+            <Checkbox checked={form.separateColorSeal} onCheckedChange={(v) => setForm({ ...form, separateColorSeal: Boolean(v) })} />
+            Separate color-sealing rate
+          </label>
+          <div className="grid grid-cols-2 gap-2">
             <MarkerField id="marker-new" value={form.lineItemMarker} onChange={(v) => setForm({ ...form, lineItemMarker: v })} />
+            <WorkTypeField id="work-type-new" value={form.ownedWorkType} onChange={(v) => setForm({ ...form, ownedWorkType: v })} />
           </div>
+          <p className="text-xs text-muted-foreground">
+            <span className="font-medium text-foreground">Tip share:</span> {tipRule(form.lineItemMarker, form.ownedWorkType)}
+          </p>
           <WorksWithField id="works-with-new" value={form.worksWithProfileId} onChange={(v) => setForm({ ...form, worksWithProfileId: v })} options={profiles} />
           <Button type="submit" size="sm" disabled={pending} className="self-start">
             Add technician

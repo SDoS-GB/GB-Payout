@@ -11,7 +11,7 @@ import { useToast } from "@/hooks/use-toast"
 import { Toaster } from "@/components/ui/toaster"
 import { Plus, X, History } from "lucide-react"
 import Link from "next/link"
-import { CONTRACTORS, type ContractorName } from "@/lib/payout/contractors"
+import { CONTRACTORS, legacyProfileOptions, type ContractorName } from "@/lib/payout/contractors"
 import { calcLegacyJobPayout } from "@/lib/payout/calculator"
 import { signInTechnician, signOutSession } from "@/app/actions/session"
 
@@ -109,9 +109,10 @@ export default function PayoutCalculator() {
     if (!rates) return { nonColorPayout: 0, colorPayout: 0, tipPayout: 0, basePayout: 0, totalPayout: 0, nonColorAmount: 0, colorAmount: 0, jobTotalNum: 0, colorSealTotalNum: 0, tipNum: 0 }
 
     // Same arithmetic as before, now shared with the Workiz payout engine.
+    // Tim's tip share is 0 (he never shares tips); the tip is shown as held for the office.
     return calcLegacyJobPayout(job, rates, {
       separateColorSeal: showColorSeal,
-      tipShare: contractorName === "Tim" ? 1 : 0.5,
+      tipShare: legacyProfileOptions(contractorName).tipShare,
     })
   }
 
@@ -540,7 +541,7 @@ export default function PayoutCalculator() {
                       <div>
                         <p className="text-sm text-muted-foreground">Tip Payout</p>
                         <p className="text-lg font-semibold">
-                          {formatCurrency(calc.tipNum)} {selectedContractor !== "Tim" && "÷ 2"}
+                          {formatCurrency(calc.tipNum)} {selectedContractor !== "Tim" ? "÷ 2" : calc.tipNum > 0 ? "· held for the office (Tim does not share tips)" : ""}
                         </p>
                       </div>
                       <p className="text-xl font-bold text-primary">{formatCurrency(calc.tipPayout)}</p>

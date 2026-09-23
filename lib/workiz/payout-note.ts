@@ -30,6 +30,8 @@ export type PayoutNoteTech = {
   tip: number
   segmentKind: string
   segmentMarker: string | null
+  /** Why this technician is paid on this job, from the saved payout snapshot. */
+  ownership?: { reason?: string | null; workType?: string | null } | null
 }
 
 export type PayoutNoteInput = {
@@ -72,6 +74,9 @@ export function buildPayoutNote(input: PayoutNoteInput): string {
 }
 
 function segmentScope(tech: PayoutNoteTech): string | null {
+  const workType = tech.ownership?.workType
+  if (workType && tech.ownership?.reason === "work-type") return `whole job, ${workType}`
+  if (workType && tech.segmentKind === "crew") return `tip only, ${workType}`
   const marker = markerLabel(tech.segmentMarker)
   if (tech.segmentKind === "dedicated") return `${marker ?? "marked"} items`
   if (tech.segmentKind === "crew") return marker ? `crew, excl. ${marker}` : "crew"
@@ -106,7 +111,11 @@ function tipSummary(input: PayoutNoteInput): string | null {
   const fromRecords = input.payments.filter((p) => p.isTip).reduce((sum, p) => sum + p.amount, 0)
   const tipTotal = input.tipTotal > 0 ? input.tipTotal : fromRecords
   if (tipTotal <= 0) return null
-  return `Tip ${formatCurrency(tipTotal)}`
+  // Who gets what only matters once the tip is split or someone on the job is excluded (Tim).
+  const shares = input.techs.filter((t) => t.tip > 0).map((t) => `${t.name} ${formatCurrency(t.tip)}`)
+  const none = input.techs.filter((t) => t.tip <= 0).map((t) => t.name)
+  if (shares.length === 0 || input.techs.length < 2) return `Tip ${formatCurrency(tipTotal)}`
+  return `Tip ${formatCurrency(tipTotal)} (${shares.join(", ")}${none.length ? `; ${none.join(", ")} none` : ""})`
 }
 
 function latestPaymentDate(records: NormalizedPayment[], timeZone: string): string | null {

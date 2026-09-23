@@ -9,7 +9,7 @@ import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
-import { segmentLabel } from "@/lib/payout/segments"
+import { ownershipExplanation, segmentLabel } from "@/lib/payout/segments"
 import {
   PAYMENT_DETAILS_UNAVAILABLE,
   explainPayoutStatus,
@@ -48,11 +48,16 @@ type Snapshot = Partial<{
   cardTipPayout: number
   nonCardTipPayout: number
   cardFeeAdjustment: number
+  serviceFactor: number
+  adjustedNonColorAmount: number
+  adjustedColorAmount: number
   mode: string
   calcVersion: string
   warnings: string[]
   segment: Partial<{
     kind: string
+    ownership: string
+    workType: string | null
     marker: string | null
     itemIndexes: number[]
     itemNames: string[]
@@ -62,10 +67,25 @@ type Snapshot = Partial<{
     allocatedDiscountAmount: number
     share: number
   }>
-  job: Partial<{ jobTotal: number; colorSealTotal: number; discountAmount: number; cardServiceAmount: number; markers: string[] }>
+  job: Partial<{ jobType: string | null; jobTotal: number; colorSealTotal: number; discountAmount: number; cardServiceAmount: number; nonCardServiceAmount: number; markers: string[]; workType: string | null }>
   verification: Partial<{ balanced: boolean; assignedItemCount: number; itemCount: number; doubleCountedItems: number }>
   /** Set when this technician was added because they always work with someone Workiz assigned. */
   companionOf: { id: number; name: string } | null
+  /** Set when the Work Type named this technician although Workiz did not assign them. */
+  addedAsOwner: boolean
+  ownership: Partial<{ reason: string; workType: string | null; ownerName: string | null; label: string | null; explanation: string }>
+  rates: Partial<{ nonColorRate: number; colorRate: number; separateColorSeal: boolean; tipShare: number }>
+  tips: Partial<{
+    total: number
+    card: number
+    other: number
+    recipients: { id: number; name: string }[]
+    share: number
+    excluded: { id: number; name: string; reason: string }[]
+    needsReview: string | null
+    thisTechnician: number
+  }>
+  invoiceFee: Partial<{ serviceSubtotal: number; cardPaid: number; otherPaid: number; cardShare: number; feeRate: number; fee: number; serviceFactor: number; adjustedServiceSubtotal: number }>
 }>
 
 const pct = (v: string | number | null | undefined) => `${(Number(v ?? 0) * 100).toFixed(Number(v ?? 0) * 100 % 1 === 0 ? 0 : 1)}%`
@@ -147,9 +167,14 @@ function PayoutDetail({
   const segment = snap.segment ?? null
   const markers = snap.job?.markers ?? []
   const marker = p.segmentMarker ?? markers.join("/") ?? null
-  const label = segmentLabel(p.segmentKind, marker)
+  const ownership = snap.ownership ?? null
+  const label = segmentLabel(p.segmentKind, marker, ownership)
+  const whyPaid = ownership?.explanation ?? ownershipExplanation(p.segmentKind, marker, ownership)
   const provisional = p.status === "pending" || p.status === "hold"
   const notCalculated = num(p.jobTotal) <= 0 && num(p.totalPayout) === 0
+  const fee = snap.invoiceFee ?? null
+  const tips = snap.tips ?? null
+  const pctExact = (v: number) => `${(v * 100).toFixed(4)}%`
   const workizUrl = workizJobUrl(p.jobUuid)
   const separateColorSeal = snap.colorAmount !== undefined ? snap.colorAmount > 0 || num(p.colorSealTotal) === 0 : num(p.colorPayout) > 0 || num(p.colorSealTotal) === 0
   const nonColorAmount = snap.nonColorAmount ?? (separateColorSeal ? num(p.jobTotal) - num(p.colorSealTotal) : num(p.jobTotal))
@@ -195,13 +220,24 @@ function PayoutDetail({
   const ownerLabel = (kind: ReturnType<typeof lineItemOwnership>) => {
     switch (kind) {
       case "whole-job":
-        return { text: p.splitCount > 1 ? `Whole job · shared by ${p.splitCount} technicians` : "Whole job", mine: true }
+        return { text: p.splitCount > 1 ? `Whole job · each of ${p.splitCount} technicians paid on it at their own rate` : "Whole job", mine: true }
       case "this-technician":
-        return { text: p.segmentKind === "dedicated" ? `${p.profileName} �� ${label ?? "marked work"}` : `${p.profileName} · crew work`, mine: true }
+        return {
+          text:
+            ownership?.reason === "work-type"
+              ? `${p.profileName} · Work Type "${ownership.workType}"`
+              : p.segmentKind === "dedicated"
+                ? `${p.profileName} · ${label ?? "marked work"}`
+                : `${p.profileName} · crew work`,
+          mine: true,
+        }
       case "crew":
         return { text: "Crew work · not this technician", mine: false }
       case "dedicated":
-        return { text: `${segmentLabel("dedicated", markers.join("/") || marker) ?? "Marked work only"} · not this technician`, mine: false }
+        return {
+          text: ownership?.workType ? `${ownership.ownerName ?? "Owner"} · Work Type "${ownership.workType}" · not this technician` : `${segmentLabel("dedicated", markers.join("/") || marker) ?? "Marked work only"} · not this technician`,
+          mine: false,
+        }
     }
   }
 
@@ -292,11 +328,17 @@ function PayoutDetail({
               ["Customer", job?.clientName ?? "Unavailable"],
               ["Service address", job?.address ?? "Unavailable"],
               ["Workiz job status", job?.status ? `${job.status}${job.subStatus ? ` · ${job.subStatus}` : ""}` : "Unavailable"],
-              job?.jobType ? ["Job type", job.jobType] : null,
+              job?.jobType ? ["Work Type (Workiz)", job.jobType] : null,
               ["Team on job", job?.teamNames?.length ? job.teamNames.join(", ") : job?.teamIds?.length ? job.teamIds.join(", ") : "Unavailable"],
               snap.companionOf ? ["Why this technician", `${p.profileName} always works with ${snap.companionOf.name}; added although Workiz does not list them on this job`] : null,
+              snap.addedAsOwner ? ["Why this technician", `Work Type "${ownership?.workType ?? job?.jobType ?? ""}" belongs to ${p.profileName}; added although Workiz does not list them on this job`] : null,
+              ["Ownership rule", ownership?.reason === "work-type" ? "A · Work Type" : ownership?.reason === "marker" ? "B · marked items" : ownership?.reason === "crew" ? (ownership.workType ? "A · Work Type (owned by someone else)" : "C · regular crew") : "C · whole job"],
             ]}
           />
+          <p className="rounded-md border bg-muted/40 p-2 text-sm">
+            <span className="font-medium">Why {p.profileName} is paid on this: </span>
+            {whyPaid}
+          </p>
           {p.siblings.length > 0 && (
             <div className="flex flex-col gap-1 text-sm">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Other technicians on this job (separate payouts)</p>
@@ -401,26 +443,46 @@ function PayoutDetail({
           />
         </Section>
 
-        <Section title={`Individual payout · ${p.profileName}`} hint="Saved calculation. Historical rates are shown, not today's.">
+        <Section title={`Individual payout · ${p.profileName}`} hint="Saved calculation. Historical rates are shown, not today's. Formula: eligible amount after discounts × (1 − card share × 3.5%) × rate, plus this technician's share of the business-held tip.">
           <Facts
             rows={[
-              ["Eligible service amount", money(p.jobTotal)],
-              separateColorSeal ? ["Regular work portion", money(nonColorAmount)] : [`${label && p.segmentKind === "dedicated" ? label : "Whole amount"} at one rate`, money(nonColorAmount)],
-              separateColorSeal ? ["Color-sealing portion", money(colorAmount)] : null,
-              ["Rates used", `${pct(p.nonColorRate)} regular${separateColorSeal ? ` · ${pct(p.colorRate)} color seal` : ""} · ${pct(p.tipShare)} of tips`],
-              ["Commission on regular work", money(p.nonColorPayout)],
-              separateColorSeal ? ["Commission on color sealing", money(p.colorPayout)] : null,
+              ["Eligible service amount (after discounts)", money(p.jobTotal)],
+              separateColorSeal ? ["Regular services portion", money(nonColorAmount)] : [`${label && p.segmentKind === "dedicated" ? label : "Whole amount"} at one rate`, money(nonColorAmount)],
+              separateColorSeal && colorAmount > 0 ? ["Color-sealing portion", money(colorAmount)] : null,
+              snap.serviceFactor !== undefined && snap.serviceFactor < 1
+                ? ["After invoice-wide card deduction", `× ${snap.serviceFactor.toFixed(10)} → ${money((snap.adjustedNonColorAmount ?? 0) + (snap.adjustedColorAmount ?? 0))}`]
+                : null,
+              ["Rates applied", `${pct(p.nonColorRate)} regular services${separateColorSeal ? ` · ${pct(p.colorRate)} color sealing` : ""}`],
+              ["Commission on regular services", money(p.nonColorPayout)],
+              separateColorSeal && colorAmount > 0 ? ["Commission on color sealing", money(p.colorPayout)] : null,
               [
-                "Card-fee adjustment",
+                "Effect of the card fee on this commission",
                 snap.cardFeeAdjustment !== undefined
                   ? snap.cardFeeAdjustment > 0
-                    ? `−${money(snap.cardFeeAdjustment)} · 3.5% on the ${pct(cardShare)} paid by card`
+                    ? `−${money(snap.cardFeeAdjustment)} · 3.5% on the ${pct(cardShare)} of services paid by card`
                     : "$0.00 · no card payments"
                   : hasCardMoney
                     ? `Unavailable · saved before fee tracking (${pct(cardShare)} paid by card)`
                     : "$0.00 · no card payments",
               ],
-              ["Payable tip share", `${money(p.tipPayout)}${snap.cardTipPayout !== undefined ? ` (card ${money(snap.cardTipPayout)} + other ${money(snap.nonCardTipPayout)})` : ""}`],
+              [
+                "Tip share",
+                tips && tips.total !== undefined && tips.total > 0
+                  ? num(p.tipShare) > 0
+                    ? `${pct(p.tipShare)} of ${money(tips.total)} → ${money(p.tipPayout)}${snap.cardTipPayout !== undefined && snap.cardTipPayout > 0 ? ` (card part after 3.5%: ${money(snap.cardTipPayout)}; other ${money(snap.nonCardTipPayout)})` : ""}`
+                    : `None · ${ownership?.reason === "work-type" || ownership?.reason === "marker" ? "paid on own work only, never shares tips" : "not eligible"}`
+                  : num(p.tipPayout) > 0
+                    ? `${money(p.tipPayout)}${snap.cardTipPayout !== undefined ? ` (card ${money(snap.cardTipPayout)} + other ${money(snap.nonCardTipPayout)})` : ""}`
+                    : "$0.00 · no tip recorded",
+              ],
+              tips && tips.total !== undefined && tips.total > 0
+                ? [
+                    "Tip recipients",
+                    tips.recipients?.length
+                      ? `${tips.recipients.map((r) => r.name).join(", ")} · ${pct(tips.share ?? 0)} each${tips.excluded?.length ? ` · ${tips.excluded.map((e) => e.name).join(", ")}: none` : ""}`
+                      : tips.needsReview ?? "Nobody eligible · needs review",
+                  ]
+                : null,
             ]}
           />
           <div className="flex items-baseline justify-between gap-3 border-t pt-2">
@@ -488,6 +550,17 @@ function PayoutDetail({
               ["Paid by", methods.count ? `${methods.label}${methods.mixed ? " (mixed)" : ""}${manualPayments.length && !fromWorkiz ? " · confirmed by admin" : ""}` : PAYMENT_DETAILS_UNAVAILABLE],
               ["Invoice subtotal", job?.subTotal != null ? money(job.subTotal) : "Not provided by Workiz"],
               ["Discount", job ? `−${money(job.discountAmount)}` : "Unavailable"],
+              ["Service subtotal after discounts (S)", job ? money(job.jobTotal) : "Unavailable"],
+              fee && fee.serviceSubtotal !== undefined
+                ? ["Paid by card (C) / other", `${money(fee.cardPaid ?? 0)} / ${money(fee.otherPaid ?? 0)}`]
+                : job
+                  ? ["Paid by card (C) / other", `${money(job.cardServiceAmount)} / ${money(job.nonCardServiceAmount)}`]
+                  : null,
+              fee && fee.cardShare !== undefined ? ["Card-paid share (C ÷ S)", fee.cardShare > 0 ? pctExact(fee.cardShare) : "0% · no card payments on file"] : null,
+              fee && fee.fee !== undefined && fee.fee > 0 ? ["Card processing fee (3.5% of C)", `${money(fee.fee)} · exact ${fee.fee.toFixed(4)}`] : null,
+              fee && fee.serviceFactor !== undefined && fee.serviceFactor < 1
+                ? ["Invoice-wide reduction on services", `${pctExact(1 - fee.serviceFactor)} → services × ${fee.serviceFactor.toFixed(10)} = ${money(fee.adjustedServiceSubtotal ?? 0)} (exact ${(fee.adjustedServiceSubtotal ?? 0).toFixed(4)})`]
+                : null,
               ["Tip", job ? money(tipsTotal) : "Unavailable"],
               ["Tax", tax != null ? money(tax) : unitemized > 0.005 ? `${money(unitemized)} · tax/fees not itemized by Workiz` : "Not provided by Workiz"],
               [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],

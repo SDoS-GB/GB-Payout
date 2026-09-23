@@ -16,8 +16,8 @@ const shortDate = (d: Date | string | null | undefined) => {
 
 const STATUS_LABEL: Record<string, { label: string; className: string }> = {
   ready: { label: "Ready", className: "bg-primary/10 text-primary border-primary/20" },
-  paid: { label: "Paid", className: "bg-emerald-500/10 text-emerald-700 border-emerald-500/30 dark:text-emerald-300" },
-  hold: { label: "In review", className: "bg-amber-500/10 text-amber-700 border-amber-500/30 dark:text-amber-300" },
+  paid: { label: "Paid", className: "bg-primary text-primary-foreground border-primary" },
+  hold: { label: "In review", className: "bg-warning/15 text-warning-foreground border-warning/50" },
   pending: { label: "Waiting on job", className: "bg-muted text-muted-foreground border-border" },
 }
 
@@ -57,7 +57,12 @@ export function TechnicianPayoutList({ data }: { data: Data }) {
                       </span>
                       <span className="text-xs text-muted-foreground">
                         {shortDate(p.job?.jobDateTime)} ·{" "}
-                        {p.segmentKind === "dedicated" ? `your ${markerLabel(p.segmentMarker) ?? "marked"} items` : p.segmentKind === "crew" ? "crew work" : "job total"}{" "}
+                        {(() => {
+                          const ownership = ((p.breakdown ?? {}) as { ownership?: { reason?: string; workType?: string | null } }).ownership
+                          if (ownership?.workType && ownership.reason === "work-type") return `whole job (${ownership.workType})`
+                          if (ownership?.workType && p.segmentKind === "crew") return `no crew commission (${ownership.workType}) · tips only`
+                          return p.segmentKind === "dedicated" ? `your ${markerLabel(p.segmentMarker) ?? "marked"} items` : p.segmentKind === "crew" ? "crew work" : "job total"
+                        })()}{" "}
                         {money(p.jobTotal)}
                         {Number(p.colorSealTotal) > 0 ? ` · color seal ${money(p.colorSealTotal)}` : ""}
                         {tips > 0 ? ` · tips ${money(tips)}` : ""}

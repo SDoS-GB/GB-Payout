@@ -234,7 +234,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                     {" · "}one record per technician; a shared job appears once per technician
                   </CardDescription>
                   {(query.status === "pending" || query.status === "hold") && (
-                    <p className="text-xs text-amber-700 dark:text-amber-300">Amounts in this view are provisional, not ready to pay.</p>
+                    <p className="text-xs text-warning-foreground">Amounts in this view are provisional, not ready to pay.</p>
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -447,7 +447,8 @@ function PayoutRow({
 }) {
   const b = (p.breakdown ?? {}) as Record<string, unknown>
   const jobWide = (b.job ?? null) as { markers?: string[] } | null
-  const label = segmentLabel(p.segmentKind, p.segmentMarker ?? jobWide?.markers?.join("/") ?? null)
+  const ownership = (b.ownership ?? null) as { reason?: string; workType?: string | null } | null
+  const label = segmentLabel(p.segmentKind, p.segmentMarker ?? jobWide?.markers?.join("/") ?? null, ownership)
   const amount = payoutAmountLabel(p)
   const methods = paymentMethodsSummary(p.job?.payments)
   const reason = p.status === "ready" || p.status === "paid" ? null : p.holdReason
@@ -493,7 +494,7 @@ function PayoutRow({
       <TableCell className="text-right">
         <div className="flex flex-col items-end">
           <span className={`font-semibold tabular-nums ${amount.unavailable ? "text-muted-foreground" : ""}`}>{amount.text}</span>
-          {amount.provisional && <span className="text-[11px] uppercase tracking-wide text-amber-700 dark:text-amber-300">Provisional</span>}
+          {amount.provisional && <span className="text-[11px] uppercase tracking-wide text-warning-foreground">Provisional</span>}
           {amount.unavailable && <span className="text-[11px] text-muted-foreground">Job total is zero</span>}
         </div>
       </TableCell>

@@ -48,6 +48,7 @@ async function loadPayoutNoteInput(uuid: string, settings: WorkizSettings): Prom
       tip: payouts.tipPayout,
       segmentKind: payouts.segmentKind,
       segmentMarker: payouts.segmentMarker,
+      breakdown: payouts.breakdown,
     })
     .from(payouts)
     .innerJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
@@ -61,7 +62,14 @@ async function loadPayoutNoteInput(uuid: string, settings: WorkizSettings): Prom
     jobTotal: Number(job.jobTotal),
     tipTotal: Number(job.cardTipAmount) + Number(job.nonCardTipAmount),
     payments: Array.isArray(job.payments) ? job.payments : [],
-    techs: ready.map((r) => ({ name: r.name, total: Number(r.total), tip: Number(r.tip), segmentKind: r.segmentKind, segmentMarker: r.segmentMarker })),
+    techs: ready.map((r) => ({
+      name: r.name,
+      total: Number(r.total),
+      tip: Number(r.tip),
+      segmentKind: r.segmentKind,
+      segmentMarker: r.segmentMarker,
+      ownership: ((r.breakdown ?? null) as { ownership?: { reason?: string | null; workType?: string | null } } | null)?.ownership ?? null,
+    })),
     timeZone: settings.businessTimezone,
   }
 }

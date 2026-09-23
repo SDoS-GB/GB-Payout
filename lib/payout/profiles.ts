@@ -2,7 +2,7 @@ import { asc, eq } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { technicianProfiles, type TechnicianProfile } from "@/lib/db/schema"
 import { hashSecret, verifySecret } from "@/lib/security/crypto"
-import { COMPANIONS, CONTRACTORS, LINE_ITEM_MARKERS, legacyProfileOptions, type ContractorName } from "./contractors"
+import { COMPANIONS, CONTRACTORS, LINE_ITEM_MARKERS, WORK_TYPE_OWNERS, legacyProfileOptions, type ContractorName } from "./contractors"
 import type { ProfileOptions, Rates } from "./calculator"
 
 export type ProfileRates = Rates & ProfileOptions
@@ -38,6 +38,7 @@ export async function ensureProfilesSeeded(): Promise<void> {
         tipShare: legacy.tipShare.toString(),
         separateColorSeal: legacy.separateColorSeal,
         lineItemMarker: LINE_ITEM_MARKERS[name] ?? null,
+        ownedWorkType: WORK_TYPE_OWNERS[name] ?? null,
         active: true,
       }
     }),

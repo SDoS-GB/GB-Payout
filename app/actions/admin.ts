@@ -23,7 +23,7 @@ import {
   completionState,
   type PayoutQuery,
 } from "@/lib/payout/presentation"
-import { parseMarkerTokens } from "@/lib/payout/segments"
+import { parseMarkerTokens, workTypeMatches } from "@/lib/payout/segments"
 import { getWebhookUrl } from "@/lib/public-origin"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
 import { requireAdmin } from "@/lib/security/session"
@@ -380,17 +380,37 @@ export async function addManualTeamMapping(workizTeamId: string, workizName: str
 
 // --- Technician profiles -----------------------------------------------------
 
-/** Marker tokens (`T, Tim`); decoration like `*T*` is stripped. Null when blank. */
+/** Marker token (`T`); decoration like `*T*` is stripped. Null when blank. */
 function normalizeMarker(input: string | null | undefined): string | null {
   if (!(input ?? "").trim()) return null
   const tokens = parseMarkerTokens(input)
-  if (tokens.length === 0) throw new Error("Line-item marker needs at least one letter or digit (e.g. T or T, Tim)")
+  if (tokens.length === 0) throw new Error("Line-item marker needs at least one letter or digit (e.g. T)")
   if (tokens.length > 4) throw new Error("Use at most 4 marker tokens")
   for (const t of tokens) {
     if (t.length > 12) throw new Error(`Marker token "${t}" must be 12 characters or fewer`)
     if (!/^[A-Za-z0-9]+$/.test(t)) throw new Error(`Marker token "${t}" may only contain letters and digits`)
   }
   return tokens.join(", ")
+}
+
+/** Owned Work Type as typed (e.g. "Tim's Job"); compared normalized at sync time. Null when blank. */
+async function normalizeOwnedWorkType(selfId: number | null, input: string | null | undefined): Promise<string | null> {
+  const value = (input ?? "").replace(/\s+/g, " ").trim()
+  if (!value) return null
+  if (value.length > 60) throw new Error("Owned Work Type must be 60 characters or fewer")
+  const others = await db.select({ id: technicianProfiles.id, name: technicianProfiles.name, owned: technicianProfiles.ownedWorkType }).from(technicianProfiles)
+  const clash = others.find((o) => o.id !== selfId && workTypeMatches(o.owned, value))
+  if (clash) throw new Error(`Work Type "${value}" is already owned by ${clash.name}; a Work Type can belong to one technician only`)
+  return value
+}
+
+/**
+ * A technician with a marker or an owned Work Type is paid on his own work only and never
+ * shares tips; everyone else splits the business-held tip equally per job. The stored
+ * tip_share column is kept in step for the manual calculator and old snapshots.
+ */
+function derivedTipShare(lineItemMarker: string | null, ownedWorkType: string | null): string {
+  return lineItemMarker || ownedWorkType ? "0" : "0.5"
 }
 
 /** The technician this profile always works with; must be a different, existing profile. Null when unpaired. */
@@ -408,10 +428,10 @@ export async function updateProfile(
   patch: {
     nonColorRate: number
     colorRate: number
-    tipShare: number
     separateColorSeal: boolean
     active: boolean
     lineItemMarker?: string | null
+    ownedWorkType?: string | null
     worksWithProfileId?: number | null
     newPin?: string
   },
@@ -422,12 +442,15 @@ export async function updateProfile(
       if (!Number.isFinite(n) || n < 0 || n > 1) throw new Error("Rates must be between 0 and 1 (e.g. 0.25 for 25%)")
       return n.toString()
     }
+    const lineItemMarker = normalizeMarker(patch.lineItemMarker)
+    const ownedWorkType = await normalizeOwnedWorkType(id, patch.ownedWorkType)
     const set: Partial<typeof technicianProfiles.$inferInsert> = {
       nonColorRate: rate(patch.nonColorRate),
       colorRate: rate(patch.colorRate),
-      tipShare: rate(patch.tipShare),
+      tipShare: derivedTipShare(lineItemMarker, ownedWorkType),
       separateColorSeal: patch.separateColorSeal,
-      lineItemMarker: normalizeMarker(patch.lineItemMarker),
+      lineItemMarker,
+      ownedWorkType,
       worksWithProfileId: await normalizeWorksWith(id, patch.worksWithProfileId),
       active: patch.active,
       updatedAt: new Date(),
@@ -449,9 +472,9 @@ export async function createProfile(input: {
   pin: string
   nonColorRate: number
   colorRate: number
-  tipShare: number
   separateColorSeal: boolean
   lineItemMarker?: string | null
+  ownedWorkType?: string | null
   worksWithProfileId?: number | null
 }): Promise<Result> {
   try {
@@ -459,14 +482,17 @@ export async function createProfile(input: {
     const name = input.name.trim()
     if (!name) throw new Error("Name is required")
     if (!/^\d{4,8}$/.test(input.pin.trim())) throw new Error("PIN must be 4-8 digits")
+    const lineItemMarker = normalizeMarker(input.lineItemMarker)
+    const ownedWorkType = await normalizeOwnedWorkType(null, input.ownedWorkType)
     await db.insert(technicianProfiles).values({
       name,
       pinHash: hashSecret(input.pin.trim()),
       nonColorRate: input.nonColorRate.toString(),
       colorRate: input.colorRate.toString(),
-      tipShare: input.tipShare.toString(),
+      tipShare: derivedTipShare(lineItemMarker, ownedWorkType),
       separateColorSeal: input.separateColorSeal,
-      lineItemMarker: normalizeMarker(input.lineItemMarker),
+      lineItemMarker,
+      ownedWorkType,
       worksWithProfileId: await normalizeWorksWith(null, input.worksWithProfileId),
       active: true,
     })

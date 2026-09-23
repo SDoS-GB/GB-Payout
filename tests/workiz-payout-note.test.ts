@@ -73,6 +73,30 @@ describe("buildPayoutNote", () => {
     expect(note).toContain("Paid $400.00 by Zelle on Sep 21, 10:00 AM")
   })
 
+  it("names the Work Type when the whole job belongs to Tim, and lists who shares the tip and who gets none", () => {
+    const note = buildPayoutNote(
+      input({
+        jobTotal: 1000,
+        tipTotal: 100,
+        payments: [payment({ amount: 1000, method: "Check", date: "2026-09-21 10:00:00" }), payment({ amount: 100, method: "Check", isTip: true, date: "2026-09-21 10:00:00" })],
+        techs: [
+          { name: "Tim", total: 160, tip: 0, segmentKind: "dedicated", segmentMarker: "T", ownership: { reason: "marker", workType: null } },
+          { name: "Arthur", total: 220, tip: 50, segmentKind: "crew", segmentMarker: "T", ownership: { reason: "crew", workType: null } },
+          { name: "Viktor", total: 220, tip: 50, segmentKind: "crew", segmentMarker: "T", ownership: { reason: "crew", workType: null } },
+        ],
+      }),
+    )
+    expect(note).toContain("Tip $100.00 (Arthur $50.00, Viktor $50.00; Tim none)")
+
+    const whole = buildPayoutNote(
+      input({
+        jobTotal: 760,
+        techs: [{ name: "Tim", total: 603.17, tip: 0, segmentKind: "dedicated", segmentMarker: null, ownership: { reason: "work-type", workType: "Tim's Job" } }],
+      }),
+    )
+    expect(whole).toContain("Pay Tim $603.17 (whole job, Tim's Job, total)")
+  })
+
   it("breaks a mixed payment down per method and dates it by the latest payment", () => {
     const note = buildPayoutNote(
       input({

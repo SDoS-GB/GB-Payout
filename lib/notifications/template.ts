@@ -24,10 +24,14 @@ export type TemplateContext = {
 export function buildTemplateContext(payout: PayoutRow, profile: TechnicianProfile, job: WorkizJobRow | null): TemplateContext {
   const m = payoutMoney(payout)
   const tipTotal = m.cardTip + m.nonCardTip
-  const jobMarkers = (payout.breakdown as { job?: { markers?: string[] } } | null)?.job?.markers ?? []
+  const snapshot = payout.breakdown as { job?: { markers?: string[] }; ownership?: { reason?: string | null; workType?: string | null } } | null
+  const jobMarkers = snapshot?.job?.markers ?? []
   const marker = markerLabel(payout.segmentMarker) ?? (jobMarkers.length ? jobMarkers.map((m) => markerLabel(m) ?? m).join("/") : null)
+  const workType = snapshot?.ownership?.workType ?? null
   let segmentLine = ""
-  if (payout.segmentKind === "dedicated") segmentLine = ` for your ${marker ?? "marked"} items`
+  if (workType && snapshot?.ownership?.reason === "work-type") segmentLine = ` for the whole job (Work Type ${workType})`
+  else if (workType && payout.segmentKind === "crew") segmentLine = ` as your tip share only (Work Type ${workType}, no crew commission)`
+  else if (payout.segmentKind === "dedicated") segmentLine = ` for your ${marker ?? "marked"} items`
   else if (payout.segmentKind === "crew") segmentLine = marker ? ` for crew work (excl. ${marker})` : " for crew work"
   return {
     technician: profile.name,
