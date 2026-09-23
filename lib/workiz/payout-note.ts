@@ -21,6 +21,9 @@ import { parseWorkizDate } from "./time"
  */
 
 export const PAYOUT_NOTE_HEADER = "PAYOUT READY (GB app)"
+/** Header of the owner text written by lib/notifications/owner-message.ts; merged the same way. */
+export const OWNER_NOTE_HEADER = "GB payout ready"
+const BLOCK_HEADERS = [PAYOUT_NOTE_HEADER, OWNER_NOTE_HEADER] as const
 
 export type PayoutNoteTech = {
   name: string
@@ -144,10 +147,10 @@ function toGsmSafe(line: string): string {
     .trim()
 }
 
-const BLOCK_PATTERN = new RegExp(`${escapeRegExp(PAYOUT_NOTE_HEADER)}[\\s\\S]*?(?:\\n[ \\t]*\\r?\\n|$)`, "g")
+const BLOCK_PATTERN = new RegExp(`(?:${BLOCK_HEADERS.map(escapeRegExp).join("|")})[\\s\\S]*?(?:\\n[ \\t]*\\r?\\n|$)`, "g")
 
 export function hasPayoutNote(description: string | null | undefined): boolean {
-  return typeof description === "string" && description.includes(PAYOUT_NOTE_HEADER)
+  return typeof description === "string" && BLOCK_HEADERS.some((h) => description.includes(h))
 }
 
 /**

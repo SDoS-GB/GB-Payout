@@ -198,11 +198,100 @@ export const jobPayments = pgTable(
     reference: text("reference"),
     recordedBy: text("recorded_by"),
     raw: jsonb("raw"),
+    /**
+     * True when `paidAt` came from the Workiz payload itself. Workiz's invoice/estimate
+     * webhooks carry no per-payment date, so `paidAt` is usually the time the FIRST event
+     * mentioning the payment arrived; a later re-delivery must not move it forward.
+     */
+    paidAtFromPayload: boolean("paid_at_from_payload").notNull().default(false),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   // The same Workiz payment delivered twice (webhook retry, two automations) is one row.
   (t) => [uniqueIndex("job_payments_external_unique").on(t.jobUuid, t.externalId).where(sql`${t.externalId} is not null`)],
+)
+
+/**
+ * Every webhook Workiz posts, stored before anything is done with it. `eventKey` de-duplicates
+ * retries; `status` tracks whether the event could be applied. Estimate/invoice events that
+ * name only Workiz's internal job id (JOB-…) wait here as `unresolved` until a job event
+ * teaches us that id's UUID, then are replayed.
+ */
+export const webhookEvents = pgTable(
+  "webhook_events",
+  {
+    id: serial("id").primaryKey(),
+    eventKey: text("event_key").notNull(),
+    triggerType: text("trigger_type"),
+    ruleName: text("rule_name"),
+    /** job | invoice | estimate | self_test | ignored | unknown */
+    kind: text("kind").notNull(),
+    jobUuid: text("job_uuid"),
+    /** Workiz internal job id ("JOB-…") when the payload carried one. */
+    jobInternalId: text("job_internal_id"),
+    serialId: text("serial_id"),
+    /** Invoice or estimate id ("IV-…" / "ES-…") for document events. */
+    documentId: text("document_id"),
+    payload: jsonb("payload"),
+    /** received | processed | unresolved | ignored | failed | duplicate */
+    status: text("status").notNull().default("received"),
+    attempts: integer("attempts").notNull().default(0),
+    error: text("error"),
+    receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
+    processedAt: timestamp("processed_at", { withTimezone: true }),
+  },
+  (t) => [uniqueIndex("webhook_events_key_unique").on(t.eventKey)],
+)
+
+/**
+ * Workiz has two ids per job: the 6-character UUID the REST API and job webhooks use, and an
+ * internal "JOB-…" id that invoice and estimate webhooks reference. Job and invoice events carry
+ * both, so every one of them teaches the mapping; estimate events (deposits) carry only the
+ * internal id and are resolved through this table.
+ */
+export const workizJobIds = pgTable("workiz_job_ids", {
+  internalId: text("internal_id").primaryKey(),
+  uuid: text("uuid").notNull(),
+  serialId: text("serial_id"),
+  firstSeenAt: timestamp("first_seen_at", { withTimezone: true }).notNull().defaultNow(),
+  updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+})
+
+/**
+ * One row per job: the owner's "payout ready" text. This is the durable outbox the webhook,
+ * cron and admin all drive. Delivery goes through Workiz (tag + job description → the owner's
+ * Workiz SMS automation), so `provider_accepted` means Workiz confirmed the tag and summary
+ * are on the job; `delivered` is only set when the owner confirms receipt — Workiz returns
+ * no delivery receipt.
+ */
+export const ownerNotifications = pgTable(
+  "owner_notifications",
+  {
+    id: serial("id").primaryKey(),
+    jobUuid: text("job_uuid").notNull(),
+    /** blocked | preview_only | queued | sending | provider_accepted | delivered | failed */
+    status: text("status").notNull().default("blocked"),
+    blockReason: text("block_reason"),
+    /** Fingerprint of the payout set the message describes; a send is refused when it no longer matches. */
+    snapshotHash: text("snapshot_hash"),
+    /** Fingerprint that was actually delivered, so a later payout change is visible as "sent for an earlier snapshot". */
+    sentSnapshotHash: text("sent_snapshot_hash"),
+    message: text("message").notNull().default(""),
+    channel: text("channel").notNull().default("workiz_tag_sms"),
+    destinationLabel: text("destination_label"),
+    destinationMasked: text("destination_masked"),
+    attempts: integer("attempts").notNull().default(0),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
+    lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
+    lastError: text("last_error"),
+    providerResponse: jsonb("provider_response"),
+    sentAt: timestamp("sent_at", { withTimezone: true }),
+    deliveredAt: timestamp("delivered_at", { withTimezone: true }),
+    deliveredConfirmedBy: text("delivered_confirmed_by"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
+  },
+  (t) => [uniqueIndex("owner_notifications_job_unique").on(t.jobUuid)],
 )
 
 export const appSettings = pgTable("app_settings", {
@@ -240,7 +329,7 @@ export type NormalizedLineItem = {
 }
 
 /** Where a payment record came from. Absent on rows saved before provenance was tracked (all were job payloads). */
-export type PaymentSource = "workiz-job" | "invoice-webhook" | "manual"
+export type PaymentSource = "workiz-job" | "invoice-webhook" | "estimate-webhook" | "manual"
 
 export type NormalizedPayment = {
   id: string | null
@@ -252,6 +341,8 @@ export type NormalizedPayment = {
   source?: PaymentSource
   /** False when the method text is not one we can place on the card / non-card side; the payout is held. */
   methodKnown?: boolean
+  /** True when Workiz did not make clear whether this payment's amount included its tip; the payout is held. */
+  tipAmbiguous?: boolean
   /** Admin who confirmed a manual record. */
   recordedBy?: string | null
 }
@@ -264,3 +355,5 @@ export type PayoutRow = typeof payouts.$inferSelect
 export type NotificationRow = typeof notifications.$inferSelect
 export type TeamMappingRow = typeof workizTeamMappings.$inferSelect
 export type SyncEventRow = typeof syncEvents.$inferSelect
+export type WebhookEventRow = typeof webhookEvents.$inferSelect
+export type OwnerNotificationRow = typeof ownerNotifications.$inferSelect

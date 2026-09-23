@@ -365,6 +365,11 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
         const sum = round2(unknown.reduce((s, p) => s + p.amount, 0))
         warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: $${sum.toFixed(2)} was recorded with a method that is not recognised (${methods}); confirm whether it was paid by card before release`)
       }
+      const ambiguousTips = tipPayments.filter((p) => p.tipAmbiguous)
+      if (ambiguousTips.length) {
+        const sum = round2(ambiguousTips.reduce((s, p) => s + p.amount, 0))
+        warnings.push(`${TIP_METHOD_UNCLEAR_PREFIX}: Workiz reported a $${sum.toFixed(2)} tip but its totals do not show whether the payment amount already included it; confirm the tip before release`)
+      }
 
       if (amountDue !== null) {
         // Workiz's balance is the authority on WHETHER the customer has paid; the records only

@@ -5,15 +5,15 @@ import { revalidatePath } from "next/cache"
 import { db } from "@/lib/db"
 import {
   colorSealItems,
-  notifications,
+  ownerNotifications,
   payouts,
   syncEvents,
   technicianProfiles,
   workizJobs,
   workizTeamMappings,
 } from "@/lib/db/schema"
-import { notifyPayout } from "@/lib/notifications/send"
-import { buildTemplateContext, renderTemplate } from "@/lib/notifications/template"
+import { confirmOwnerDelivered, getOwnerNotification, loadOwnerInput, refreshOwnerNotification, sendOwnerNotificationNow, sendOwnerTest } from "@/lib/notifications/owner"
+import { evaluateOwnerNotification } from "@/lib/notifications/owner-message"
 import { releaseBlocker } from "@/lib/payout/engine"
 import { listProfiles } from "@/lib/payout/profiles"
 import {
@@ -31,16 +31,17 @@ import {
   DEFAULT_WORKIZ_SETTINGS,
   getNotificationSettings,
   getWorkizSettings,
+  maskPhone,
   saveAdminSettings,
   saveNotificationSettings,
   saveWorkizSettings,
-  type NotificationSettings,
 } from "@/lib/settings"
 import { WorkizApiError, WorkizClient } from "@/lib/workiz/client"
+import { countWebhookEventsByStatus, recentWebhookEvents } from "@/lib/workiz/events"
 import { validateManualPayments, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { parseWorkizDate } from "@/lib/workiz/time"
-import { applyPayoutReadyTag, describeTagOutcome, getWorkizClient, logSyncEvent, reconcileRecentJobs, replaceManualPayments, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
-import { DEFAULT_PAYOUT_READY_TAG, explainNotApplied, normalizeTagName } from "@/lib/workiz/tags"
+import { MIN_RECONCILE_LOOKBACK_DAYS, getWorkizClient, logSyncEvent, reconcileRecentJobs, replaceManualPayments, syncJobByUuid, syncTeamMappings } from "@/lib/workiz/sync"
+import { DEFAULT_PAYOUT_READY_TAG, normalizeTagName } from "@/lib/workiz/tags"
 
 type Result<T = undefined> = { ok: true; data?: T } | { ok: false; error: string }
 
@@ -73,7 +74,8 @@ export async function updateWorkizSettings(form: {
       colorSealKeywords: splitList(form.colorSealKeywords),
       cardMethodKeywords: splitList(form.cardMethodKeywords),
       tipKeywords: splitList(form.tipKeywords),
-      reconcileLookbackDays: Math.min(90, Math.max(1, Math.round(Number(form.reconcileLookbackDays) || DEFAULT_WORKIZ_SETTINGS.reconcileLookbackDays))),
+      // Below 30 days the cron silently skips jobs scheduled weeks ago and paid today (production was found at 1).
+      reconcileLookbackDays: Math.min(90, Math.max(MIN_RECONCILE_LOOKBACK_DAYS, Math.round(Number(form.reconcileLookbackDays) || DEFAULT_WORKIZ_SETTINGS.reconcileLookbackDays))),
     }
     if (form.businessTimezone !== undefined) {
       const tz = form.businessTimezone.trim() || DEFAULT_BUSINESS_TIMEZONE
@@ -166,8 +168,9 @@ export async function updatePayoutTagSettings(form: { enabled: boolean; tag: str
 }
 
 /**
- * Add the payout-ready tag to one job right now, regardless of its payouts, so the admin can
- * confirm the Workiz automation texts them. The tag cannot be removed through the API afterwards.
+ * "Send test to owner": tag one real job and write a clearly labelled TEST block (no amounts)
+ * so the owner's Workiz automation fires once. The tag cannot be removed through the API, so
+ * the admin should pick a job that is already paid out. Never touches the payout outbox.
  */
 export async function tagJobForPayoutTest(jobRef: string): Promise<Result<{ summary: string }>> {
   try {
@@ -175,31 +178,12 @@ export async function tagJobForPayoutTest(jobRef: string): Promise<Result<{ summ
     const ref = jobRef.trim()
     if (!ref) throw new Error("Enter a job number or UUID.")
     const where = /^\d+$/.test(ref) ? eq(workizJobs.serialId, ref) : eq(workizJobs.uuid, ref)
-    const [job] = await db.select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId }).from(workizJobs).where(where).limit(1)
+    const [job] = await db.select({ uuid: workizJobs.uuid }).from(workizJobs).where(where).limit(1)
     if (!job) throw new Error(`Job ${ref} has not been synced yet. Run Sync now, or paste the job's UUID.`)
-
-    const { client, settings } = await getWorkizClient()
-    const fresh = await client.getJob(job.uuid)
-    if (!fresh) throw new Error(`Workiz job ${job.uuid} not found`)
-    const existingTags = Array.isArray(fresh.Tags) ? (fresh.Tags as unknown[]).map(String) : []
-    const existingDescription = typeof fresh.JobNotes === "string" ? fresh.JobNotes : null
-    const outcome = await applyPayoutReadyTag({ client, uuid: job.uuid, serialId: job.serialId, existingTags, existingDescription, settings, force: true, via: "admin-test" })
+    const outcome = await sendOwnerTest(job.uuid)
     revalidatePath("/admin")
-
-    const label = job.serialId ? `#${job.serialId}` : job.uuid
-    if (outcome.action === "skip") {
-      if (outcome.reason === "already-tagged") return { ok: true, data: { summary: `Job ${label} already carries "${settings.payoutReadyTag}", so Workiz will not fire again for it. Test with a different job.` } }
-      throw new Error(`Nothing to do: ${describeTagOutcome(outcome)}`)
-    }
-    if ("error" in outcome) throw new Error(outcome.error)
-    if (outcome.verdict !== "applied") throw new Error(explainNotApplied(outcome.tag))
-    const descriptionNote =
-      outcome.description === "written"
-        ? " The payout summary is now at the top of that job's description, so a text built from the Job description short code will carry it."
-        : outcome.description === "not-written"
-          ? " Warning: the tag stuck but the payout summary did not appear in the job description — check Activity for details."
-          : ""
-    return { ok: true, data: { summary: `Tagged job ${label} with "${outcome.tag}".${descriptionNote} If your Workiz automation is live, the text is on its way.` } }
+    if (!outcome.tagApplied && !outcome.tagWasPresent) throw new Error(outcome.summary)
+    return { ok: true, data: { summary: outcome.summary } }
   } catch (err) {
     return fail(err)
   }
@@ -577,11 +561,15 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
         break
     }
     await db.update(payouts).set(set).where(eq(payouts.id, id))
-    // A release makes the payout ready, so it gets the same ready-to-pay message a sync would
-    // produce; notifyPayout only previews unless sending is enabled and never delivers twice.
-    if (action === "release") {
-      await notifyPayout(id)
-      await tagReleasedJob(id)
+    // Any review action changes what the owner text should say (or whether it is due), so the
+    // job's outbox row is re-evaluated; a release delivers right away when texts are enabled.
+    const [changed] = await db.select({ jobUuid: payouts.jobUuid }).from(payouts).where(eq(payouts.id, id)).limit(1)
+    if (changed) {
+      try {
+        await refreshOwnerNotification(changed.jobUuid, { via: `admin ${action}` })
+      } catch (err) {
+        await logSyncEvent("owner-notify", { jobUuid: changed.jobUuid, ok: false, summary: `Owner text refresh after ${action} failed: ${err instanceof Error ? err.message : String(err)}` })
+      }
     }
     revalidatePath("/admin")
     revalidatePath("/payouts")
@@ -589,26 +577,6 @@ export async function reviewPayout(id: number, action: "release" | "hold" | "voi
   } catch (err) {
     return fail(err)
   }
-}
-
-/**
- * A released hold is now a ready payout, so the job should be tagged without waiting for the
- * next cron. Best-effort: tagging problems are logged by applyPayoutReadyTag, never surfaced here.
- */
-async function tagReleasedJob(payoutId: number) {
-  const settings = await getWorkizSettings()
-  if (!settings.payoutReadyTagEnabled || !settings.apiToken) return
-  const [row] = await db
-    .select({ uuid: workizJobs.uuid, serialId: workizJobs.serialId, raw: workizJobs.raw })
-    .from(payouts)
-    .innerJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
-    .where(eq(payouts.id, payoutId))
-    .limit(1)
-  if (!row) return
-  const rawTags = (row.raw as { Tags?: unknown } | null)?.Tags
-  const existingTags = Array.isArray(rawTags) ? rawTags.map(String) : []
-  const client = new WorkizClient({ apiToken: settings.apiToken, apiSecret: settings.apiSecret })
-  await applyPayoutReadyTag({ client, uuid: row.uuid, serialId: row.serialId, existingTags, settings, via: "release" })
 }
 
 export async function bulkMarkPaid(ids: number[]): Promise<Result<{ count: number }>> {
@@ -629,40 +597,99 @@ export async function bulkMarkPaid(ids: number[]): Promise<Result<{ count: numbe
   }
 }
 
-// --- Notifications -----------------------------------------------------------
+// --- Owner texts -------------------------------------------------------------
 
-export async function updateNotificationSettings(patch: Partial<NotificationSettings>): Promise<Result> {
+export type OwnerRecipientCandidate = { workizTeamId: string; name: string; role: string | null; phoneMasked: string | null; hasPhone: boolean }
+
+/**
+ * Workiz team members the owner text can go to, with masked phones. The SMS is addressed by the
+ * owner's Workiz automation; this choice records WHO that automation texts so the app can show
+ * it and refuse to report "sent" while nobody is configured.
+ */
+export async function listOwnerRecipientCandidates(): Promise<Result<OwnerRecipientCandidate[]>> {
   try {
     await requireAdmin()
-    await saveNotificationSettings(patch, "admin")
+    const { client } = await getWorkizClient()
+    const team = await client.listTeam()
+    const data = team
+      .filter((m) => m.id)
+      .map((m) => ({ workizTeamId: m.id, name: m.name, role: m.role, phoneMasked: maskPhone(m.phone), hasPhone: Boolean(maskPhone(m.phone)) }))
+      .sort((a, b) => a.name.localeCompare(b.name))
+    return { ok: true, data }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+export async function setOwnerRecipient(workizTeamId: string | null): Promise<Result<{ name: string | null }>> {
+  try {
+    await requireAdmin()
+    if (!workizTeamId) {
+      await saveNotificationSettings({ ownerRecipient: null }, "admin")
+      await logSyncEvent("settings", { ok: true, summary: "Owner text recipient cleared" })
+      revalidatePath("/admin")
+      return { ok: true, data: { name: null } }
+    }
+    const { client } = await getWorkizClient()
+    const member = (await client.listTeam()).find((m) => m.id === workizTeamId)
+    if (!member) throw new Error("That team member is not in Workiz any more; refresh the list.")
+    const phoneMasked = maskPhone(member.phone)
+    await saveNotificationSettings({ ownerRecipient: { workizTeamId: member.id, name: member.name, phoneMasked } }, "admin")
+    await logSyncEvent("settings", { ok: true, summary: `Owner text recipient set to ${member.name}${phoneMasked ? ` (${phoneMasked})` : " (no phone on the Workiz profile)"}` })
+    revalidatePath("/admin")
+    return { ok: true, data: { name: member.name } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+/** Current owner text for a job, re-evaluated now, without sending. */
+export async function previewOwnerText(jobUuid: string): Promise<Result<{ state: string; reason: string | null; message: string | null }>> {
+  try {
+    await requireAdmin()
+    const input = await loadOwnerInput(jobUuid, await getWorkizSettings(), await getNotificationSettings())
+    if (!input) throw new Error("Job has not been synced yet")
+    const decision = evaluateOwnerNotification(input)
+    return { ok: true, data: { state: decision.state, reason: decision.state === "ready" ? null : decision.reason, message: decision.message } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+export type SendPayoutOutcome = { status: string; outcome: string; detail: string }
+
+/** Admin "Send payout to owner" for one job; `force` re-sends after an earlier delivery. */
+export async function sendPayoutToOwner(jobUuid: string, force = false): Promise<Result<SendPayoutOutcome>> {
+  try {
+    await requireAdmin()
+    const res = await sendOwnerNotificationNow(jobUuid, { force, via: force ? "admin-resend" : "admin-send" })
+    revalidatePath("/admin")
+    revalidatePath("/payouts")
+    const d = res.delivery
+    const detail =
+      d.outcome === "provider_accepted"
+        ? d.reconciled
+          ? "Workiz already had the tag and summary on this job; recorded as accepted (no second text)."
+          : `Workiz accepted the tag and summary${d.descriptionWritten ? "" : " (summary did not appear in the description)"}. Your Workiz automation sends the SMS; delivery is unconfirmed until you confirm receipt.`
+        : d.outcome === "failed"
+          ? `${d.error}${d.retryAt ? ` Retry scheduled ${d.retryAt.toISOString()}.` : ""}`
+          : d.outcome === "not_eligible"
+            ? d.reason
+            : d.reason
+    return { ok: true, data: { status: res.row?.status ?? "unknown", outcome: d.outcome, detail } }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+export async function confirmOwnerTextReceived(id: number): Promise<Result> {
+  try {
+    await requireAdmin()
+    const row = await confirmOwnerDelivered(id, "admin")
+    if (!row) throw new Error("Only a text Workiz has accepted can be confirmed as received")
+    await logSyncEvent("owner-notify", { jobUuid: row.jobUuid, ok: true, summary: `Owner confirmed receipt of the payout text for job ${row.jobUuid}` })
     revalidatePath("/admin")
     return { ok: true }
-  } catch (err) {
-    return fail(err)
-  }
-}
-
-export async function previewNotification(payoutId: number): Promise<Result<{ message: string }>> {
-  try {
-    await requireAdmin()
-    const [payout] = await db.select().from(payouts).where(eq(payouts.id, payoutId)).limit(1)
-    if (!payout) throw new Error("Payout not found")
-    const [profile] = await db.select().from(technicianProfiles).where(eq(technicianProfiles.id, payout.profileId)).limit(1)
-    if (!profile) throw new Error("Profile not found")
-    const [job] = await db.select().from(workizJobs).where(eq(workizJobs.uuid, payout.jobUuid)).limit(1)
-    const settings = await getNotificationSettings()
-    return { ok: true, data: { message: renderTemplate(settings.template, buildTemplateContext(payout, profile, job ?? null)) } }
-  } catch (err) {
-    return fail(err)
-  }
-}
-
-export async function sendNotificationNow(payoutId: number): Promise<Result<{ status: string; reason?: string }>> {
-  try {
-    await requireAdmin()
-    const outcome = await notifyPayout(payoutId, { force: true })
-    revalidatePath("/admin")
-    return { ok: true, data: { status: outcome.status, reason: outcome.reason } }
   } catch (err) {
     return fail(err)
   }
@@ -685,13 +712,11 @@ export async function changeAdminPassword(current: string, next: string): Promis
 
 // --- Read models for the admin dashboard ------------------------------------
 
-async function latestNotificationByPayout(payoutIds: number[]) {
-  const rows = payoutIds.length
-    ? await db.select().from(notifications).where(inArray(notifications.payoutId, payoutIds)).orderBy(desc(notifications.createdAt))
-    : []
-  const byPayout = new Map<number, (typeof rows)[number]>()
-  for (const n of rows) if (!byPayout.has(n.payoutId)) byPayout.set(n.payoutId, n)
-  return byPayout
+/** The job-level owner text row for each job, keyed by job UUID. */
+async function ownerTextByJob(jobUuids: string[]) {
+  const unique = Array.from(new Set(jobUuids))
+  const rows = unique.length ? await db.select().from(ownerNotifications).where(inArray(ownerNotifications.jobUuid, unique)) : []
+  return new Map(rows.map((r) => [r.jobUuid, r]))
 }
 
 function sanitizeQuery(input: Partial<PayoutQuery> | undefined): PayoutQuery {
@@ -782,7 +807,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
     .limit(q.pageSize)
     .offset((q.page - 1) * q.pageSize)
 
-  const notifByPayout = await latestNotificationByPayout(rows.map((r) => r.payout.id))
+  const ownerByJob = await ownerTextByJob(rows.map((r) => r.payout.jobUuid))
 
   // Other technicians paid on the same job, so a shared job is visibly one record per technician.
   const jobUuids = Array.from(new Set(rows.map((r) => r.payout.jobUuid)))
@@ -811,7 +836,7 @@ export async function queryPayouts(input?: Partial<PayoutQuery>) {
       profileMarker: r.profileMarker ?? null,
       job,
       completion: job ? completionState({ status: job.status, payableStatuses: settings.payableStatuses, lastStatusUpdate: job.lastStatusUpdate }) : null,
-      lastNotification: notifByPayout.get(r.payout.id) ?? null,
+      ownerText: ownerByJob.get(r.payout.jobUuid) ?? null,
       siblings: siblings.filter((s) => s.jobUuid === r.payout.jobUuid && s.id !== r.payout.id).map((s) => ({ ...s, profileName: s.profileName ?? "Unknown" })),
     }
   })
@@ -860,9 +885,44 @@ async function unmappedTeamImpact(teamIds: string[]) {
   return impact
 }
 
+/** Newest reconcile run (cron or manual), successful or not, plus the newest successful one. */
+async function reconcileDiagnostics() {
+  const [last] = await db.select({ createdAt: syncEvents.createdAt, ok: syncEvents.ok, summary: syncEvents.summary, details: syncEvents.details }).from(syncEvents).where(eq(syncEvents.kind, "reconcile")).orderBy(desc(syncEvents.createdAt)).limit(1)
+  const [lastOk] = await db.select({ createdAt: syncEvents.createdAt, summary: syncEvents.summary }).from(syncEvents).where(and(eq(syncEvents.kind, "reconcile"), eq(syncEvents.ok, true))).orderBy(desc(syncEvents.createdAt)).limit(1)
+  const [lastJobSync] = await db.select({ createdAt: syncEvents.createdAt }).from(syncEvents).where(inArray(syncEvents.kind, ["job:rest", "job:webhook"])).orderBy(desc(syncEvents.createdAt)).limit(1)
+  const d = (last?.details ?? null) as { lookbackDays?: number; revisited?: number; outbox?: { considered: number; accepted: number; failed: number } } | null
+  return {
+    last: last ? { createdAt: last.createdAt, ok: last.ok, summary: last.summary, lookbackDays: d?.lookbackDays ?? null, revisited: d?.revisited ?? null, outbox: d?.outbox ?? null } : null,
+    lastSuccessfulAt: lastOk?.createdAt ?? null,
+    lastJobSyncAt: lastJobSync?.createdAt ?? null,
+  }
+}
+
+/** Every job-level owner text, newest first, with the job facts the diagnostics table shows. */
+async function ownerTextRows(limit = 100) {
+  const rows = await db
+    .select({
+      row: ownerNotifications,
+      job: { serialId: workizJobs.serialId, clientName: workizJobs.clientName, status: workizJobs.status, jobTotal: workizJobs.jobTotal, payments: workizJobs.payments, fullyPaid: workizJobs.fullyPaid },
+    })
+    .from(ownerNotifications)
+    .leftJoin(workizJobs, eq(ownerNotifications.jobUuid, workizJobs.uuid))
+    .orderBy(desc(ownerNotifications.updatedAt))
+    .limit(limit)
+  return rows.map((r) => ({ ...r.row, job: r.job.serialId === null && r.job.clientName === null && r.job.status === null ? null : r.job, paymentSource: paymentSourceSummary(r.job.payments) }))
+}
+
+function paymentSourceSummary(payments: unknown): string {
+  const list = Array.isArray(payments) ? (payments as Array<{ source?: string; isTip?: boolean }>) : []
+  const service = list.filter((p) => !p.isTip)
+  if (service.length === 0) return "none (Workiz balance only)"
+  const sources = Array.from(new Set(service.map((p) => p.source ?? "workiz-job")))
+  return sources.map((s) => (s === "invoice-webhook" ? "invoice webhook" : s === "estimate-webhook" ? "estimate webhook" : s === "manual" ? "admin recovery entry" : "job payload")).join(" + ")
+}
+
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook, lastTagEvent] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, notif, events, statusCounts, payoutPage, lastWebhook, lastTagEvent, reconcile, ownerTexts, webhookLog, webhookCounts] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
@@ -873,24 +933,14 @@ export async function loadAdminDashboard() {
     queryPayouts(DEFAULT_PAYOUT_QUERY),
     latestWorkizWebhook(),
     latestTagEvent(),
+    reconcileDiagnostics(),
+    ownerTextRows(),
+    recentWebhookEvents(25),
+    countWebhookEventsByStatus(),
   ])
 
   const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
   const unmappedImpact = await unmappedTeamImpact(unmappedIds)
-
-  // Compact recent list for the Messages tab (preview picker + delivery log).
-  const recentRows = await db
-    .select({
-      payout: payouts,
-      profileName: technicianProfiles.name,
-      job: { serialId: workizJobs.serialId, clientName: workizJobs.clientName, status: workizJobs.status, jobDateTime: workizJobs.jobDateTime, fullyPaid: workizJobs.fullyPaid },
-    })
-    .from(payouts)
-    .leftJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
-    .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
-    .orderBy(desc(payouts.updatedAt))
-    .limit(300)
-  const notifByPayout = await latestNotificationByPayout(recentRows.map((r) => r.payout.id))
 
   return {
     profiles: profiles.map((p) => ({ ...p, pinHash: undefined })),
@@ -911,22 +961,31 @@ export async function loadAdminDashboard() {
       cardMethodKeywords: workiz.cardMethodKeywords,
       tipKeywords: workiz.tipKeywords,
       reconcileLookbackDays: workiz.reconcileLookbackDays,
+      effectiveLookbackDays: Math.max(MIN_RECONCILE_LOOKBACK_DAYS, workiz.reconcileLookbackDays),
       businessTimezone: workiz.businessTimezone || DEFAULT_BUSINESS_TIMEZONE,
       payoutReadyTagEnabled: workiz.payoutReadyTagEnabled,
       payoutReadyTag: workiz.payoutReadyTag,
       lastTagEvent,
     },
-    notifications: notif,
+    ownerTexts: {
+      recipient: notif.ownerRecipient,
+      sendEnabled: workiz.payoutReadyTagEnabled,
+      tag: workiz.payoutReadyTag,
+      hasCredentials: Boolean(workiz.apiToken && workiz.apiSecret),
+      rows: ownerTexts,
+      reconcile,
+      webhookLog: webhookLog.map((e) => ({ id: e.id, receivedAt: e.receivedAt, triggerType: e.triggerType, ruleName: e.ruleName, kind: e.kind, jobUuid: e.jobUuid, jobInternalId: e.jobInternalId, serialId: e.serialId, status: e.status, error: e.error, payments: paymentCountOf(e.payload) })),
+      webhookCounts,
+    },
     events,
-    payouts: recentRows.map((r) => ({
-      ...r.payout,
-      profileName: r.profileName ?? "Unknown",
-      job: r.job,
-      lastNotification: notifByPayout.get(r.payout.id) ?? null,
-    })),
     statusCounts,
     payoutPage,
   }
+}
+
+function paymentCountOf(payload: unknown): number | null {
+  const data = (payload as { data?: { payments?: unknown } } | null)?.data
+  return Array.isArray(data?.payments) ? data.payments.length : null
 }
 
 export type AdminDashboardData = Awaited<ReturnType<typeof loadAdminDashboard>>
