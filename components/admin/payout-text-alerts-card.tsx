@@ -116,11 +116,13 @@ export function PayoutTextAlertsCard({ workiz, dashboardUrl }: { workiz: Workiz;
                 Open <span className="font-medium">Automations</span> and select <span className="font-medium">Add automation</span>.
               </li>
               <li>
-                <span className="font-medium">This happens</span>: choose the job trigger for a tag being added and pick{" "}
-                <span className="font-mono">{cleanTag || "Payout Ready"}</span>. If your plan only offers status triggers, use{" "}
-                <span className="font-medium">Job has a status of {"Done"}</span>, set the timing to <span className="font-medium">10 minutes after</span>{" "}
-                <span className="font-medium">last status change date</span>, and add the condition <span className="font-medium">Job tag = {cleanTag || "Payout Ready"}</span>{" "}
-                so the tag has time to arrive before Workiz checks it.
+                <span className="font-medium">This happens</span>: select the underlined <span className="font-medium">has a status</span> and change it to the
+                tag trigger (<span className="font-medium">has a tag</span> / <span className="font-medium">is tagged</span>), pick{" "}
+                <span className="font-mono">{cleanTag || "Payout Ready"}</span>, timing <span className="font-medium">immediately</span>. The app adds that tag
+                the moment a payout becomes ready, which is usually hours or days after the job is marked Done (payment lands later, or a hold is
+                released), so a trigger on <span className="font-medium">status Done</span> with a{" "}
+                <span className="font-medium">Job tag = {cleanTag || "Payout Ready"}</span> condition checked 10 minutes later will almost never fire. Use
+                that only if your plan has no tag trigger, and expect to miss any job paid more than 10 minutes after Done.
               </li>
               <li>
                 <span className="font-medium">Do this</span>: choose <span className="font-medium">Send text message</span> → <span className="font-medium">Team member</span> and
