@@ -1,5 +1,4 @@
 import { NextResponse } from "next/server"
-import { processOwnerOutbox } from "@/lib/notifications/owner"
 import { getWorkizSettings } from "@/lib/settings"
 import { markWebhookEvent, rememberJobIds, storeWebhookEvent } from "@/lib/workiz/events"
 import { getWorkizClient, logSyncEvent, replayUnresolvedEvents, syncDocumentWebhook, syncJobByUuid } from "@/lib/workiz/sync"
@@ -17,14 +16,13 @@ const NO_STORE = { "Cache-Control": "no-store" }
  * Every authenticated event is written to `webhook_events` FIRST (de-duplicated by Workiz's own
  * trigger type + timestamp + record id), then applied:
  *   - job events        → learn JOB-… ↔ UUID, re-fetch the job through the REST API, replay any
- *                         parked estimate/invoice events for it, run the payout + owner-text pipeline;
+ *                         parked estimate/invoice events for it, run the payout pipeline;
  *   - invoice/estimate  → store `payments[]` (the only Workiz surface with the payment TYPE), then
  *                         the same pipeline; an estimate that names only the JOB-… id is parked
  *                         as `unresolved` until a job/invoice event teaches the mapping;
  *   - lead events       → acknowledged and ignored.
  * The payload is never trusted for amounts: the job is always re-fetched before calculating.
- * After every event the owner-text outbox runs, so a job that became eligible through an
- * earlier event but could not be delivered then is retried now.
+ * Nothing here sends a message: the app records payouts only.
  */
 export async function POST(req: Request) {
   const settings = await getWorkizSettings()
@@ -84,7 +82,6 @@ export async function POST(req: Request) {
         return NextResponse.json({ ok: true, parked: true, reason: outcome.reason, eventId: event.id }, { status: 202, headers: NO_STORE })
       }
       await markWebhookEvent(event.id, "processed", { jobUuid: outcome.result.uuid })
-      await runOutboxSafely(via)
       return NextResponse.json(
         {
           ok: true,
@@ -93,7 +90,6 @@ export async function POST(req: Request) {
           status: outcome.result.normalized.status,
           payments: { stored: outcome.stored, skipped: outcome.skipped, onJob: outcome.result.normalized.payments.length },
           payouts: outcome.result.engine,
-          ownerText: ownerSummary(outcome.result.owner),
         },
         { headers: NO_STORE },
       )
@@ -124,7 +120,6 @@ export async function POST(req: Request) {
       const replay = parsed.jobInternalId ? await replayUnresolvedEvents({ internalId: parsed.jobInternalId, via: `job event ${via}` }) : null
       const result = await syncJobByUuid(uuid, "webhook", { via })
       await markWebhookEvent(event.id, "processed", { jobUuid: result.uuid })
-      await runOutboxSafely(via)
       return NextResponse.json(
         {
           ok: true,
@@ -133,7 +128,6 @@ export async function POST(req: Request) {
           status: result.normalized.status,
           payouts: result.engine,
           replayedEvents: replay,
-          ownerText: ownerSummary(result.owner),
         },
         { headers: NO_STORE },
       )
@@ -151,20 +145,6 @@ export async function POST(req: Request) {
     details: { eventId: event.id, trigger: parsed.triggerType, candidates: parsed.uuidCandidates, serialId: parsed.serialId, status: parsed.status },
   })
   return NextResponse.json({ ok: false, error: lastError }, { status: 502, headers: NO_STORE })
-}
-
-function ownerSummary(owner: Awaited<ReturnType<typeof syncJobByUuid>>["owner"]) {
-  if (!owner) return null
-  return { status: owner.row.status, reason: owner.row.blockReason, delivery: owner.delivery?.outcome ?? null }
-}
-
-/** Other jobs may have been waiting for their retry time; a live webhook is as good a moment as the cron. */
-async function runOutboxSafely(via: string) {
-  try {
-    await processOwnerOutbox({ via: `webhook ${via}`, limit: 10 })
-  } catch (err) {
-    await logSyncEvent("owner-notify", { ok: false, summary: `Outbox run after webhook failed: ${err instanceof Error ? err.message : String(err)}` })
-  }
 }
 
 export async function GET() {
