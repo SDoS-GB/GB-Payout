@@ -15,6 +15,7 @@ import {
 import { TECH_PAYMENT_METHODS, isoDateInZone, round2, validateBatchForm, type SelectionItem, type StaleItem } from "@/lib/payout/batch-rules"
 import { getBatch, listBatches, recordOpeningBatch, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
 import { isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
+import { confirmPreviouslyPaid, initializeOpeningBalance, previewOpeningBalance } from "@/lib/payout/opening"
 import { listProfiles } from "@/lib/payout/profiles"
 import {
   DEFAULT_BUSINESS_TIMEZONE,
@@ -1059,4 +1060,3 @@ export async function loadAdminDashboard() {
 }
 
 export type AdminDashboardData = Awaited<ReturnType<typeof loadAdminDashboard>>
-
