@@ -31,6 +31,8 @@ export type NormalizedJob = {
   paymentDueDate: Date | null
   jobDateTime: Date | null
   jobEndDateTime: Date | null
+  /** Workiz `LastStatusUpdate`; the completion time when the status is payable (Workiz has no dedicated completion stamp). */
+  lastStatusUpdate: Date | null
   clientId: string | null
   clientName: string | null
   address: string | null
@@ -433,6 +435,7 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
       paymentDueDate: date(pick(r, "PaymentDueDate", "payment_due_date"), settings.businessTimezone),
       jobDateTime: date(pick(r, "JobDateTime", "job_date_time"), settings.businessTimezone),
       jobEndDateTime: date(pick(r, "JobEndDateTime", "job_end_date_time"), settings.businessTimezone),
+      lastStatusUpdate: date(pick(r, "LastStatusUpdate", "last_status_update"), settings.businessTimezone),
       clientId: str(pick(r, "ClientId", "client_id")),
       clientName,
       address,

@@ -149,10 +149,105 @@ export const payouts = pgTable(
     paidAt: timestamp("paid_at", { withTimezone: true }),
     paidBy: text("paid_by"),
     adminNote: text("admin_note"),
+    /** Payment batch that currently settles this payout (null while unpaid or after a reversal). */
+    batchId: integer("batch_id"),
+    /** How the row was settled: "payment" (owner clicked Paid) or "opening" (declared paid before the cutoff). */
+    settledKind: text("settled_kind"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   (t) => [uniqueIndex("payouts_job_profile_unique").on(t.jobUuid, t.profileId)],
+)
+
+/**
+ * One owner payment to one technician: the selected job payouts settled together with a
+ * single "Paid" click, or an opening-balance entry for work the owner declared already paid.
+ * `paidAmount`/`method`/`paidOn` describe the REAL transfer and stay null when nobody recorded
+ * them; `calculatedTotal` is the sum of the settled payout calculations and is never presented
+ * as a verified transfer amount.
+ */
+export const paymentBatches = pgTable(
+  "payment_batches",
+  {
+    id: serial("id").primaryKey(),
+    profileId: integer("profile_id").notNull(),
+    /** payment | opening */
+    kind: text("kind").notNull().default("payment"),
+    /** recorded | reversed */
+    status: text("status").notNull().default("recorded"),
+    /** Zelle | Cash | Check | Other; null = unknown (opening history). */
+    method: text("method"),
+    /** Effective payment date in the business timezone (YYYY-MM-DD); null = unknown. */
+    paidOn: text("paid_on"),
+    /** Amount actually handed to the technician; null = unknown. */
+    paidAmount: numeric("paid_amount", { precision: 12, scale: 2 }),
+    calculatedTotal: numeric("calculated_total", { precision: 12, scale: 2 }).notNull().default("0"),
+    itemCount: integer("item_count").notNull().default(0),
+    reference: text("reference"),
+    /** Client-generated key so a double tap or retried request records one batch. */
+    idempotencyKey: text("idempotency_key"),
+    recordedAt: timestamp("recorded_at", { withTimezone: true }).notNull().defaultNow(),
+    recordedBy: text("recorded_by").notNull(),
+    reversedAt: timestamp("reversed_at", { withTimezone: true }),
+    reversedBy: text("reversed_by"),
+    reversalReason: text("reversal_reason"),
+    details: jsonb("details"),
+  },
+  (t) => [uniqueIndex("payment_batches_idempotency_unique").on(t.idempotencyKey).where(sql`${t.idempotencyKey} is not null`)],
+)
+
+/**
+ * One job payout inside a batch, frozen at the moment it was settled. The partial unique
+ * index is the duplicate-settlement guard: a payout can be in at most one un-reversed batch,
+ * whatever two taps, two tabs or a concurrent sync try to do.
+ */
+export const payoutSettlements = pgTable(
+  "payout_settlements",
+  {
+    id: serial("id").primaryKey(),
+    batchId: integer("batch_id").notNull(),
+    payoutId: integer("payout_id").notNull(),
+    profileId: integer("profile_id").notNull(),
+    jobUuid: text("job_uuid").notNull(),
+    /** Rounded amount the owner saw and settled. */
+    amount: numeric("amount", { precision: 12, scale: 2 }).notNull(),
+    /** payouts.total_payout at full stored precision when settled. */
+    exactAmount: numeric("exact_amount", { precision: 12, scale: 4 }).notNull(),
+    calcVersion: text("calc_version"),
+    inputHash: text("input_hash"),
+    /** Copy of the payout row (money columns + breakdown) so history never depends on a later recalculation. */
+    snapshot: jsonb("snapshot"),
+    /** settled | reversed */
+    status: text("status").notNull().default("settled"),
+    createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
+    reversedAt: timestamp("reversed_at", { withTimezone: true }),
+  },
+  (t) => [uniqueIndex("payout_settlements_active_unique").on(t.payoutId).where(sql`${t.status} = 'settled'`)],
+)
+
+/**
+ * A settled payout whose Workiz inputs changed afterwards. The settlement is never touched;
+ * the owner reviews the difference here.
+ */
+export const payoutSourceChanges = pgTable(
+  "payout_source_changes",
+  {
+    id: serial("id").primaryKey(),
+    payoutId: integer("payout_id").notNull(),
+    jobUuid: text("job_uuid").notNull(),
+    profileId: integer("profile_id").notNull(),
+    settledHash: text("settled_hash"),
+    newHash: text("new_hash").notNull(),
+    settledAmount: numeric("settled_amount", { precision: 12, scale: 4 }),
+    recomputedAmount: numeric("recomputed_amount", { precision: 12, scale: 4 }),
+    summary: text("summary"),
+    /** open | acknowledged */
+    status: text("status").notNull().default("open"),
+    detectedAt: timestamp("detected_at", { withTimezone: true }).notNull().defaultNow(),
+    acknowledgedAt: timestamp("acknowledged_at", { withTimezone: true }),
+    acknowledgedBy: text("acknowledged_by"),
+  },
+  (t) => [uniqueIndex("payout_source_changes_hash_unique").on(t.payoutId, t.newHash)],
 )
 
 export const notifications = pgTable(
@@ -357,3 +452,6 @@ export type TeamMappingRow = typeof workizTeamMappings.$inferSelect
 export type SyncEventRow = typeof syncEvents.$inferSelect
 export type WebhookEventRow = typeof webhookEvents.$inferSelect
 export type OwnerNotificationRow = typeof ownerNotifications.$inferSelect
+export type PaymentBatchRow = typeof paymentBatches.$inferSelect
+export type PayoutSettlementRow = typeof payoutSettlements.$inferSelect
+export type PayoutSourceChangeRow = typeof payoutSourceChanges.$inferSelect

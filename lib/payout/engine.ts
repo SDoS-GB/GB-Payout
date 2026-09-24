@@ -1,7 +1,8 @@
 import { createHash } from "node:crypto"
-import { and, eq, inArray } from "drizzle-orm"
+import { and, eq, inArray, notInArray } from "drizzle-orm"
 import { db } from "@/lib/db"
 import {
+  payoutSourceChanges,
   payouts,
   technicianProfiles,
   workizTeamMappings,
@@ -37,6 +38,31 @@ export type EngineResult = {
   unmappedTeamIds: string[]
   payoutIds: number[]
   notes: string[]
+  /** Settled payouts whose Workiz inputs changed; the settlement is untouched and flagged for review. */
+  sourceChanges: number
+}
+
+export type EngineOptions = {
+  /**
+   * The owner's "everything paid through" declaration. A NEW payout for a job completed and
+   * customer-paid at or before this instant is not new debt: it is held for the owner to confirm
+   * as previously settled instead of appearing as Due.
+   */
+  openingCutoff?: Date | null
+}
+
+/** Hold reason prefix for pre-cutoff work first seen after the opening-balance initialization. */
+export const OPENING_REVIEW_PREFIX = "Completed before the previously-paid-through cutoff"
+
+export function isOpeningReviewHold(holdReason: string | null | undefined): boolean {
+  return Boolean(holdReason && holdReason.startsWith(OPENING_REVIEW_PREFIX))
+}
+
+/** True when the job finished and was customer-paid no later than the owner's cutoff. */
+export function completedBeforeCutoff(job: Pick<NormalizedJob, "status" | "fullyPaid" | "lastStatusUpdate">, settings: WorkizSettings, cutoff: Date | null | undefined): boolean {
+  if (!cutoff) return false
+  if (!isPayableStatus(job.status, settings) || !job.fullyPaid) return false
+  return job.lastStatusUpdate != null && job.lastStatusUpdate.getTime() <= cutoff.getTime()
 }
 
 const round2 = (n: number) => Math.round(n * 100) / 100
@@ -222,6 +248,7 @@ export async function upsertPayoutsForJob(
   job: NormalizedJob,
   settings: WorkizSettings,
   source: "rest" | "webhook" = "rest",
+  options: EngineOptions = {},
 ): Promise<EngineResult> {
   const result: EngineResult = {
     jobUuid: job.uuid,
@@ -233,7 +260,9 @@ export async function upsertPayoutsForJob(
     unmappedTeamIds: [],
     payoutIds: [],
     notes: [],
+    sourceChanges: 0,
   }
+  const preCutoff = completedBeforeCutoff(job, settings, options.openingCutoff)
 
   const { profiles: assigned, unmapped, mappingByProfile } = await resolveTeam(job, source)
   result.unmappedTeamIds = unmapped
@@ -308,7 +337,27 @@ export async function upsertPayoutsForJob(
     if (prior && (prior.status === "paid" || prior.status === "void")) {
       result.unchanged++
       result.payoutIds.push(prior.id)
-      if (prior.inputHash !== hash) result.notes.push(`Payout #${prior.id} for ${profile.name} is ${prior.status} but Workiz data changed; left untouched`)
+      if (prior.inputHash !== hash) {
+        // A settled payout is frozen; the difference is recorded once per new fingerprint for review.
+        const recomputed = computeForProfile(segment, profile, computeOpts)
+        const settled = Number(prior.totalPayout)
+        const inserted = await db
+          .insert(payoutSourceChanges)
+          .values({
+            payoutId: prior.id,
+            jobUuid: job.uuid,
+            profileId: profile.id,
+            settledHash: prior.inputHash,
+            newHash: hash,
+            settledAmount: prior.totalPayout,
+            recomputedAmount: recomputed.totalPayout.toFixed(4),
+            summary: `${profile.name} on ${job.serialId ?? job.uuid}: settled ${money(round2(settled))}, Workiz data now computes ${money(round2(recomputed.totalPayout))} (${job.status ?? "?"}, ${job.fullyPaid ? "paid" : "unpaid"})`,
+          })
+          .onConflictDoNothing()
+          .returning({ id: payoutSourceChanges.id })
+        if (inserted.length) result.sourceChanges++
+        result.notes.push(`Payout #${prior.id} for ${profile.name} is ${prior.status} but Workiz data changed; left untouched and flagged for review`)
+      }
       continue
     }
     if (prior && prior.inputHash === hash) {
@@ -339,6 +388,13 @@ export async function upsertPayoutsForJob(
     const cardFeeAdjustment = cardFeeWithheld(breakdown, segment, profile, tipShare)
     let holdReason = baseGate ?? (unmapped.length ? `Job has unmapped team members (${unmapped.join(", ")})` : null)
     if (nothingOwed) holdReason = `${ownership.explanation} Nothing is owed on this row; void it if that is right.`
+    // Work finished and paid before the owner's declaration is not new debt. A row first created
+    // now (late import, newly mapped technician) waits for the owner to confirm it was settled;
+    // a row that already carries that hold keeps it until the owner decides.
+    const openingHold = preCutoff && (!prior || isOpeningReviewHold(prior.holdReason)) && !nothingOwed
+    if (openingHold) {
+      holdReason = `${OPENING_REVIEW_PREFIX} (${options.openingCutoff!.toISOString()}) but first seen afterwards — confirm it was already paid, or release it if it is still owed${holdReason ? `. Also: ${holdReason}` : ""}`
+    }
     const status: PayoutStatus = holdReason ? (isPayableStatus(job.status, settings) ? "hold" : "pending") : "ready"
     if (status === "hold") result.held++
 
@@ -430,8 +486,17 @@ export async function upsertPayoutsForJob(
     }
 
     if (prior) {
-      await db.update(payouts).set(values).where(eq(payouts.id, prior.id))
-      result.updated++
+      // The row was read before this write; if the owner settled it in between, leave it alone.
+      const written = await db
+        .update(payouts)
+        .set(values)
+        .where(and(eq(payouts.id, prior.id), notInArray(payouts.status, ["paid", "void"])))
+        .returning({ id: payouts.id })
+      if (written.length) result.updated++
+      else {
+        result.unchanged++
+        result.notes.push(`Payout #${prior.id} for ${profile.name} was settled while this sync ran; left untouched`)
+      }
       result.payoutIds.push(prior.id)
     } else {
       const inserted = await db.insert(payouts).values(values).returning({ id: payouts.id })

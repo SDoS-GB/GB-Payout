@@ -55,6 +55,30 @@ export type AdminSettings = {
   passwordHash: string | null
 }
 
+/**
+ * Owner payout bookkeeping. `openingCutoffAt` is the owner's "everything up to here was
+ * already paid" declaration; it is set once by the initialization and never moves with a
+ * deployment or a sync.
+ */
+export type PayoutSettings = {
+  /** First business day the app is responsible for (YYYY-MM-DD in the business timezone). */
+  historyStartDate: string
+  /** ISO instant of the owner's all-paid declaration; null until the one-time initialization ran. */
+  openingCutoffAt: string | null
+  openingInitializedAt: string | null
+  openingInitializedBy: string | null
+  /** Opening-balance batches the initialization created, one per technician. */
+  openingBatchIds: number[]
+}
+
+export const DEFAULT_PAYOUT_SETTINGS: PayoutSettings = {
+  historyStartDate: "2026-09-01",
+  openingCutoffAt: null,
+  openingInitializedAt: null,
+  openingInitializedBy: null,
+  openingBatchIds: [],
+}
+
 export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
   apiToken: "",
   apiSecret: "",
@@ -84,6 +108,7 @@ const KEYS = {
   workiz: "workiz",
   notifications: "notifications",
   admin: "admin",
+  payout: "payout",
 } as const
 
 async function readSetting<T>(key: string, fallback: T): Promise<T> {
@@ -138,6 +163,17 @@ export async function saveAdminSettings(patch: Partial<AdminSettings>, updatedBy
   const current = await getAdminSettings()
   const next = { ...current, ...patch }
   await writeSetting(KEYS.admin, next, updatedBy)
+  return next
+}
+
+export async function getPayoutSettings(): Promise<PayoutSettings> {
+  return readSetting(KEYS.payout, DEFAULT_PAYOUT_SETTINGS)
+}
+
+export async function savePayoutSettings(patch: Partial<PayoutSettings>, updatedBy: string | null) {
+  const current = await getPayoutSettings()
+  const next = { ...current, ...patch }
+  await writeSetting(KEYS.payout, next, updatedBy)
   return next
 }
 
