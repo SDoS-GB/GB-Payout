@@ -1,7 +1,6 @@
 "use client"
 
 import { Badge } from "@/components/ui/badge"
-import { describeOwnerState } from "@/lib/notifications/owner-message"
 
 export const money = (v: string | number | null | undefined) => `$${Number(v ?? 0).toFixed(2)}`
 
@@ -72,25 +71,6 @@ export function StatusBadge({ status }: { status: string }) {
   return (
     <Badge variant="outline" className={`capitalize ${STATUS_STYLES[status] ?? ""}`}>
       {status}
-    </Badge>
-  )
-}
-
-const OWNER_TONE_STYLES: Record<ReturnType<typeof describeOwnerState>["tone"], string> = {
-  muted: "bg-muted text-muted-foreground border-border",
-  warn: "bg-warning/15 text-warning-foreground border-warning/50",
-  info: "bg-secondary/25 text-primary border-secondary/60",
-  ok: "bg-primary text-primary-foreground border-primary",
-  error: "bg-destructive/15 text-destructive-foreground border-destructive/50",
-}
-
-/** Job-level owner "payout ready" text state; `null` means the job has not been evaluated yet. */
-export function OwnerTextBadge({ status }: { status: string | null | undefined }) {
-  if (!status) return <span className="text-xs text-muted-foreground">Not evaluated</span>
-  const d = describeOwnerState(status)
-  return (
-    <Badge variant="outline" className={OWNER_TONE_STYLES[d.tone]} title={d.explanation}>
-      {d.label}
     </Badge>
   )
 }

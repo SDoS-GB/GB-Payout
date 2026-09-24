@@ -13,7 +13,7 @@ import {
   workizTeamMappings,
 } from "@/lib/db/schema"
 import { TECH_PAYMENT_METHODS, isoDateInZone, round2, validateBatchForm, type SelectionItem, type StaleItem } from "@/lib/payout/batch-rules"
-import { getBatch, listBatches, recordOpeningBatch, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
+import { getBatch, listBatches, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
 import { isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
 import { confirmPreviouslyPaid, initializeOpeningBalance, previewOpeningBalance } from "@/lib/payout/opening"
 import { listProfiles } from "@/lib/payout/profiles"

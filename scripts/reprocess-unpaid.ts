@@ -1,9 +1,8 @@
 /**
  * One-off: re-run every job that still has an unpaid (pending/hold/ready) payout through the
  * normal deduplicated sync path (`processRawJob`) using live Workiz data, so the saved payouts
- * reflect the current ownership/tip/card rules. Paid and void payouts are never touched by the
- * engine. The "Payout Ready" tag step is disabled for this batch only (settings are not
- * modified) so re-running an already-alerted job does not re-text the admin.
+ * reflect the current ownership/tip/card rules. Settled (paid) and void payouts are never
+ * rewritten by the engine; a settled row whose inputs changed is flagged for review instead.
  *
  * Run from the project root:
  *   set -a && source /vercel/share/.env.project && set +a && pnpm dlx tsx scripts/reprocess-unpaid.ts
@@ -12,8 +11,7 @@
 import { eq, inArray, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { payouts, technicianProfiles, workizJobs } from "@/lib/db/schema"
-import { getWorkizSettings } from "@/lib/settings"
-import { getWorkizClient, loadColorSealCatalog, processRawJob } from "@/lib/workiz/sync"
+import { getWorkizClient, loadSyncContext, processRawJob } from "@/lib/workiz/sync"
 
 const VIA = `reprocess-unpaid-${new Date().toISOString().slice(0, 10)}`
 const dryRun = process.argv.includes("--dry-run")
@@ -66,10 +64,8 @@ async function main() {
   for (const r of before) console.log(`  #${r.serialId} ${r.tech.padEnd(8)} ${r.status.padEnd(7)} $${r.total.padStart(8)} tip $${r.tip.padStart(7)} ${r.segmentKind}${r.provisional ? " provisional" : ""}${r.holdReason ? ` — ${r.holdReason.slice(0, 60)}` : ""}`)
   if (dryRun) return
 
-  const liveSettings = await getWorkizSettings()
-  const settings = { ...liveSettings, payoutReadyTagEnabled: false }
-  const { client } = await getWorkizClient(settings)
-  const catalog = await loadColorSealCatalog()
+  const { client, settings } = await getWorkizClient()
+  const context = await loadSyncContext(settings)
 
   console.log("\nSYNC")
   const failures: Array<{ uuid: string; error: string }> = []
@@ -77,9 +73,9 @@ async function main() {
     try {
       const raw = await client.getJob(uuid)
       if (!raw) throw new Error("not found in Workiz")
-      const result = await processRawJob(raw, "rest", { settings, catalog, client, via: VIA })
+      const result = await processRawJob(raw, "rest", { ...context, via: VIA })
       const e = result.engine
-      console.log(`  #${result.normalized.serialId ?? uuid} ${result.normalized.status ?? "?"} · +${e.created}/~${e.updated}/=${e.unchanged}${e.held ? ` held ${e.held}` : ""} · owner text ${result.owner?.row.status ?? "n/a"}${result.normalized.warnings.length ? ` · ${result.normalized.warnings.length} warning(s)` : ""}`)
+      console.log(`  #${result.normalized.serialId ?? uuid} ${result.normalized.status ?? "?"} · +${e.created}/~${e.updated}/=${e.unchanged}${e.held ? ` held ${e.held}` : ""}${e.sourceChanges ? ` · ${e.sourceChanges} settled row(s) changed` : ""}${result.normalized.warnings.length ? ` · ${result.normalized.warnings.length} warning(s)` : ""}`)
       for (const n of e.notes) console.log(`      note: ${n}`)
       for (const w of result.normalized.warnings) console.log(`      warn: ${w.slice(0, 160)}`)
     } catch (err) {

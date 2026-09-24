@@ -1,7 +1,7 @@
 "use client"
 
-import { useEffect, useState, useTransition } from "react"
-import { AlertTriangle, ExternalLink, Send } from "lucide-react"
+import { useEffect, useState } from "react"
+import { AlertTriangle, ExternalLink } from "lucide-react"
 import type { PayoutRecord, reviewPayout } from "@/app/actions/admin"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
@@ -22,7 +22,7 @@ import {
 } from "@/lib/payout/presentation"
 import type { ManualPaymentEntry } from "@/lib/workiz/payments"
 import { PaymentConfirmationForm } from "./payment-confirmation-form"
-import { InlineMessage, OwnerTextBadge, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
+import { InlineMessage, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
 
 type ReviewAction = Parameters<typeof reviewPayout>[1]
 
@@ -120,7 +120,16 @@ function snapshotMismatches(p: PayoutRecord, snap: Snapshot): string[] {
   return out
 }
 
-export type OwnerSendResult = { tone: "ok" | "error" | "info"; text: string }
+export type SheetHandlers = {
+  onAction: (id: number, action: ReviewAction, note?: string) => void
+  payments: PaymentHandlers
+  /** Pre-cutoff work first seen after the opening balance: settle it as historically paid. */
+  onConfirmPreviouslyPaid: (payoutId: number) => void
+  /** Jump to the Due tab with this technician's card in view. */
+  onGoToDue?: (profileId: number) => void
+  /** Open the batch this payout was settled in. */
+  onOpenBatch?: (batchId: number) => void
+}
 
 export function PayoutDetailSheet({
   record,
@@ -128,52 +137,28 @@ export function PayoutDetailSheet({
   onOpenChange,
   timezone,
   pending,
-  onAction,
-  payments,
-  onSendOwnerText,
+  handlers,
 }: {
   record: PayoutRecord | null
   open: boolean
   onOpenChange: (open: boolean) => void
   timezone: string
   pending: boolean
-  onAction: (id: number, action: ReviewAction, note?: string) => void
-  payments: PaymentHandlers
-  onSendOwnerText: (jobUuid: string, force: boolean) => Promise<OwnerSendResult>
+  handlers: SheetHandlers
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl">
-        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} paymentHandlers={payments} onSendOwnerText={onSendOwnerText} />}
+        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} handlers={handlers} />}
       </SheetContent>
     </Sheet>
   )
 }
 
-function PayoutDetail({
-  p,
-  timezone,
-  pending,
-  onAction,
-  paymentHandlers,
-  onSendOwnerText,
-}: {
-  p: PayoutRecord
-  timezone: string
-  pending: boolean
-  onAction: (id: number, action: ReviewAction, note?: string) => void
-  paymentHandlers: PaymentHandlers
-  onSendOwnerText: (jobUuid: string, force: boolean) => Promise<OwnerSendResult>
-}) {
+function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; timezone: string; pending: boolean; handlers: SheetHandlers }) {
+  const { onAction, payments: paymentHandlers } = handlers
   const [note, setNote] = useState(p.adminNote ?? "")
   useEffect(() => setNote(p.adminNote ?? ""), [p.adminNote])
-  const [ownerPending, startOwner] = useTransition()
-  const [ownerResult, setOwnerResult] = useState<OwnerSendResult | null>(null)
-  const sendOwner = (force: boolean) =>
-    startOwner(async () => {
-      setOwnerResult(null)
-      setOwnerResult(await onSendOwnerText(p.jobUuid, force))
-    })
 
   const job = p.job
   const snap = (p.breakdown ?? {}) as Snapshot
@@ -319,20 +304,27 @@ function PayoutDetail({
           )}
           <Facts
             rows={[
-              ["Technician paid", p.status === "paid" ? `Yes · ${zonedDateTime(p.paidAt, timezone)}${p.paidBy ? ` by ${p.paidBy}` : ""}` : "Not yet"],
               [
-                "Owner payout text (whole job)",
-                <span className="inline-flex flex-wrap items-center gap-2">
-                  <OwnerTextBadge status={p.ownerText?.status} />
-                  {p.ownerText?.sentAt ? <span className="text-xs text-muted-foreground">accepted by Workiz {zonedDateTime(p.ownerText.sentAt, timezone)}</span> : null}
-                  {p.ownerText?.deliveredAt ? <span className="text-xs text-muted-foreground">· received {zonedDateTime(p.ownerText.deliveredAt, timezone)}</span> : null}
-                </span>,
+                "Technician paid",
+                p.status === "paid" ? (
+                  <span className="inline-flex flex-wrap items-center justify-end gap-x-2">
+                    <span>
+                      {p.settledKind === "opening" ? "Yes · previously settled (opening balance)" : `Yes · ${zonedDateTime(p.paidAt, timezone)}${p.paidBy ? ` by ${p.paidBy}` : ""}`}
+                    </span>
+                    {p.batchId != null && handlers.onOpenBatch && (
+                      <button type="button" className="text-primary underline-offset-4 hover:underline" onClick={() => handlers.onOpenBatch?.(p.batchId as number)}>
+                        Payment #{p.batchId}
+                      </button>
+                    )}
+                  </span>
+                ) : (
+                  "Not yet"
+                ),
               ],
               p.adminNote ? ["Admin note", p.adminNote] : null,
               p.reviewedAt ? ["Last reviewed", `${zonedDateTime(p.reviewedAt, timezone)}${p.reviewedBy ? ` by ${p.reviewedBy}` : ""}`] : null,
             ]}
           />
-          <OwnerTextPanel p={p} pending={pending || ownerPending} onSend={sendOwner} result={ownerResult} />
         </Section>
 
         <Section title="Job and customer">
@@ -593,16 +585,33 @@ function PayoutDetail({
         </Section>
 
         <Section title="Review">
+          {p.openingReview && p.status === "hold" && (
+            <div className="flex flex-col gap-2 rounded-md border border-warning/50 bg-warning/10 p-3 text-sm">
+              <p className="font-medium text-warning-foreground">Finished before your opening-balance cutoff</p>
+              <p className="text-muted-foreground">
+                This job was first seen after the opening balance was recorded, but it was completed and paid by the customer before the cutoff. If {p.profileName} was already paid for it, confirm that
+                here and it goes into history as previously settled. If not, release it and it becomes due.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" disabled={pending} onClick={() => handlers.onConfirmPreviouslyPaid(p.id)}>
+                  Confirm previously paid
+                </Button>
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction(p.id, "release", note)}>
+                  Not paid yet · make it due
+                </Button>
+              </div>
+            </div>
+          )}
           <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Admin note (optional)" rows={2} className="text-sm" aria-label="Admin note" />
           <div className="flex flex-wrap gap-2">
-            {p.status !== "ready" && p.status !== "paid" && (
+            {p.status !== "ready" && p.status !== "paid" && !(p.openingReview && p.status === "hold") && (
               <Button size="sm" disabled={pending} onClick={() => onAction(p.id, "release", note)}>
                 Release
               </Button>
             )}
-            {p.status === "ready" && (
-              <Button size="sm" disabled={pending} onClick={() => onAction(p.id, "mark-paid", note)}>
-                Mark paid
+            {p.status === "ready" && handlers.onGoToDue && (
+              <Button size="sm" disabled={pending} onClick={() => handlers.onGoToDue?.(p.profileId)}>
+                Pay from Due
               </Button>
             )}
             {p.status !== "hold" && p.status !== "paid" && (
@@ -610,7 +619,7 @@ function PayoutDetail({
                 Hold
               </Button>
             )}
-            {p.status === "paid" && (
+            {p.status === "paid" && p.batchId == null && (
               <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction(p.id, "reopen", note)}>
                 Reopen
               </Button>
@@ -621,7 +630,8 @@ function PayoutDetail({
               </Button>
             )}
           </div>
-          {p.status !== "ready" && <InlineMessage tone="info">Mark paid is only available once this payout is Ready.</InlineMessage>}
+          {p.status === "ready" && <InlineMessage tone="info">Payments are recorded per technician from the Due tab, so the amount you pay always matches what the app owes.</InlineMessage>}
+          {p.status === "paid" && p.batchId != null && <InlineMessage tone="info">Settled in a recorded payment. To take it back, undo that payment from Paid history; the payout returns to Due or Waiting on its own.</InlineMessage>}
         </Section>
       </div>
     </div>
@@ -639,54 +649,6 @@ function Section({ title, hint, children }: { title: string; hint?: string; chil
       <Separator className="mt-1" />
     </section>
   )
-}
-
-/**
- * The job-level owner text as it stands, with the one button that pushes it to Workiz now.
- * The server re-evaluates eligibility before sending, so the button is always safe to press.
- */
-function OwnerTextPanel({ p, pending, onSend, result }: { p: PayoutRecord; pending: boolean; onSend: (force: boolean) => void; result: OwnerSendResult | null }) {
-  const t = p.ownerText
-  const accepted = t?.status === "provider_accepted" || t?.status === "delivered"
-  const stale = Boolean(t?.sentSnapshotHash && t?.snapshotHash && t.sentSnapshotHash !== t.snapshotHash)
-  const reason = t && !accepted ? t.blockReason : null
-  return (
-    <div className="flex flex-col gap-2 rounded border bg-muted/40 p-2">
-      <div className="flex flex-wrap items-start justify-between gap-2">
-        <p className="text-xs text-muted-foreground">
-          {t ? describeState(t.status) : "This job has not been evaluated for the owner text yet; syncing it will do that."}
-          {reason ? ` ${reason}.` : ""}
-          {t?.status === "failed" && t.lastError ? ` Last error: ${t.lastError}` : ""}
-          {stale ? " The payouts changed after the text went out; re-send to update the owner." : ""}
-        </p>
-        <Button size="sm" variant={accepted && !stale ? "outline" : "default"} disabled={pending} onClick={() => onSend(accepted)}>
-          <Send className="h-4 w-4" />
-          {accepted ? "Re-send payout to owner" : "Send payout to owner"}
-        </Button>
-      </div>
-      {t?.message ? <pre className="overflow-x-auto whitespace-pre-wrap font-mono text-xs leading-relaxed">{t.message}</pre> : null}
-      {result && <InlineMessage tone={result.tone}>{result.text}</InlineMessage>}
-    </div>
-  )
-}
-
-function describeState(status: string): string {
-  switch (status) {
-    case "provider_accepted":
-      return "Workiz accepted the tag and payout summary; your Workiz automation sends the SMS."
-    case "delivered":
-      return "The owner confirmed receiving this text."
-    case "queued":
-      return "Eligible; it goes out on the next webhook, cron run, or when you send it now."
-    case "sending":
-      return "A delivery attempt is in progress."
-    case "failed":
-      return "Workiz rejected or timed out; the cron retries on a back-off schedule."
-    case "preview_only":
-      return "Owner texts are switched off, so this message is stored but not sent."
-    default:
-      return "Not eligible yet."
-  }
 }
 
 function Facts({ rows }: { rows: Array<[string, React.ReactNode] | null> }) {

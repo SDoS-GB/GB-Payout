@@ -3,12 +3,11 @@
 import { useEffect, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
 import useSWR, { SWRConfig, unstable_serialize, useSWRConfig } from "swr"
-import { ChevronLeft, ChevronRight, RefreshCw, Search, X } from "lucide-react"
+import { ChevronLeft, ChevronRight, Search, X } from "lucide-react"
 import type { PayoutPage, PayoutRecord, AdminDashboardData } from "@/app/actions/admin"
-import { bulkMarkPaid, clearConfirmedPayments, confirmJobPayments, queryPayouts, reviewPayout, runReconcile, sendPayoutToOwner, syncSingleJob } from "@/app/actions/admin"
+import { clearConfirmedPayments, confirmJobPayments, confirmPreviouslyPaidPayouts, queryPayouts, reviewPayout, syncSingleJob } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
-import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
@@ -16,15 +15,15 @@ import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@
 import { segmentLabel } from "@/lib/payout/segments"
 import { DEFAULT_PAYOUT_QUERY, PAYOUT_STATUS_FILTERS, paymentMethodsSummary, type PayoutQuery, type PayoutStatusFilter } from "@/lib/payout/presentation"
 import { PayoutDetailSheet } from "./payout-detail-sheet"
-import { InlineMessage, OwnerTextBadge, StatusBadge, money, zonedDate } from "./shared"
+import { InlineMessage, StatusBadge, money, zonedDate } from "./shared"
 
 type Profile = AdminDashboardData["profiles"][number]
 
 const STATUS_LABELS: Record<PayoutStatusFilter, string> = {
   all: "All statuses",
-  ready: "Ready to pay",
-  hold: "On hold",
-  pending: "Pending",
+  ready: "Due",
+  hold: "Needs review",
+  pending: "Waiting",
   paid: "Paid",
   void: "Void",
 }
@@ -33,17 +32,19 @@ const payoutKey = (q: PayoutQuery) => ["payouts", q.status, q.profileId, q.searc
 const isPayoutKey = (k: unknown): boolean => Array.isArray(k) && k[0] === "payouts"
 
 type Props = {
-  initialPage: PayoutPage
+  initialPage: PayoutPage | null
   profiles: Profile[]
   query: PayoutQuery
   onQueryChange: (next: PayoutQuery | ((q: PayoutQuery) => PayoutQuery)) => void
   focusToken: number
   timezone: string
+  onGoToDue: (profileId: number) => void
+  onOpenBatch: (batchId: number) => void
 }
 
 export function PayoutsTab(props: Props) {
   return (
-    <SWRConfig value={{ fallback: { [unstable_serialize(payoutKey(DEFAULT_PAYOUT_QUERY))]: props.initialPage }, revalidateOnFocus: false }}>
+    <SWRConfig value={{ fallback: props.initialPage ? { [unstable_serialize(payoutKey(DEFAULT_PAYOUT_QUERY))]: props.initialPage } : {}, revalidateOnFocus: false }}>
       <PayoutsTabInner {...props} />
     </SWRConfig>
   )
@@ -57,11 +58,10 @@ export function payoutAmountLabel(p: Pick<PayoutRecord, "jobTotal" | "totalPayou
   return { text: money(total), provisional: p.status === "pending" || p.status === "hold", unavailable: false }
 }
 
-function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone }: Props) {
+function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone, onGoToDue, onOpenBatch }: Props) {
   const router = useRouter()
   const { mutate: mutateAll } = useSWRConfig()
   const [pending, startTransition] = useTransition()
-  const [selected, setSelected] = useState<Set<number>>(new Set())
   const [openId, setOpenId] = useState<number | null>(null)
   const [message, setMessage] = useState<{ tone: "ok" | "error" | "info"; text: string } | null>(null)
   const [uuid, setUuid] = useState("")
@@ -98,14 +98,10 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
     return () => clearTimeout(t)
   }, [searchDraft, query.search, onQueryChange])
 
-  // Drop stale selections when rows leave the page.
+  // Close the panel when its row leaves the page.
   useEffect(() => {
     if (!data) return
     const ids = new Set(data.items.map((i) => i.id))
-    setSelected((prev) => {
-      const next = new Set(Array.from(prev).filter((id) => ids.has(id)))
-      return next.size === prev.size ? prev : next
-    })
     if (openId != null && !ids.has(openId)) setOpenId(null)
   }, [data, openId])
 
@@ -113,15 +109,6 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
     await mutateAll(isPayoutKey, undefined, { revalidate: false })
     await mutate()
     router.refresh()
-  }
-
-  const readyVisible = items.filter((p) => p.status === "ready")
-  const allReadySelected = readyVisible.length > 0 && readyVisible.every((p) => selected.has(p.id))
-  const toggleAll = () => {
-    const next = new Set(selected)
-    if (allReadySelected) readyVisible.forEach((p) => next.delete(p.id))
-    else readyVisible.forEach((p) => next.add(p.id))
-    setSelected(next)
   }
 
   const act = (fn: () => Promise<{ ok: boolean; error?: string; data?: unknown }>, okText: string) =>
@@ -133,11 +120,9 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
         return
       }
       setMessage({ tone: "ok", text: okText })
-      setSelected(new Set())
       await refreshAll()
     })
 
-  const selectedTotal = items.filter((p) => selected.has(p.id)).reduce((s, p) => s + Number(p.totalPayout), 0)
   const filtered = query.status !== "all" || query.profileId != null || query.search !== ""
   const selectedProfile = query.profileId != null ? profiles.find((p) => p.id === query.profileId) ?? null : null
   const openRecord = openId != null ? items.find((i) => i.id === openId) ?? null : null
@@ -147,13 +132,13 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
     const who = selectedProfile ? ` for ${selectedProfile.name}` : ""
     switch (query.status) {
       case "ready":
-        return { title: `Nothing is ready to pay${who}`, body: "A payout becomes ready once the Workiz job is in a payable status, the customer has paid in full, and every team member on the job is mapped." }
+        return { title: `Nothing is due${who}`, body: "A payout becomes due once the Workiz job is finished, the customer has paid in full, and every team member on the job is mapped. Pay it from the Due tab." }
       case "hold":
-        return { title: `Nothing is on hold${who}`, body: "Payouts land here when a finished, paid job still needs review, for example an unmapped team member or a line-item marker problem." }
+        return { title: `Nothing needs review${who}`, body: "Payouts land here when a finished, paid job still needs a decision: an unknown payment method, an unmapped team member, or pre-cutoff work seen after the opening balance." }
       case "pending":
-        return { title: `No pending payouts${who}`, body: "Pending payouts are jobs that are not finished or not fully paid yet. Their amounts are provisional." }
+        return { title: `Nothing is waiting${who}`, body: "Waiting payouts are jobs that are not finished or not fully paid by the customer yet. Their amounts are provisional." }
       case "paid":
-        return { title: `No paid payouts${who}`, body: "Payouts you mark as paid will be listed here with the paid date." }
+        return { title: `No paid payouts${who}`, body: "Payouts settled from the Due tab are listed here, each linked to the payment it was part of." }
       case "void":
         return { title: `No voided payouts${who}`, body: "Voided payouts are excluded from every total." }
       default:
@@ -165,66 +150,13 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
 
   return (
     <div className="flex flex-col gap-4">
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Sync</CardTitle>
-          <CardDescription>Pull recent jobs from Workiz or re-process a single job by UUID. Paid and voided payouts are never changed by a sync.</CardDescription>
-        </CardHeader>
-        <CardContent className="flex flex-col gap-3">
-          <div className="flex flex-wrap items-center gap-2">
-            <Button
-              size="sm"
-              variant="outline"
-              disabled={pending}
-              onClick={() =>
-                startTransition(async () => {
-                  setMessage(null)
-                  const res = await runReconcile()
-                  if (!res.ok) return setMessage({ tone: "error", text: res.error })
-                  const d = res.data!
-                  setMessage({
-                    tone: d.failed ? "info" : "ok",
-                    text: `Scanned ${d.scanned} jobs since ${d.startDate}: ${d.created} new payouts, ${d.updated} updated, ${d.held} held${d.failed ? `, ${d.failed} failed` : ""}${d.unmappedTeamIds.length ? `. Unmapped team ids: ${d.unmappedTeamIds.join(", ")}` : ""}`,
-                  })
-                  await refreshAll()
-                })
-              }
-            >
-              <RefreshCw className={`h-4 w-4 ${pending ? "animate-spin" : ""}`} />
-              Reconcile recent jobs
-            </Button>
-            <form
-              className="flex flex-1 items-center gap-2"
-              onSubmit={(e) => {
-                e.preventDefault()
-                startTransition(async () => {
-                  setMessage(null)
-                  const res = await syncSingleJob(uuid)
-                  if (!res.ok) return setMessage({ tone: "error", text: res.error })
-                  const d = res.data!
-                  setMessage({ tone: "ok", text: `Job ${uuid} (${d.status ?? "?"}): ${d.created} new, ${d.updated} updated, ${d.held} held.${d.notes.length ? ` ${d.notes.join(" · ")}` : ""}` })
-                  setUuid("")
-                  await refreshAll()
-                })
-              }}
-            >
-              <Input placeholder="Workiz job UUID" value={uuid} onChange={(e) => setUuid(e.target.value)} className="max-w-xs" aria-label="Workiz job UUID" />
-              <Button size="sm" type="submit" variant="secondary" disabled={pending || !uuid.trim()}>
-                Sync job
-              </Button>
-            </form>
-          </div>
-          {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
-        </CardContent>
-      </Card>
-
       <div ref={listRef} className="scroll-mt-4">
         <Card>
           <CardHeader className="pb-3">
             <div className="flex flex-col gap-3">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="flex flex-col gap-1">
-                  <CardTitle className="text-base">Payout history</CardTitle>
+                  <CardTitle className="text-base">Every payout</CardTitle>
                   <CardDescription aria-live="polite">
                     {isLoading && !data
                       ? "Loading payouts…"
@@ -234,7 +166,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                     {" · "}one record per technician; a shared job appears once per technician
                   </CardDescription>
                   {(query.status === "pending" || query.status === "hold") && (
-                    <p className="text-xs text-warning-foreground">Amounts in this view are provisional, not ready to pay.</p>
+                    <p className="text-xs text-warning-foreground">Amounts in this view are provisional, not due yet.</p>
                   )}
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
@@ -244,15 +176,29 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                       All payouts
                     </Button>
                   )}
-                  <Button
-                    size="sm"
-                    disabled={pending || selected.size === 0}
-                    onClick={() => act(() => bulkMarkPaid(Array.from(selected)), `Marked ${selected.size} payouts as paid (${money(selectedTotal)})`)}
+                  <form
+                    className="flex items-center gap-2"
+                    onSubmit={(e) => {
+                      e.preventDefault()
+                      startTransition(async () => {
+                        setMessage(null)
+                        const res = await syncSingleJob(uuid)
+                        if (!res.ok) return setMessage({ tone: "error", text: res.error })
+                        const d = res.data!
+                        setMessage({ tone: "ok", text: `Job ${uuid} (${d.status ?? "?"}): ${d.created} new, ${d.updated} updated, ${d.held} held.${d.notes.length ? ` ${d.notes.join(" · ")}` : ""}` })
+                        setUuid("")
+                        await refreshAll()
+                      })
+                    }}
                   >
-                    Mark {selected.size || ""} paid{selected.size ? ` · ${money(selectedTotal)}` : ""}
-                  </Button>
+                    <Input placeholder="Re-sync a job by Workiz UUID" value={uuid} onChange={(e) => setUuid(e.target.value)} className="h-8 w-56" aria-label="Workiz job UUID" />
+                    <Button size="sm" type="submit" variant="secondary" disabled={pending || !uuid.trim()}>
+                      Sync job
+                    </Button>
+                  </form>
                 </div>
               </div>
+              {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
 
               <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_12rem]">
                 <div className="flex flex-col gap-1">
@@ -312,9 +258,6 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
               <Table>
                 <TableHeader>
                   <TableRow>
-                    <TableHead className="w-10">
-                      <Checkbox checked={allReadySelected} onCheckedChange={toggleAll} aria-label="Select all ready payouts on this page" disabled={readyVisible.length === 0} />
-                    </TableHead>
                     <TableHead>Job</TableHead>
                     <TableHead>Customer</TableHead>
                     <TableHead>Technician</TableHead>
@@ -322,7 +265,6 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                     <TableHead>Status / reason</TableHead>
                     <TableHead>Completed</TableHead>
                     <TableHead>Customer paid by</TableHead>
-                    <TableHead>Owner text</TableHead>
                     <TableHead className="w-8">
                       <span className="sr-only">Open details</span>
                     </TableHead>
@@ -331,7 +273,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                 <TableBody>
                   {items.length === 0 && !isLoading && (
                     <TableRow>
-                      <TableCell colSpan={10} className="whitespace-normal py-12 text-center">
+                      <TableCell colSpan={8} className="whitespace-normal py-12 text-center">
                         <div className="mx-auto flex max-w-md flex-col gap-2">
                           <p className="text-sm font-medium">{emptyState().title}</p>
                           <p className="text-sm text-muted-foreground">{emptyState().body}</p>
@@ -348,26 +290,13 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
                   )}
                   {items.length === 0 && isLoading && (
                     <TableRow>
-                      <TableCell colSpan={10} className="py-12 text-center text-sm text-muted-foreground">
+                      <TableCell colSpan={8} className="py-12 text-center text-sm text-muted-foreground">
                         Loading payouts…
                       </TableCell>
                     </TableRow>
                   )}
                   {items.map((p) => (
-                    <PayoutRow
-                      key={p.id}
-                      p={p}
-                      timezone={timezone}
-                      open={openId === p.id}
-                      onOpen={() => setOpenId(p.id)}
-                      checked={selected.has(p.id)}
-                      onCheck={(v) => {
-                        const next = new Set(selected)
-                        if (v) next.add(p.id)
-                        else next.delete(p.id)
-                        setSelected(next)
-                      }}
-                    />
+                    <PayoutRow key={p.id} p={p} timezone={timezone} open={openId === p.id} onOpen={() => setOpenId(p.id)} />
                   ))}
                 </TableBody>
               </Table>
@@ -420,38 +349,22 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone 
         }}
         timezone={timezone}
         pending={pending}
-        onAction={(id, action, note) => act(() => reviewPayout(id, action, note), `Payout #${id}: ${action.replace("-", " ")}`)}
-        payments={{
-          onConfirmPayments: (jobUuid, entries) => act(() => confirmJobPayments(jobUuid, entries), "Payments confirmed and job re-synced"),
-          onClearPayments: (jobUuid) => act(() => clearConfirmedPayments(jobUuid), "Payment confirmation cleared and job re-synced"),
-        }}
-        onSendOwnerText={async (jobUuid, force) => {
-          const res = await sendPayoutToOwner(jobUuid, force)
-          if (!res.ok) return { tone: "error", text: res.error }
-          const d = res.data!
-          await refreshAll()
-          return { tone: d.outcome === "provider_accepted" ? "ok" : d.outcome === "failed" ? "error" : "info", text: d.detail }
+        handlers={{
+          onAction: (id, action, note) => act(() => reviewPayout(id, action, note), `Payout #${id}: ${action}`),
+          payments: {
+            onConfirmPayments: (jobUuid, entries) => act(() => confirmJobPayments(jobUuid, entries), "Payments confirmed and job re-synced"),
+            onClearPayments: (jobUuid) => act(() => clearConfirmedPayments(jobUuid), "Payment confirmation cleared and job re-synced"),
+          },
+          onConfirmPreviouslyPaid: (id) => act(() => confirmPreviouslyPaidPayouts([id]), `Payout #${id} recorded as previously paid`),
+          onGoToDue,
+          onOpenBatch,
         }}
       />
     </div>
   )
 }
 
-function PayoutRow({
-  p,
-  timezone,
-  open,
-  onOpen,
-  checked,
-  onCheck,
-}: {
-  p: PayoutRecord
-  timezone: string
-  open: boolean
-  onOpen: () => void
-  checked: boolean
-  onCheck: (v: boolean) => void
-}) {
+function PayoutRow({ p, timezone, open, onOpen }: { p: PayoutRecord; timezone: string; open: boolean; onOpen: () => void }) {
   const b = (p.breakdown ?? {}) as Record<string, unknown>
   const jobWide = (b.job ?? null) as { markers?: string[] } | null
   const ownership = (b.ownership ?? null) as { reason?: string; workType?: string | null } | null
@@ -467,9 +380,6 @@ function PayoutRow({
       data-state={open ? "selected" : undefined}
       aria-selected={open}
     >
-      <TableCell onClick={(e) => e.stopPropagation()}>
-        <Checkbox checked={checked} onCheckedChange={(v) => onCheck(Boolean(v))} disabled={p.status !== "ready"} aria-label={`Select payout ${p.id}`} />
-      </TableCell>
       <TableCell>
         <button
           type="button"
@@ -517,9 +427,6 @@ function PayoutRow({
       <TableCell className="text-xs">
         <span className={methods.count === 0 ? "text-muted-foreground" : ""}>{methods.label}</span>
         {methods.mixed && <span className="ml-1 rounded bg-muted px-1 py-0.5 text-[10px] uppercase text-muted-foreground">Mixed</span>}
-      </TableCell>
-      <TableCell>
-        <OwnerTextBadge status={p.ownerText?.status} />
       </TableCell>
       <TableCell className="text-muted-foreground">
         <ChevronRight className="h-4 w-4" aria-hidden="true" />
