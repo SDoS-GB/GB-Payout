@@ -10,23 +10,27 @@ import { Button } from "@/components/ui/button"
 import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs"
 import { Badge } from "@/components/ui/badge"
 import { DEFAULT_PAYOUT_QUERY, type PayoutQuery } from "@/lib/payout/presentation"
+import { DueTab } from "./due-tab"
+import { PaidHistoryTab } from "./paid-history-tab"
 import { PayoutsTab } from "./payouts-tab"
+import { SyncStatusStrip } from "./sync-status-strip"
 import { WorkizSettingsTab } from "./workiz-settings-tab"
 import { TeamMappingTab } from "./team-mapping-tab"
 import { ProfilesTab } from "./profiles-tab"
-import { OwnerTextsTab } from "./owner-texts-tab"
 import { ActivityTab } from "./activity-tab"
 import { money } from "./shared"
 
-type CardKey = "ready" | "hold" | "pending" | "unmapped"
+type CardKey = "due" | "hold" | "pending" | "unmapped"
 
 export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: AdminDashboardData; webhookUrl: string; cronConfigured: boolean }) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
-  const [tab, setTab] = useState("payouts")
+  const [tab, setTab] = useState("due")
   const [payoutQuery, setPayoutQuery] = useState<PayoutQuery>(DEFAULT_PAYOUT_QUERY)
   const [teamView, setTeamView] = useState<"all" | "unmapped">("all")
   const [focusToken, setFocusToken] = useState(0)
+  const [dueFocus, setDueFocus] = useState<number | null>(null)
+  const [openBatchId, setOpenBatchId] = useState<number | null>(null)
 
   const signOut = () =>
     startTransition(async () => {
@@ -36,51 +40,68 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
     })
 
   const unmappedPeople = data.mappings.filter((m) => m.profileId == null && !m.excluded)
-  // Failed texts and webhook payloads the app could not attach to a job both need a human look.
-  const ownerAttention = data.ownerTexts.rows.filter((r) => r.status === "failed").length + (data.ownerTexts.webhookCounts.unresolved ?? 0) + (data.ownerTexts.webhookCounts.failed ?? 0)
-  const selectedProfile = payoutQuery.profileId != null ? data.profiles.find((p) => p.id === payoutQuery.profileId) ?? null : null
+  const dueTotal = data.due.technicians.reduce((cents, t) => cents + Math.round(t.total * 100), 0) / 100
+  const dueCount = data.due.technicians.reduce((n, t) => n + t.count, 0)
+  const attention = data.sourceChanges.length + (data.opening.openingInitializedAt ? 0 : 1)
 
   // Individual payout-record counts from the same table + status definitions the list queries.
   const counts = useMemo(() => {
-    const scoped = data.statusCounts.filter((c) => payoutQuery.profileId == null || c.profileId === payoutQuery.profileId)
-    const sum = (status: string, field: "count" | "total") => scoped.filter((c) => c.status === status).reduce((s, c) => s + c[field], 0)
-    return {
-      ready: sum("ready", "count"),
-      readyTotal: sum("ready", "total"),
-      hold: sum("hold", "count"),
-      pending: sum("pending", "count"),
-    }
-  }, [data.statusCounts, payoutQuery.profileId])
+    const sum = (status: string) => data.statusCounts.filter((c) => c.status === status).reduce((s, c) => s + c.count, 0)
+    return { hold: sum("hold"), pending: sum("pending") }
+  }, [data.statusCounts])
+
+  const focus = () => setFocusToken((t) => t + 1)
 
   const openCard = (card: CardKey) => {
     if (card === "unmapped") {
       setTeamView("unmapped")
       setTab("team")
+    } else if (card === "due") {
+      setDueFocus(null)
+      setTab("due")
     } else {
-      // Keep the technician scope (the cards reflect it) but drop search/paging so the list count equals the card.
-      setPayoutQuery((q) => ({ ...q, status: card, search: "", page: 1 }))
+      setPayoutQuery((q) => ({ ...q, status: card, profileId: null, search: "", page: 1 }))
       setTab("payouts")
     }
-    setFocusToken((t) => t + 1)
+    focus()
+  }
+
+  const goToDue = (profileId: number) => {
+    setDueFocus(profileId)
+    setTab("due")
+    focus()
+  }
+
+  const openBatch = (batchId: number) => {
+    setOpenBatchId(batchId > 0 ? batchId : null)
+    setTab("history")
+    focus()
+  }
+
+  const openReview = (status: "hold" | "pending") => {
+    setPayoutQuery((q) => ({ ...q, status, profileId: null, search: "", page: 1 }))
+    setTab("payouts")
+    focus()
   }
 
   const selectedCard: CardKey | null =
-    tab === "team" && teamView === "unmapped"
-      ? "unmapped"
-      : tab === "payouts" && payoutQuery.search === "" && (payoutQuery.status === "ready" || payoutQuery.status === "hold" || payoutQuery.status === "pending")
-        ? payoutQuery.status
-        : null
+    tab === "due"
+      ? "due"
+      : tab === "team" && teamView === "unmapped"
+        ? "unmapped"
+        : tab === "payouts" && payoutQuery.search === "" && (payoutQuery.status === "hold" || payoutQuery.status === "pending")
+          ? payoutQuery.status
+          : null
 
   const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`
-  const scopeSuffix = selectedProfile ? ` for ${selectedProfile.name}` : ""
 
   return (
     <main className="min-h-screen bg-background">
       <header className="border-b bg-card">
         <div className="mx-auto flex max-w-6xl flex-wrap items-center justify-between gap-4 px-4 py-4">
           <div className="flex flex-col gap-1">
-            <h1 className="text-xl font-semibold tracking-tight">Payout automation</h1>
-            <p className="text-sm text-muted-foreground">Workiz jobs → technician payouts</p>
+            <h1 className="text-xl font-semibold tracking-tight">Technician payouts</h1>
+            <p className="text-sm text-muted-foreground">What each technician is owed from finished, paid Workiz jobs</p>
           </div>
           <div className="flex items-center gap-2">
             <Button asChild variant="outline" size="sm">
@@ -98,44 +119,40 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
       </header>
 
       <div className="mx-auto flex max-w-6xl flex-col gap-6 px-4 py-6">
+        <SyncStatusStrip initial={data.sync} timezone={data.workiz.businessTimezone} onOpenWorkizTab={() => setTab("workiz")} />
+
         <section aria-label="Summary" className="grid grid-cols-2 gap-3 md:grid-cols-4">
           <SummaryCard
-            label="Ready to pay"
-            value={counts.ready}
-            hint={
-              selectedProfile
-                ? `${money(counts.readyTotal)} owed to ${selectedProfile.name}`
-                : counts.ready
-                  ? `${plural(counts.ready, "individual payout")} · pick a technician for their total`
-                  : "Nothing ready yet"
-            }
+            label="Due now"
+            value={money(dueTotal)}
+            hint={dueCount ? `${plural(dueCount, "job")} across ${plural(data.due.technicians.length, "technician")}` : "Nobody is owed anything"}
             tone="primary"
-            selected={selectedCard === "ready"}
-            onClick={() => openCard("ready")}
-            description={`Open ready, unpaid payouts${scopeSuffix}`}
+            selected={selectedCard === "due"}
+            onClick={() => openCard("due")}
+            description="Open what is due per technician"
           />
           <SummaryCard
-            label="On hold"
-            value={counts.hold}
-            hint={counts.hold ? "Needs review · open to see why" : "Nothing needs review"}
+            label="Needs your call"
+            value={String(counts.hold)}
+            hint={counts.hold ? "Payment method, tip split or discount to confirm" : "Nothing to decide"}
             tone={counts.hold ? "warn" : "muted"}
             selected={selectedCard === "hold"}
             onClick={() => openCard("hold")}
-            description={`Open payouts on hold${scopeSuffix}`}
+            description="Open payouts on hold"
           />
           <SummaryCard
-            label="Pending"
-            value={counts.pending}
-            hint={counts.pending ? "Job not finished or not paid · provisional" : "No pending payouts"}
+            label="Waiting"
+            value={String(counts.pending)}
+            hint={counts.pending ? "Job not finished or customer not paid yet" : "Nothing waiting"}
             tone="muted"
             selected={selectedCard === "pending"}
             onClick={() => openCard("pending")}
-            description={`Open pending payouts${scopeSuffix}`}
+            description="Open pending payouts"
           />
           <SummaryCard
             label="Unmapped team ids"
-            value={unmappedPeople.length}
-            hint={unmappedPeople.length ? `${plural(unmappedPeople.length, "person")} to link` : "All mapped"}
+            value={String(unmappedPeople.length)}
+            hint={unmappedPeople.length ? `${plural(unmappedPeople.length, "person")} to link before their jobs can pay` : "All mapped"}
             tone={unmappedPeople.length ? "warn" : "muted"}
             selected={selectedCard === "unmapped"}
             onClick={() => openCard("unmapped")}
@@ -145,7 +162,16 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
 
         <Tabs value={tab} onValueChange={setTab} className="flex flex-col gap-4">
           <TabsList className="flex h-auto w-full flex-wrap justify-start">
-            <TabsTrigger value="payouts">Payouts</TabsTrigger>
+            <TabsTrigger value="due">
+              Due
+              {attention > 0 && (
+                <Badge variant="secondary" className="ml-2">
+                  {attention}
+                </Badge>
+              )}
+            </TabsTrigger>
+            <TabsTrigger value="payouts">All payouts</TabsTrigger>
+            <TabsTrigger value="history">Paid history</TabsTrigger>
             <TabsTrigger value="team">
               Team mapping
               {unmappedPeople.length > 0 && (
@@ -155,27 +181,38 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
               )}
             </TabsTrigger>
             <TabsTrigger value="profiles">Technicians</TabsTrigger>
-            <TabsTrigger value="notifications">
-              Owner texts
-              {ownerAttention > 0 && (
-                <Badge variant="secondary" className="ml-2">
-                  {ownerAttention}
-                </Badge>
-              )}
-            </TabsTrigger>
             <TabsTrigger value="workiz">Workiz</TabsTrigger>
             <TabsTrigger value="activity">Activity</TabsTrigger>
           </TabsList>
 
+          <TabsContent value="due">
+            <DueTab
+              due={data.due}
+              waiting={data.waiting}
+              sourceChanges={data.sourceChanges}
+              opening={data.opening}
+              paymentMethods={data.paymentMethods}
+              timezone={data.workiz.businessTimezone}
+              focusProfileId={dueFocus}
+              focusToken={tab === "due" ? focusToken : 0}
+              onOpenReview={openReview}
+              onOpenBatch={openBatch}
+            />
+          </TabsContent>
           <TabsContent value="payouts">
             <PayoutsTab
-              initialPage={data.payoutPage}
+              initialPage={null}
               profiles={data.profiles}
               query={payoutQuery}
               onQueryChange={setPayoutQuery}
               focusToken={tab === "payouts" ? focusToken : 0}
               timezone={data.workiz.businessTimezone}
+              onGoToDue={goToDue}
+              onOpenBatch={openBatch}
             />
+          </TabsContent>
+          <TabsContent value="history">
+            <PaidHistoryTab batches={data.batches} legacyPaid={data.legacyPaid} profiles={data.profiles} timezone={data.workiz.businessTimezone} openBatchId={openBatchId} focusToken={tab === "history" ? focusToken : 0} />
           </TabsContent>
           <TabsContent value="team">
             <TeamMappingTab
@@ -191,9 +228,6 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
           </TabsContent>
           <TabsContent value="profiles">
             <ProfilesTab profiles={data.profiles} />
-          </TabsContent>
-          <TabsContent value="notifications">
-            <OwnerTextsTab data={data.ownerTexts} lastWebhook={data.workiz.lastWebhook} timezone={data.workiz.businessTimezone} onOpenWorkizTab={() => setTab("workiz")} />
           </TabsContent>
           <TabsContent value="workiz">
             <WorkizSettingsTab workiz={data.workiz} catalog={data.catalog} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />
@@ -217,7 +251,7 @@ function SummaryCard({
   description,
 }: {
   label: string
-  value: number
+  value: string
   hint: string
   tone: "primary" | "warn" | "muted"
   selected: boolean
