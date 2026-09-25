@@ -34,17 +34,49 @@ export type WorkizSettings = {
   payoutReadyTag: string
 }
 
+/**
+ * Who the owner "payout ready" text goes to. The SMS itself is sent by the owner's Workiz
+ * automation ("tag added → send text to team member"), so this records WHICH Workiz team
+ * member that automation targets — for diagnostics and the masked display — it does not
+ * address the message. Missing = configuration blocker.
+ */
+export type OwnerRecipient = {
+  workizTeamId: string
+  name: string
+  /** Last digits of the Workiz team member's phone, e.g. "•••• 1234"; never the full number. */
+  phoneMasked: string | null
+}
+
 export type NotificationSettings = {
-  /** When false, messages are rendered and stored but never sent anywhere. */
-  sendEnabled: boolean
-  /** Delivery channel for technician messages. */
-  channel: "workiz_note" | "none"
-  /** Template with {{placeholders}}; see lib/notifications/template.ts. */
-  template: string
+  ownerRecipient: OwnerRecipient | null
 }
 
 export type AdminSettings = {
   passwordHash: string | null
+}
+
+/**
+ * Owner payout bookkeeping. `openingCutoffAt` is the owner's "everything up to here was
+ * already paid" declaration; it is set once by the initialization and never moves with a
+ * deployment or a sync.
+ */
+export type PayoutSettings = {
+  /** First business day the app is responsible for (YYYY-MM-DD in the business timezone). */
+  historyStartDate: string
+  /** ISO instant of the owner's all-paid declaration; null until the one-time initialization ran. */
+  openingCutoffAt: string | null
+  openingInitializedAt: string | null
+  openingInitializedBy: string | null
+  /** Opening-balance batches the initialization created, one per technician. */
+  openingBatchIds: number[]
+}
+
+export const DEFAULT_PAYOUT_SETTINGS: PayoutSettings = {
+  historyStartDate: "2026-09-01",
+  openingCutoffAt: null,
+  openingInitializedAt: null,
+  openingInitializedBy: null,
+  openingBatchIds: [],
 }
 
 export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
@@ -62,19 +94,21 @@ export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
 }
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
-  sendEnabled: false,
-  channel: "workiz_note",
-  template: [
-    "Hi {{technician}}, your payout for job #{{jobSerial}} ({{clientName}}) is {{totalPayout}}.",
-    "Job total {{jobTotal}}{{segmentLine}}{{discountLine}}{{colorSealLine}}{{tipLine}}.",
-    "Base {{basePayout}} + tip {{tipPayout}}. Status: {{status}}.",
-  ].join(" "),
+  ownerRecipient: null,
+}
+
+/** "•••• 1234" from any phone formatting; null when there is nothing to mask. */
+export function maskPhone(phone: string | null | undefined): string | null {
+  const digits = (phone ?? "").replace(/\D/g, "")
+  if (digits.length < 4) return null
+  return `•••• ${digits.slice(-4)}`
 }
 
 const KEYS = {
   workiz: "workiz",
   notifications: "notifications",
   admin: "admin",
+  payout: "payout",
 } as const
 
 async function readSetting<T>(key: string, fallback: T): Promise<T> {
@@ -106,7 +140,12 @@ export async function saveWorkizSettings(patch: Partial<WorkizSettings>, updated
 }
 
 export async function getNotificationSettings(): Promise<NotificationSettings> {
-  return readSetting(KEYS.notifications, DEFAULT_NOTIFICATION_SETTINGS)
+  const stored = await readSetting<NotificationSettings & Record<string, unknown>>(KEYS.notifications, DEFAULT_NOTIFICATION_SETTINGS)
+  const r = stored.ownerRecipient as Partial<OwnerRecipient> | null | undefined
+  // Rows saved by the retired technician-message feature carry template/channel keys; only the recipient matters now.
+  return {
+    ownerRecipient: r && typeof r.workizTeamId === "string" && r.workizTeamId && typeof r.name === "string" ? { workizTeamId: r.workizTeamId, name: r.name, phoneMasked: typeof r.phoneMasked === "string" ? r.phoneMasked : null } : null,
+  }
 }
 
 export async function saveNotificationSettings(patch: Partial<NotificationSettings>, updatedBy: string | null) {
@@ -124,6 +163,17 @@ export async function saveAdminSettings(patch: Partial<AdminSettings>, updatedBy
   const current = await getAdminSettings()
   const next = { ...current, ...patch }
   await writeSetting(KEYS.admin, next, updatedBy)
+  return next
+}
+
+export async function getPayoutSettings(): Promise<PayoutSettings> {
+  return readSetting(KEYS.payout, DEFAULT_PAYOUT_SETTINGS)
+}
+
+export async function savePayoutSettings(patch: Partial<PayoutSettings>, updatedBy: string | null) {
+  const current = await getPayoutSettings()
+  const next = { ...current, ...patch }
+  await writeSetting(KEYS.payout, next, updatedBy)
   return next
 }
 

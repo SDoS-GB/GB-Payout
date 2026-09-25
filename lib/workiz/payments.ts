@@ -27,10 +27,41 @@ export type ExternalPaymentInput = {
   tipAmount: number
   /** ISO or Workiz wall-clock string; null when the source did not include one. */
   paidAt: string | null
+  /**
+   * True when `paidAt` is the payment's own date from the payload. False when it is only the
+   * time the event arrived (Workiz's live invoice payloads carry no per-payment date), in which
+   * case a stored earlier date must be kept on re-delivery.
+   */
+  paidAtFromPayload: boolean
+  /** Invoice ("IV-…") or estimate ("ES-…") the payment was reported on. */
   invoiceId: string | null
   reference: string | null
   recordedBy: string | null
   raw?: unknown
+}
+
+export type DocumentKind = "invoice" | "estimate"
+
+/**
+ * Whether the `amount` on a Workiz payment record already contains its `tipAmount`.
+ * Workiz's article shows `{ amount: 100, tipAmount: 10 }` without saying; the live account
+ * has only tipless payments so far. Decided per event from the document's own totals:
+ *   - sum(amount) == totalPrice − amountDue        → amounts EXCLUDE tips ("separate")
+ *   - sum(amount) − sum(tip) == totalPrice − amountDue → amounts INCLUDE tips ("included")
+ * Anything else (or no totals) is "unknown"; with a non-zero tip that holds the job for review
+ * instead of guessing the tip in or out of the card-fee base.
+ */
+export type TipInclusion = "separate" | "included" | "unknown"
+
+export function inferTipInclusion(payments: ReadonlyArray<Pick<ExternalPaymentInput, "amount" | "tipAmount">>, totalPrice: number | null, amountDue: number | null): TipInclusion {
+  const tips = payments.reduce((s, p) => s + p.tipAmount, 0)
+  if (tips <= 0) return "separate"
+  if (totalPrice === null || amountDue === null) return "unknown"
+  const collected = round2(totalPrice - amountDue)
+  const gross = round2(payments.reduce((s, p) => s + p.amount, 0))
+  if (Math.abs(gross - collected) <= 0.011) return "separate"
+  if (Math.abs(round2(gross - tips) - collected) <= 0.011) return "included"
+  return "unknown"
 }
 
 export type PaymentMethodClass = {
@@ -90,58 +121,88 @@ const pick = (obj: Record<string, unknown>, ...keys: string[]): unknown => {
 const round2 = (n: number) => Math.round(n * 100) / 100
 
 export type InvoiceWebhookPayments = {
+  kind: DocumentKind
+  /** Invoice or estimate id ("IV-…" / "ES-…"). */
   invoiceId: string | null
-  /** Workiz internal job id ("JOB-…"); not resolvable through the REST API, kept for diagnostics. */
+  /** Workiz internal job id ("JOB-…"); resolvable only through the learned id map (workiz_job_ids). */
   jobId: string | null
   invoiceTotal: number | null
   amountDue: number | null
+  /** Whether each payment's `amount` already contains its tip, decided from the document totals. */
+  tipInclusion: TipInclusion
   payments: ExternalPaymentInput[]
 }
 
+/** Alias kept for readers of the invoice-only name; estimates carry the same `payments[]`. */
+export type DocumentWebhookPayments = InvoiceWebhookPayments
+
 /**
- * Pull the payment records out of an `invoice_*` webhook `data` object. Returns null when the
- * payload has no `payments` array at all (so "not included" stays distinct from "empty").
+ * Pull the payment records out of an `invoice_*` or `estimate_*` webhook `data` object. Returns
+ * null when the payload has no `payments` array at all (so "not included" stays distinct from
+ * "empty"). Estimates are how deposits reach us: a client paying a deposit online pays it on the
+ * estimate, weeks before the job is done, and that record never appears on the job payload.
  */
-export function extractInvoiceWebhookPayments(data: Record<string, unknown> | null | undefined, receivedAt?: string | null): InvoiceWebhookPayments | null {
+export function extractDocumentPayments(data: Record<string, unknown> | null | undefined, receivedAt?: string | null, kind: DocumentKind = "invoice"): InvoiceWebhookPayments | null {
   if (!data) return null
   const list = pick(data, "payments", "Payments")
   if (!Array.isArray(list)) return null
-  const invoiceId = str(pick(data, "id", "invoiceId", "invoice_id"))
+  const documentId = str(pick(data, "id", "invoiceId", "invoice_id", "estimateId", "estimate_id"))
+  const source: PaymentSource = kind === "estimate" ? "estimate-webhook" : "invoice-webhook"
   const payments: ExternalPaymentInput[] = []
   for (const entry of list) {
     if (!entry || typeof entry !== "object") continue
     const r = entry as Record<string, unknown>
     const amount = round2(num(pick(r, "amount", "Amount", "total", "Total")))
     if (amount <= 0) continue
+    const explicitDate = str(pick(r, "date", "Date", "paidAt", "paid_at", "createdAt", "created_at", "created", "timestamp"))
     payments.push({
       externalId: str(pick(r, "id", "Id", "ID", "paymentId", "payment_id")),
-      source: "invoice-webhook",
+      source,
       method: str(pick(r, "type", "Type", "method", "Method", "paymentMethod", "payment_method")) ?? "",
       amount,
       tipAmount: round2(Math.max(0, num(pick(r, "tipAmount", "tip_amount", "tip", "Tip")))),
-      paidAt: str(pick(r, "date", "Date", "paidAt", "paid_at", "createdAt", "created_at", "created")) ?? receivedAt ?? null,
-      invoiceId,
+      paidAt: explicitDate ?? receivedAt ?? null,
+      paidAtFromPayload: explicitDate !== null,
+      invoiceId: documentId,
       reference: str(pick(r, "reference", "Reference", "confirmation")),
       recordedBy: null,
       raw: r,
     })
   }
-  const total = pick(data, "totalPrice", "total_price")
+  // Invoices report `totalPrice`; estimates report `total`. Both report `amountDue` when they know it.
+  const total = pick(data, "totalPrice", "total_price", "total", "Total")
   const due = pick(data, "amountDue", "amount_due")
+  const invoiceTotal = total === undefined ? null : round2(num(total))
+  const amountDue = due === undefined ? null : round2(num(due))
   return {
-    invoiceId,
-    jobId: str(pick(data, "jobId", "job_id")),
-    invoiceTotal: total === undefined ? null : round2(num(total)),
-    amountDue: due === undefined ? null : round2(num(due)),
+    kind,
+    invoiceId: documentId,
+    jobId: str(pick(data, "jobId", "job_id", "jobID")),
+    invoiceTotal,
+    amountDue,
+    tipInclusion: inferTipInclusion(payments, invoiceTotal, amountDue),
     payments,
   }
+}
+
+/** Invoice-only entry point kept for existing callers and tests. */
+export function extractInvoiceWebhookPayments(data: Record<string, unknown> | null | undefined, receivedAt?: string | null): InvoiceWebhookPayments | null {
+  return extractDocumentPayments(data, receivedAt, "invoice")
 }
 
 /**
  * Turn stored `job_payments` rows into the payment shape the normalizer already understands.
  * A tip attached to a payment is split off exactly as the job-payload path does.
  */
-export function externalRowsToPayments(rows: ReadonlyArray<Pick<JobPaymentRow, "id" | "externalId" | "source" | "method" | "amount" | "tipAmount" | "paidAt" | "recordedBy">>, cardKeywords: readonly string[]): NormalizedPayment[] {
+/** Key under which the per-event tip-inclusion verdict is kept inside a stored row's `raw`. */
+export const TIP_INCLUSION_RAW_KEY = "_tipInclusion"
+
+export function tipInclusionOfRow(raw: unknown): TipInclusion {
+  const v = raw && typeof raw === "object" ? (raw as Record<string, unknown>)[TIP_INCLUSION_RAW_KEY] : undefined
+  return v === "included" || v === "unknown" ? v : "separate"
+}
+
+export function externalRowsToPayments(rows: ReadonlyArray<Pick<JobPaymentRow, "id" | "externalId" | "source" | "method" | "amount" | "tipAmount" | "paidAt" | "recordedBy"> & Partial<Pick<JobPaymentRow, "raw">>>, cardKeywords: readonly string[]): NormalizedPayment[] {
   const out: NormalizedPayment[] = []
   const seen = new Set<string>()
   for (const row of rows) {
@@ -155,12 +216,17 @@ export function externalRowsToPayments(rows: ReadonlyArray<Pick<JobPaymentRow, "
     const date = row.paidAt ? row.paidAt.toISOString() : null
     const base = { id, method: row.method, isCard: cls.isCard, methodKnown: cls.known, source, date, recordedBy: row.recordedBy ?? null }
     const tip = round2(num(row.tipAmount))
-    if (tip > 0 && tip < amount) {
-      out.push({ ...base, amount: round2(amount - tip), isTip: false })
-      out.push({ ...base, amount: tip, isTip: true })
-    } else {
+    if (tip <= 0) {
       out.push({ ...base, amount, isTip: false })
+      continue
     }
+    const inclusion = tipInclusionOfRow(row.raw)
+    // "included": Workiz's amount already contains the tip, so the service part is the remainder.
+    // "separate": amount is the service payment and the tip is on top of it.
+    // "unknown": kept as separate (the smaller card-fee base) but flagged so the payout is held.
+    const service = inclusion === "included" && tip < amount ? round2(amount - tip) : amount
+    out.push({ ...base, amount: service, isTip: false, tipAmbiguous: inclusion === "unknown" || undefined })
+    out.push({ ...base, id: `${id}:tip`, amount: tip, isTip: true, tipAmbiguous: inclusion === "unknown" || undefined })
   }
   return out
 }

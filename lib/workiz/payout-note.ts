@@ -21,6 +21,9 @@ import { parseWorkizDate } from "./time"
  */
 
 export const PAYOUT_NOTE_HEADER = "PAYOUT READY (GB app)"
+/** Header of the owner text written by lib/notifications/owner-message.ts; merged the same way. */
+export const OWNER_NOTE_HEADER = "GB payout ready"
+const BLOCK_HEADERS = [PAYOUT_NOTE_HEADER, OWNER_NOTE_HEADER] as const
 
 export type PayoutNoteTech = {
   name: string
@@ -30,6 +33,8 @@ export type PayoutNoteTech = {
   tip: number
   segmentKind: string
   segmentMarker: string | null
+  /** Why this technician is paid on this job, from the saved payout snapshot. */
+  ownership?: { reason?: string | null; workType?: string | null } | null
 }
 
 export type PayoutNoteInput = {
@@ -72,6 +77,9 @@ export function buildPayoutNote(input: PayoutNoteInput): string {
 }
 
 function segmentScope(tech: PayoutNoteTech): string | null {
+  const workType = tech.ownership?.workType
+  if (workType && tech.ownership?.reason === "work-type") return `whole job, ${workType}`
+  if (workType && tech.segmentKind === "crew") return `tip only, ${workType}`
   const marker = markerLabel(tech.segmentMarker)
   if (tech.segmentKind === "dedicated") return `${marker ?? "marked"} items`
   if (tech.segmentKind === "crew") return marker ? `crew, excl. ${marker}` : "crew"
@@ -106,7 +114,11 @@ function tipSummary(input: PayoutNoteInput): string | null {
   const fromRecords = input.payments.filter((p) => p.isTip).reduce((sum, p) => sum + p.amount, 0)
   const tipTotal = input.tipTotal > 0 ? input.tipTotal : fromRecords
   if (tipTotal <= 0) return null
-  return `Tip ${formatCurrency(tipTotal)}`
+  // Who gets what only matters once the tip is split or someone on the job is excluded (Tim).
+  const shares = input.techs.filter((t) => t.tip > 0).map((t) => `${t.name} ${formatCurrency(t.tip)}`)
+  const none = input.techs.filter((t) => t.tip <= 0).map((t) => t.name)
+  if (shares.length === 0 || input.techs.length < 2) return `Tip ${formatCurrency(tipTotal)}`
+  return `Tip ${formatCurrency(tipTotal)} (${shares.join(", ")}${none.length ? `; ${none.join(", ")} none` : ""})`
 }
 
 function latestPaymentDate(records: NormalizedPayment[], timeZone: string): string | null {
@@ -135,10 +147,10 @@ function toGsmSafe(line: string): string {
     .trim()
 }
 
-const BLOCK_PATTERN = new RegExp(`${escapeRegExp(PAYOUT_NOTE_HEADER)}[\\s\\S]*?(?:\\n[ \\t]*\\r?\\n|$)`, "g")
+const BLOCK_PATTERN = new RegExp(`(?:${BLOCK_HEADERS.map(escapeRegExp).join("|")})[\\s\\S]*?(?:\\n[ \\t]*\\r?\\n|$)`, "g")
 
 export function hasPayoutNote(description: string | null | undefined): boolean {
-  return typeof description === "string" && description.includes(PAYOUT_NOTE_HEADER)
+  return typeof description === "string" && BLOCK_HEADERS.some((h) => description.includes(h))
 }
 
 /**

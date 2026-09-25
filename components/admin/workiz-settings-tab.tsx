@@ -5,7 +5,6 @@ import { useRouter } from "next/navigation"
 import { Radio, Trash2 } from "lucide-react"
 import type { AdminDashboardData } from "@/app/actions/admin"
 import { deleteColorSealItem, probeWorkiz, updateWorkizSettings, upsertColorSealItem } from "@/app/actions/admin"
-import { PayoutTextAlertsCard } from "./payout-text-alerts-card"
 import { WebhookSetupCard } from "./webhook-setup-card"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -211,8 +210,6 @@ export function WorkizSettingsTab({ workiz, catalog, webhookUrl, cronConfigured 
       </Card>
 
       <WebhookSetupCard workiz={workiz} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />
-
-      <PayoutTextAlertsCard workiz={workiz} dashboardUrl={webhookUrl.replace(/\/api\/workiz\/webhook$/, "") + "/admin"} />
 
       <ColorSealCatalog catalog={catalog} />
     </div>

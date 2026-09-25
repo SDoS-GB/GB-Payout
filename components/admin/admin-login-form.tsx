@@ -4,32 +4,75 @@ import { useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
 import Link from "next/link"
 import { ShieldCheck } from "lucide-react"
-import { signInAdmin } from "@/app/actions/session"
+import { signInAdmin, type ActionResult } from "@/app/actions/session"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Alert, AlertDescription } from "@/components/ui/alert"
 
+// Upper bound on the authentication request itself. The dashboard render that
+// follows a successful sign-in is bounded separately by the /admin error boundary.
+const AUTH_TIMEOUT_MS = 20_000
+
+class AuthTimeoutError extends Error {}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_, reject) => {
+    timer = setTimeout(() => reject(new AuthTimeoutError("timeout")), ms)
+  })
+  try {
+    return await Promise.race([promise, timeout])
+  } finally {
+    clearTimeout(timer)
+  }
+}
+
+type Phase = "idle" | "authenticating" | "opening"
+
 export function AdminLoginForm({ needsBootstrap, bootstrapAvailable }: { needsBootstrap: boolean; bootstrapAvailable: boolean }) {
   const router = useRouter()
   const [password, setPassword] = useState("")
   const [error, setError] = useState<string | null>(null)
+  const [phase, setPhase] = useState<Phase>("idle")
   const [pending, startTransition] = useTransition()
+
+  const busy = pending || phase !== "idle"
 
   const submit = (e: React.FormEvent) => {
     e.preventDefault()
+    if (busy) return
     setError(null)
+    setPhase("authenticating")
     startTransition(async () => {
-      const res = await signInAdmin(password)
+      let res: ActionResult
+      try {
+        res = await withTimeout(signInAdmin(password), AUTH_TIMEOUT_MS)
+      } catch (err) {
+        setPhase("idle")
+        setError(
+          err instanceof AuthTimeoutError
+            ? "The sign-in request timed out. Check your connection and try again."
+            : "Could not reach the server. Check your connection and try again.",
+        )
+        return
+      }
       if (!res.ok) {
+        setPhase("idle")
         setError(res.error)
         return
       }
-      router.push("/admin")
-      router.refresh()
+      setPassword("")
+      setPhase("opening")
+      // The session cookie is set by the action; the dashboard is a server page,
+      // so navigate and let it read the saved data. Any failure there lands in
+      // app/admin/error.tsx with Retry / Sign out instead of an endless spinner.
+      router.replace("/admin")
     })
   }
+
+  const buttonLabel = phase === "authenticating" ? "Signing in…" : phase === "opening" ? "Opening dashboard…" : "Sign in"
 
   return (
     <Card className="w-full max-w-md">
@@ -41,7 +84,7 @@ export function AdminLoginForm({ needsBootstrap, bootstrapAvailable }: { needsBo
         <CardDescription>Workiz payout automation for Grout Brothers</CardDescription>
       </CardHeader>
       <CardContent>
-        <form onSubmit={submit} className="flex flex-col gap-4">
+        <form onSubmit={submit} className="flex flex-col gap-4" aria-busy={busy}>
           {needsBootstrap && (
             <Alert>
               <AlertDescription>
@@ -59,13 +102,19 @@ export function AdminLoginForm({ needsBootstrap, bootstrapAvailable }: { needsBo
               autoComplete="current-password"
               value={password}
               onChange={(e) => setPassword(e.target.value)}
-              disabled={pending}
+              disabled={busy}
+              aria-invalid={error ? true : undefined}
+              aria-describedby={error ? "admin-password-error" : undefined}
               required
             />
           </div>
-          {error && <p className="text-sm text-destructive">{error}</p>}
-          <Button type="submit" className="w-full" disabled={pending || (needsBootstrap && !bootstrapAvailable)}>
-            {pending ? "Signing in…" : "Sign in"}
+          {error && (
+            <p id="admin-password-error" role="alert" className="text-sm text-destructive">
+              {error}
+            </p>
+          )}
+          <Button type="submit" className="w-full" disabled={busy || (needsBootstrap && !bootstrapAvailable)}>
+            {buttonLabel}
           </Button>
           <Link href="/" className="text-center text-sm text-muted-foreground hover:underline">
             Back to calculator

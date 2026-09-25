@@ -11,7 +11,7 @@ import { useToast } from "@/hooks/use-toast"
 import { Toaster } from "@/components/ui/toaster"
 import { Plus, X, History } from "lucide-react"
 import Link from "next/link"
-import { CONTRACTORS, type ContractorName } from "@/lib/payout/contractors"
+import { CONTRACTORS, legacyProfileOptions, type ContractorName } from "@/lib/payout/contractors"
 import { calcLegacyJobPayout } from "@/lib/payout/calculator"
 import { signInTechnician, signOutSession } from "@/app/actions/session"
 
@@ -109,9 +109,10 @@ export default function PayoutCalculator() {
     if (!rates) return { nonColorPayout: 0, colorPayout: 0, tipPayout: 0, basePayout: 0, totalPayout: 0, nonColorAmount: 0, colorAmount: 0, jobTotalNum: 0, colorSealTotalNum: 0, tipNum: 0 }
 
     // Same arithmetic as before, now shared with the Workiz payout engine.
+    // Tim's tip share is 0 (he never shares tips); the tip is shown as held for the office.
     return calcLegacyJobPayout(job, rates, {
       separateColorSeal: showColorSeal,
-      tipShare: contractorName === "Tim" ? 1 : 0.5,
+      tipShare: legacyProfileOptions(contractorName).tipShare,
     })
   }
 
@@ -215,7 +216,7 @@ export default function PayoutCalculator() {
 
   if (!isAuthenticated) {
     return (
-      <main className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 flex items-center justify-center p-4">
+      <main className="min-h-screen bg-background flex items-center justify-center p-4">
         <Card className="w-full max-w-md shadow-xl">
           <CardHeader className="space-y-1">
             <CardTitle className="text-3xl font-bold text-center text-balance">
@@ -269,7 +270,7 @@ export default function PayoutCalculator() {
                 id="stayLoggedIn"
                 checked={stayLoggedIn}
                 onChange={(e) => setStayLoggedIn(e.target.checked)}
-                className="w-5 h-5 rounded border-gray-300 text-primary focus:ring-primary cursor-pointer"
+                className="w-5 h-5 rounded border-input accent-primary text-primary focus:ring-ring cursor-pointer"
               />
               <Label htmlFor="stayLoggedIn" className="text-base font-medium cursor-pointer">
                 Stay Logged In
@@ -290,7 +291,7 @@ export default function PayoutCalculator() {
   }
 
   return (
-    <main className="min-h-screen bg-gradient-to-br from-slate-50 to-slate-100 dark:from-slate-950 dark:to-slate-900 p-4 pb-28">
+    <main className="min-h-screen bg-background p-4 pb-28">
       <div className="max-w-2xl mx-auto space-y-6 py-6">
 
         {/* Header */}
@@ -351,7 +352,7 @@ export default function PayoutCalculator() {
                 {/* Customer Name */}
                 <div className="space-y-2">
                   <Label htmlFor={`customerName-${job.id}`} className="text-base font-semibold">
-                    Customer Name <span className="text-red-500">*</span>
+                    Customer Name <span className="text-destructive">*</span>
                   </Label>
                   <Input
                     id={`customerName-${job.id}`}
@@ -540,7 +541,7 @@ export default function PayoutCalculator() {
                       <div>
                         <p className="text-sm text-muted-foreground">Tip Payout</p>
                         <p className="text-lg font-semibold">
-                          {formatCurrency(calc.tipNum)} {selectedContractor !== "Tim" && "÷ 2"}
+                          {formatCurrency(calc.tipNum)} {selectedContractor !== "Tim" ? "÷ 2" : calc.tipNum > 0 ? "· held for the office (Tim does not share tips)" : ""}
                         </p>
                       </div>
                       <p className="text-xl font-bold text-primary">{formatCurrency(calc.tipPayout)}</p>
@@ -567,7 +568,7 @@ export default function PayoutCalculator() {
 
         {/* Denis Payout Summary (Vadim only) */}
         {selectedContractor === "Vadim" && anySummaryVisible && (
-          <Card className="shadow-xl bg-gradient-to-br from-blue-50 to-blue-100 dark:from-blue-950 dark:to-blue-900 border-blue-300 dark:border-blue-700">
+          <Card className="shadow-xl bg-accent border-secondary/60">
             <CardHeader>
               <CardTitle className="text-xl font-bold">Denis&apos; Payout Summary</CardTitle>
               <CardDescription className="text-base">Denis</CardDescription>
@@ -597,34 +598,34 @@ export default function PayoutCalculator() {
                         <p className="text-sm text-muted-foreground">Non-Color Portion</p>
                         <p className="text-lg font-semibold">{formatCurrency(calc.nonColorAmount)}</p>
                       </div>
-                      <p className="text-xl font-bold text-blue-600 dark:text-blue-400">{formatCurrency(calc.nonColorPayout)}</p>
+                      <p className="text-xl font-bold text-primary">{formatCurrency(calc.nonColorPayout)}</p>
                     </div>
                     <div className="flex justify-between items-baseline pb-2 border-b">
                       <div>
                         <p className="text-sm text-muted-foreground">Color Portion</p>
                         <p className="text-lg font-semibold">{formatCurrency(calc.colorAmount)}</p>
                       </div>
-                      <p className="text-xl font-bold text-blue-600 dark:text-blue-400">{formatCurrency(calc.colorPayout)}</p>
+                      <p className="text-xl font-bold text-primary">{formatCurrency(calc.colorPayout)}</p>
                     </div>
                     <div className="flex justify-between items-baseline pb-2 border-b">
                       <div>
                         <p className="text-sm text-muted-foreground">Tip Payout</p>
                         <p className="text-lg font-semibold">{formatCurrency(calc.tipNum)} ÷ 2</p>
                       </div>
-                      <p className="text-xl font-bold text-blue-600 dark:text-blue-400">{formatCurrency(calc.tipPayout)}</p>
+                      <p className="text-xl font-bold text-primary">{formatCurrency(calc.tipPayout)}</p>
                     </div>
                     <div className="flex justify-between items-baseline">
                       <p className="text-base font-semibold text-muted-foreground">Job Payout</p>
                       <p className="text-xl font-bold">{formatCurrency(calc.totalPayout)}</p>
                     </div>
-                    {index < validJobs.length - 1 && <div className="border-t-2 border-blue-200 dark:border-blue-800 pt-2" />}
+                    {index < validJobs.length - 1 && <div className="border-t-2 border-secondary/40 pt-2" />}
                   </div>
                 )
               })}
 
-              <div className="flex justify-between items-baseline pt-4 border-t-2 border-blue-300 dark:border-blue-700">
+              <div className="flex justify-between items-baseline pt-4 border-t-2 border-secondary/60">
                 <p className="text-xl font-bold">Total Payout</p>
-                <p className="text-3xl font-bold text-blue-600 dark:text-blue-400">{formatCurrency(denisCombinedTotal)}</p>
+                <p className="text-3xl font-bold text-primary">{formatCurrency(denisCombinedTotal)}</p>
               </div>
             </CardContent>
           </Card>

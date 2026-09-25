@@ -56,14 +56,14 @@ export const zonedDateTime = (d: Date | string | null | undefined, tz: string) =
 }
 
 const STATUS_STYLES: Record<string, string> = {
-  ready: "bg-primary/10 text-primary border-primary/20",
-  hold: "bg-amber-500/10 text-amber-700 border-amber-500/30 dark:text-amber-300",
+  ready: "bg-secondary/25 text-primary border-secondary/60",
+  hold: "bg-warning/15 text-warning-foreground border-warning/50",
   pending: "bg-muted text-muted-foreground border-border",
-  paid: "bg-emerald-500/10 text-emerald-700 border-emerald-500/30 dark:text-emerald-300",
-  void: "bg-destructive/10 text-destructive border-destructive/30",
-  sent: "bg-emerald-500/10 text-emerald-700 border-emerald-500/30 dark:text-emerald-300",
+  paid: "bg-primary text-primary-foreground border-primary",
+  void: "bg-destructive/15 text-destructive-foreground border-destructive/50",
+  sent: "bg-primary text-primary-foreground border-primary",
   previewed: "bg-muted text-muted-foreground border-border",
-  failed: "bg-destructive/10 text-destructive border-destructive/30",
+  failed: "bg-destructive/15 text-destructive-foreground border-destructive/50",
   skipped: "bg-muted text-muted-foreground border-border",
 }
 
@@ -78,9 +78,9 @@ export function StatusBadge({ status }: { status: string }) {
 export function InlineMessage({ tone, children }: { tone: "ok" | "error" | "info"; children: React.ReactNode }) {
   const cls =
     tone === "ok"
-      ? "text-emerald-700 dark:text-emerald-300"
+      ? "text-success-foreground"
       : tone === "error"
-        ? "text-destructive"
+        ? "text-warning-foreground"
         : "text-muted-foreground"
   return <p className={`text-sm ${cls}`}>{children}</p>
 }

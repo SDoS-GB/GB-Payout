@@ -46,11 +46,28 @@ describe("Workiz webhook payload parsing", () => {
     expect(p.uuidCandidates.some((c) => c.startsWith("JOB-") || c.startsWith("IV-"))).toBe(false)
   })
 
-  it("ignores lead and estimate events", () => {
+  it("ignores lead events but keeps estimates, which carry deposits", () => {
     expect(parseWebhookBody({ trigger: { type: "lead_created" }, data: { uuid: "GD87TS" } }).kind).toBe("ignored")
-    expect(parseWebhookBody({ trigger: { type: "estimate_created" }, data: { id: "ES-1" } }).kind).toBe("ignored")
     expect(classifyTrigger("payment_received")).toBe("invoice")
     expect(classifyTrigger(null)).toBe("unknown")
+
+    const estimate = parseWebhookBody({
+      trigger: { type: "estimate_created", timestamp: "2026-09-21T12:00:00Z" },
+      data: { id: "ES-71c3a6U1dXeVd2yv", jobId: "JOB-BA5r7o4bqzR9MONa", total: 950, amountDue: 475, payments: [{ id: "PAY-dep1", type: "Credit Card", amount: 475, tipAmount: 0 }] },
+    })
+    expect(estimate.kind).toBe("estimate")
+    // Estimates never carry the short job uuid; only the internal JOB- id, resolved through the learned map.
+    expect(estimate.uuidCandidates).toEqual([])
+    expect(estimate.jobInternalId).toBe("JOB-BA5r7o4bqzR9MONa")
+    expect(estimate.invoice).toMatchObject({ kind: "estimate", invoiceId: "ES-71c3a6U1dXeVd2yv", jobId: "JOB-BA5r7o4bqzR9MONa", invoiceTotal: 950, amountDue: 475 })
+    expect(estimate.invoice?.payments).toEqual([expect.objectContaining({ externalId: "PAY-dep1", source: "estimate-webhook", method: "Credit Card", amount: 475, tipAmount: 0 })])
+  })
+
+  it("learns the internal job id from job events so document events can be attached later", () => {
+    const p = parseWebhookBody(workizJobEvent)
+    expect(p.jobInternalId).toBe("JOB-BA5r7o4bqzR9MONa")
+    const inv = parseWebhookBody(workizInvoiceEvent)
+    expect(inv.jobInternalId).toBe("JOB-BA5r7o4bqzR9MONa")
   })
 
   it("still accepts the legacy flat body and a ?uuid= query", () => {

@@ -12,9 +12,29 @@
  * exactly as the calculator UI does.
  */
 
-export const CALC_VERSION = "legacy-v1+split-2026-09"
+export const CALC_VERSION = "legacy-v1+ownership-2026-09-23"
 
 export const CARD_FEE_MULTIPLIER = 0.965
+/** Processor fee on the card-paid part of the invoice; `1 - CARD_FEE_MULTIPLIER`. */
+export const CARD_FEE_RATE = 0.035
+
+/**
+ * The single invoice-wide multiplier every service amount is scaled by before a
+ * rate is applied: `1 - cardShare x 3.5%`, where `cardShare = C / S` is the
+ * fraction of the discounted service subtotal the customer paid by card. It is
+ * the same for every technician and category on the job, so nobody's smaller
+ * portion is ever measured against its own card percentage.
+ */
+export function serviceFactorFor(cardServiceShare: number): number {
+  const share = Math.min(1, Math.max(0, Number.isFinite(cardServiceShare) ? cardServiceShare : 0))
+  return 1 - share * CARD_FEE_RATE
+}
+
+/** `C / S` with the S = 0 case made explicit: no service revenue means no card share. */
+export function cardShareOf(cardServiceAmount: number, jobTotal: number): number {
+  if (!(jobTotal > 0)) return 0
+  return Math.min(1, Math.max(0, cardServiceAmount / jobTotal))
+}
 
 export interface Rates {
   nonColorRate: number
@@ -98,7 +118,13 @@ export interface SplitPayoutInput {
 }
 
 export interface SplitPayoutBreakdown extends PayoutBreakdown {
+  /** `C / S`: fraction of the invoice's service subtotal paid by card. */
   cardServiceShare: number
+  /** `1 - cardServiceShare x 3.5%`, applied to every service dollar before its rate. */
+  serviceFactor: number
+  /** Service amounts after the invoice-wide factor (what the rates are applied to). */
+  adjustedNonColorAmount: number
+  adjustedColorAmount: number
   cardNonColorAmount: number
   cardColorAmount: number
   nonCardNonColorAmount: number
@@ -108,27 +134,47 @@ export interface SplitPayoutBreakdown extends PayoutBreakdown {
   mode: "legacy-card" | "legacy-non-card" | "split"
 }
 
+export interface CardShareInput {
+  /** Service subtotal after discounts, excluding tips and tax (this technician's eligible amount). */
+  jobTotal: number
+  /** Color-sealing portion after discounts (already inside jobTotal). */
+  colorSealTotal: number
+  /** Invoice-wide `C / S`, identical for every technician on the job. */
+  cardServiceShare: number
+  /** Tips paid by card that the business owes the crew (fee applies). */
+  cardTip: number
+  /** Tips the business holds that were paid by check/cash/Zelle (no fee). */
+  nonCardOwedTip: number
+}
+
 const EPSILON = 1e-9
 
 /**
- * Mixed-payment payout. Routes pure all-card / all-non-card inputs through the
- * legacy function so existing results are preserved exactly.
+ * The authoritative commission formula. Every eligible service dollar is scaled
+ * by the invoice-wide `serviceFactor` and then multiplied by the technician's
+ * rate; the business-held tip is scaled by the fee only where it was paid by
+ * card and then by the technician's share. Pure all-card and all-non-card
+ * inputs are routed through the legacy function so historical results stay
+ * bit-identical.
  */
-export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates, options: ProfileOptions): SplitPayoutBreakdown {
+export function calcPayoutWithCardShare(input: CardShareInput, rates: Rates, options: ProfileOptions): SplitPayoutBreakdown {
   const jobTotal = parseNumber(input.jobTotal)
   const colorSeal = parseNumber(input.colorSealTotal)
-  const cardService = parseNumber(input.cardServiceAmount)
   const cardTip = parseNumber(input.cardTip)
   const nonCardTip = parseNumber(input.nonCardOwedTip)
+  const cardServiceShare = Math.min(1, Math.max(0, Number.isFinite(input.cardServiceShare) ? input.cardServiceShare : 0))
 
-  const noCardMoney = cardService < EPSILON && cardTip < EPSILON
-  const fullyCard = Math.abs(cardService - jobTotal) < EPSILON && nonCardTip < EPSILON
+  const noCardMoney = cardServiceShare < EPSILON && cardTip < EPSILON
+  const fullyCard = (jobTotal < EPSILON || 1 - cardServiceShare < EPSILON) && nonCardTip < EPSILON
 
   if (noCardMoney) {
     const legacy = calcLegacyJobPayout({ jobTotal, colorSealTotal: colorSeal, tip: nonCardTip, isCreditCard: false }, rates, options)
     return {
       ...legacy,
       cardServiceShare: 0,
+      serviceFactor: 1,
+      adjustedNonColorAmount: legacy.nonColorAmount,
+      adjustedColorAmount: legacy.colorAmount,
       cardNonColorAmount: 0,
       cardColorAmount: 0,
       nonCardNonColorAmount: legacy.nonColorAmount,
@@ -144,6 +190,9 @@ export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates
     return {
       ...legacy,
       cardServiceShare: 1,
+      serviceFactor: CARD_FEE_MULTIPLIER,
+      adjustedNonColorAmount: legacy.nonColorAmount * CARD_FEE_MULTIPLIER,
+      adjustedColorAmount: legacy.colorAmount * CARD_FEE_MULTIPLIER,
       cardNonColorAmount: legacy.nonColorAmount,
       cardColorAmount: legacy.colorAmount,
       nonCardNonColorAmount: 0,
@@ -158,15 +207,17 @@ export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates
   const nonColorAmount = showColorSeal ? jobTotal - colorSeal : jobTotal
   const colorAmount = showColorSeal ? colorSeal : 0
 
-  const cardServiceShare = jobTotal > 0 ? cardService / jobTotal : 0
+  const serviceFactor = serviceFactorFor(cardServiceShare)
+  const adjustedNonColorAmount = nonColorAmount * serviceFactor
+  const adjustedColorAmount = colorAmount * serviceFactor
+  const nonColorPayout = adjustedNonColorAmount * rates.nonColorRate
+  const colorPayout = adjustedColorAmount * rates.colorRate
+
+  // Informational split of the eligible amounts by payment method (display only).
   const cardNonColorAmount = nonColorAmount * cardServiceShare
   const nonCardNonColorAmount = nonColorAmount - cardNonColorAmount
   const cardColorAmount = colorAmount * cardServiceShare
   const nonCardColorAmount = colorAmount - cardColorAmount
-
-  const nonColorPayout =
-    cardNonColorAmount * CARD_FEE_MULTIPLIER * rates.nonColorRate + nonCardNonColorAmount * 1 * rates.nonColorRate
-  const colorPayout = cardColorAmount * CARD_FEE_MULTIPLIER * rates.colorRate + nonCardColorAmount * 1 * rates.colorRate
 
   let cardTipPayout = 0
   if (cardTip > 0) cardTipPayout = cardTip * CARD_FEE_MULTIPLIER * options.tipShare
@@ -189,6 +240,9 @@ export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates
     colorSealTotalNum: colorSeal,
     tipNum: cardTip + nonCardTip,
     cardServiceShare,
+    serviceFactor,
+    adjustedNonColorAmount,
+    adjustedColorAmount,
     cardNonColorAmount,
     cardColorAmount,
     nonCardNonColorAmount,
@@ -197,6 +251,26 @@ export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates
     nonCardTipPayout,
     mode: "split",
   }
+}
+
+/**
+ * Mixed-payment payout expressed in dollars paid by card. The card share is
+ * `cardServiceAmount / jobTotal`; the arithmetic is `calcPayoutWithCardShare`.
+ */
+export function calcPayoutWithPaymentSplit(input: SplitPayoutInput, rates: Rates, options: ProfileOptions): SplitPayoutBreakdown {
+  const jobTotal = parseNumber(input.jobTotal)
+  const cardService = parseNumber(input.cardServiceAmount)
+  return calcPayoutWithCardShare(
+    {
+      jobTotal,
+      colorSealTotal: parseNumber(input.colorSealTotal),
+      cardServiceShare: cardShareOf(cardService, jobTotal),
+      cardTip: parseNumber(input.cardTip),
+      nonCardOwedTip: parseNumber(input.nonCardOwedTip),
+    },
+    rates,
+    options,
+  )
 }
 
 /** Amount owed as the calculator displays it (cents). */

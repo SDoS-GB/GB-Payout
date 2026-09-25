@@ -106,7 +106,7 @@ describe("marker matching", () => {
     expect(findMarker(name("*T* Grout"), "*T*")).toBe("name")
   })
 
-  it("finds the marker in the Description field and records where it was found", () => {
+  it("reads the marker from the item Name only; a marker typed into the Description is flagged, not trusted", () => {
     const job = normalizeJob(
       {
         UUID: "desc-1",
@@ -125,9 +125,16 @@ describe("marker matching", () => {
     expect(job.lineItems[1].description).toBe("*T* upstairs bath")
     const { segments } = segmentJob(job, [TIM.lineItemMarker])
     const tim = segments.find((s) => s.kind === "dedicated")!
-    expect(tim.itemNames).toEqual(["Grout repair"])
-    expect(tim.markerFields).toEqual(["description"])
-    expect(tim.jobTotal).toBe(100)
+    expect(tim.itemNames).toEqual([])
+    expect(tim.jobTotal).toBe(0)
+    expect(segments.find((s) => s.kind === "crew")!.itemNames).toEqual(["Door", "Grout repair"])
+    const plan = planSegments(job, [VADIM, TIM], [TIM])
+    expect(plan.warnings.some((w) => w.includes("in the description but not the item name"))).toBe(true)
+  })
+
+  it("accepts whitespace inside the asterisks (`* T *`) but never a bare T or the name Tim", () => {
+    for (const n of ["Regrout * T *", "*  t  * caulk", "Shower * T*", "*T * repair"]) expect(findMarker(name(n), "T"), n).toBe("name")
+    for (const n of ["T Regrout", "Tim Regrout", "Tim's shower", "Trim", "*TT*", "* Tim *", "Regrout (T)", "* T", "T *"]) expect(findMarker(name(n), "T"), n).toBeNull()
   })
 })
 
@@ -274,7 +281,7 @@ describe("planSegments – who is paid on what", () => {
     expect(plan.splitCountFor.get(TIM.id)).toBe(1)
   })
 
-  it("pays Tim on the whole job when he works alone (legacy behaviour)", () => {
+  it("pays Tim on the whole job when he works alone, but a tip with no regular technician is flagged for review", () => {
     const job = normalizeJob(
       {
         UUID: "solo-1",
@@ -292,9 +299,17 @@ describe("planSegments – who is paid on what", () => {
     expect(seg.kind).toBe("job")
     expect(seg.jobTotal).toBe(600)
     expect(seg.cardTipAmount).toBe(50)
-    expect(plan.warnings).toEqual([])
-    const result = payFor(seg, TIM)
-    expect(result.totalPayout).toBeCloseTo(600 * CARD_FEE_MULTIPLIER * 0.8 + 50 * CARD_FEE_MULTIPLIER * 1, 8)
+    expect(plan.tipShareFor.get(TIM.id)).toBe(0)
+    expect(plan.tips.recipients).toEqual([])
+    expect(plan.warnings).toEqual([plan.tips.needsReview])
+    expect(plan.tips.needsReview).toMatch(/^Tip allocation needs review/)
+    const result = payFor(seg, { ...TIM, tipShare: String(plan.tipShareFor.get(TIM.id)) })
+    expect(result.tipPayout).toBe(0)
+    expect(result.totalPayout).toBeCloseTo(600 * CARD_FEE_MULTIPLIER * 0.8, 8)
+
+    // Without a tip the solo job is clean: whole job at 80%, nothing to review.
+    const noTip = normalizeJob({ UUID: "solo-2", Status: "Done", Team: [{ id: 15, Name: "Tim" }], SubTotal: 600, Items: [{ Name: "Caulk", Price: 600 }], Payments: [{ Amount: 600, Method: "Visa" }] }, settings, noCatalog)
+    expect(planSegments(noTip, [TIM], [TIM]).warnings).toEqual([])
   })
 
   it("flags marked items when Tim is not assigned to the job", () => {

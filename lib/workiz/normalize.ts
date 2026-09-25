@@ -31,6 +31,8 @@ export type NormalizedJob = {
   paymentDueDate: Date | null
   jobDateTime: Date | null
   jobEndDateTime: Date | null
+  /** Workiz `LastStatusUpdate`; the completion time when the status is payable (Workiz has no dedicated completion stamp). */
+  lastStatusUpdate: Date | null
   clientId: string | null
   clientName: string | null
   address: string | null
@@ -112,6 +114,7 @@ export const INFORMATIONAL_WARNING_PREFIXES = ["Line items mention sealing", "Wo
 
 export const PAYMENT_METHOD_UNKNOWN_PREFIX = "Payment method unknown"
 export const UNITEMIZED_DISCOUNT_PREFIX = "Unitemized discount"
+export const TIP_METHOD_UNCLEAR_PREFIX = "Tip payment method unclear"
 
 export function isBlockingWarning(warning: string): boolean {
   return !INFORMATIONAL_WARNING_PREFIXES.some((prefix) => warning.startsWith(prefix))
@@ -311,9 +314,22 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   const amountDueRaw = pick(r, "JobAmountDue", "AmountDue", "amount_due")
   const amountDue = amountDueRaw !== undefined ? round2(num(amountDueRaw)) : null
 
-  // Tip line items with no dedicated tip payment: attribute them to the dominant method.
+  // A tip that is an invoice line but has no payment record of its own takes the method of the
+  // payment(s) that covered the invoice. One method: unambiguous. Several methods: the tip's
+  // share of the card fee cannot be known, so it is split in the same proportion and held for review.
   if (tipItemsTotal > 0 && cardTipAmount === 0 && nonCardTipAmount === 0) {
-    if (cardServiceAmount >= nonCardServiceAmount && cardServiceAmount > 0) {
+    if (cardServiceAmount > 0 && nonCardServiceAmount > 0) {
+      const share = cardServiceAmount / (cardServiceAmount + nonCardServiceAmount)
+      const cardPart = round2(tipItemsTotal * share)
+      const otherPart = round2(tipItemsTotal - cardPart)
+      cardServiceAmount = round2(Math.max(0, cardServiceAmount - cardPart))
+      nonCardServiceAmount = round2(Math.max(0, nonCardServiceAmount - otherPart))
+      warnings.push(
+        `${TIP_METHOD_UNCLEAR_PREFIX}: the $${tipItemsTotal.toFixed(2)} tip is an invoice line but the invoice was paid by more than one method (card $${(cardServiceAmount + cardPart).toFixed(2)}, other $${(nonCardServiceAmount + otherPart).toFixed(2)}); the tip is split in the same proportion ($${cardPart.toFixed(2)} card / $${otherPart.toFixed(2)} other) until an admin confirms how it was paid`,
+      )
+      return finalize({ cardTipAmount: cardPart, nonCardTipAmount: otherPart })
+    }
+    if (cardServiceAmount > 0) {
       // Card tip: move it out of the card service bucket if it was included.
       cardServiceAmount = round2(Math.max(0, cardServiceAmount - tipItemsTotal))
       return finalize({ cardTipAmount: tipItemsTotal, nonCardTipAmount })
@@ -350,6 +366,11 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
         const methods = Array.from(new Set(unknown.map((p) => p.method))).join(", ")
         const sum = round2(unknown.reduce((s, p) => s + p.amount, 0))
         warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: $${sum.toFixed(2)} was recorded with a method that is not recognised (${methods}); confirm whether it was paid by card before release`)
+      }
+      const ambiguousTips = tipPayments.filter((p) => p.tipAmbiguous)
+      if (ambiguousTips.length) {
+        const sum = round2(ambiguousTips.reduce((s, p) => s + p.amount, 0))
+        warnings.push(`${TIP_METHOD_UNCLEAR_PREFIX}: Workiz reported a $${sum.toFixed(2)} tip but its totals do not show whether the payment amount already included it; confirm the tip before release`)
       }
 
       if (amountDue !== null) {
@@ -414,6 +435,7 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
       paymentDueDate: date(pick(r, "PaymentDueDate", "payment_due_date"), settings.businessTimezone),
       jobDateTime: date(pick(r, "JobDateTime", "job_date_time"), settings.businessTimezone),
       jobEndDateTime: date(pick(r, "JobEndDateTime", "job_end_date_time"), settings.businessTimezone),
+      lastStatusUpdate: date(pick(r, "LastStatusUpdate", "last_status_update"), settings.businessTimezone),
       clientId: str(pick(r, "ClientId", "client_id")),
       clientName,
       address,

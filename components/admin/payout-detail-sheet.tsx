@@ -9,7 +9,7 @@ import { Separator } from "@/components/ui/separator"
 import { Sheet, SheetContent, SheetDescription, SheetHeader, SheetTitle } from "@/components/ui/sheet"
 import { Table, TableBody, TableCell, TableHead, TableHeader, TableRow } from "@/components/ui/table"
 import { Textarea } from "@/components/ui/textarea"
-import { segmentLabel } from "@/lib/payout/segments"
+import { ownershipExplanation, segmentLabel } from "@/lib/payout/segments"
 import {
   PAYMENT_DETAILS_UNAVAILABLE,
   explainPayoutStatus,
@@ -48,11 +48,16 @@ type Snapshot = Partial<{
   cardTipPayout: number
   nonCardTipPayout: number
   cardFeeAdjustment: number
+  serviceFactor: number
+  adjustedNonColorAmount: number
+  adjustedColorAmount: number
   mode: string
   calcVersion: string
   warnings: string[]
   segment: Partial<{
     kind: string
+    ownership: string
+    workType: string | null
     marker: string | null
     itemIndexes: number[]
     itemNames: string[]
@@ -62,10 +67,25 @@ type Snapshot = Partial<{
     allocatedDiscountAmount: number
     share: number
   }>
-  job: Partial<{ jobTotal: number; colorSealTotal: number; discountAmount: number; cardServiceAmount: number; markers: string[] }>
+  job: Partial<{ jobType: string | null; jobTotal: number; colorSealTotal: number; discountAmount: number; cardServiceAmount: number; nonCardServiceAmount: number; markers: string[]; workType: string | null }>
   verification: Partial<{ balanced: boolean; assignedItemCount: number; itemCount: number; doubleCountedItems: number }>
   /** Set when this technician was added because they always work with someone Workiz assigned. */
   companionOf: { id: number; name: string } | null
+  /** Set when the Work Type named this technician although Workiz did not assign them. */
+  addedAsOwner: boolean
+  ownership: Partial<{ reason: string; workType: string | null; ownerName: string | null; label: string | null; explanation: string }>
+  rates: Partial<{ nonColorRate: number; colorRate: number; separateColorSeal: boolean; tipShare: number }>
+  tips: Partial<{
+    total: number
+    card: number
+    other: number
+    recipients: { id: number; name: string }[]
+    share: number
+    excluded: { id: number; name: string; reason: string }[]
+    needsReview: string | null
+    thisTechnician: number
+  }>
+  invoiceFee: Partial<{ serviceSubtotal: number; cardPaid: number; otherPaid: number; cardShare: number; feeRate: number; fee: number; serviceFactor: number; adjustedServiceSubtotal: number }>
 }>
 
 const pct = (v: string | number | null | undefined) => `${(Number(v ?? 0) * 100).toFixed(Number(v ?? 0) * 100 % 1 === 0 ? 0 : 1)}%`
@@ -100,45 +120,43 @@ function snapshotMismatches(p: PayoutRecord, snap: Snapshot): string[] {
   return out
 }
 
+export type SheetHandlers = {
+  onAction: (id: number, action: ReviewAction, note?: string) => void
+  payments: PaymentHandlers
+  /** Pre-cutoff work first seen after the opening balance: settle it as historically paid. */
+  onConfirmPreviouslyPaid: (payoutId: number) => void
+  /** Jump to the Due tab with this technician's card in view. */
+  onGoToDue?: (profileId: number) => void
+  /** Open the batch this payout was settled in. */
+  onOpenBatch?: (batchId: number) => void
+}
+
 export function PayoutDetailSheet({
   record,
   open,
   onOpenChange,
   timezone,
   pending,
-  onAction,
-  payments,
+  handlers,
 }: {
   record: PayoutRecord | null
   open: boolean
   onOpenChange: (open: boolean) => void
   timezone: string
   pending: boolean
-  onAction: (id: number, action: ReviewAction, note?: string) => void
-  payments: PaymentHandlers
+  handlers: SheetHandlers
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent side="right" className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl">
-        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} onAction={onAction} paymentHandlers={payments} />}
+        {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} handlers={handlers} />}
       </SheetContent>
     </Sheet>
   )
 }
 
-function PayoutDetail({
-  p,
-  timezone,
-  pending,
-  onAction,
-  paymentHandlers,
-}: {
-  p: PayoutRecord
-  timezone: string
-  pending: boolean
-  onAction: (id: number, action: ReviewAction, note?: string) => void
-  paymentHandlers: PaymentHandlers
-}) {
+function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; timezone: string; pending: boolean; handlers: SheetHandlers }) {
+  const { onAction, payments: paymentHandlers } = handlers
   const [note, setNote] = useState(p.adminNote ?? "")
   useEffect(() => setNote(p.adminNote ?? ""), [p.adminNote])
 
@@ -147,9 +165,14 @@ function PayoutDetail({
   const segment = snap.segment ?? null
   const markers = snap.job?.markers ?? []
   const marker = p.segmentMarker ?? markers.join("/") ?? null
-  const label = segmentLabel(p.segmentKind, marker)
+  const ownership = snap.ownership ?? null
+  const label = segmentLabel(p.segmentKind, marker, ownership)
+  const whyPaid = ownership?.explanation ?? ownershipExplanation(p.segmentKind, marker, ownership)
   const provisional = p.status === "pending" || p.status === "hold"
   const notCalculated = num(p.jobTotal) <= 0 && num(p.totalPayout) === 0
+  const fee = snap.invoiceFee ?? null
+  const tips = snap.tips ?? null
+  const pctExact = (v: number) => `${(v * 100).toFixed(4)}%`
   const workizUrl = workizJobUrl(p.jobUuid)
   const separateColorSeal = snap.colorAmount !== undefined ? snap.colorAmount > 0 || num(p.colorSealTotal) === 0 : num(p.colorPayout) > 0 || num(p.colorSealTotal) === 0
   const nonColorAmount = snap.nonColorAmount ?? (separateColorSeal ? num(p.jobTotal) - num(p.colorSealTotal) : num(p.jobTotal))
@@ -195,13 +218,24 @@ function PayoutDetail({
   const ownerLabel = (kind: ReturnType<typeof lineItemOwnership>) => {
     switch (kind) {
       case "whole-job":
-        return { text: p.splitCount > 1 ? `Whole job · shared by ${p.splitCount} technicians` : "Whole job", mine: true }
+        return { text: p.splitCount > 1 ? `Whole job · each of ${p.splitCount} technicians paid on it at their own rate` : "Whole job", mine: true }
       case "this-technician":
-        return { text: p.segmentKind === "dedicated" ? `${p.profileName} �� ${label ?? "marked work"}` : `${p.profileName} · crew work`, mine: true }
+        return {
+          text:
+            ownership?.reason === "work-type"
+              ? `${p.profileName} · Work Type "${ownership.workType}"`
+              : p.segmentKind === "dedicated"
+                ? `${p.profileName} · ${label ?? "marked work"}`
+                : `${p.profileName} · crew work`,
+          mine: true,
+        }
       case "crew":
         return { text: "Crew work · not this technician", mine: false }
       case "dedicated":
-        return { text: `${segmentLabel("dedicated", markers.join("/") || marker) ?? "Marked work only"} · not this technician`, mine: false }
+        return {
+          text: ownership?.workType ? `${ownership.ownerName ?? "Owner"} · Work Type "${ownership.workType}" · not this technician` : `${segmentLabel("dedicated", markers.join("/") || marker) ?? "Marked work only"} · not this technician`,
+          mine: false,
+        }
     }
   }
 
@@ -210,7 +244,7 @@ function PayoutDetail({
       <SheetHeader className="gap-2 border-b bg-card p-5">
         <div className="flex flex-wrap items-center gap-2">
           <StatusBadge status={p.status} />
-          {provisional && <Badge variant="outline" className="border-amber-500/40 text-amber-700 dark:text-amber-300">Provisional amount</Badge>}
+          {provisional && <Badge variant="outline" className="border-warning/60 bg-warning/10 text-warning-foreground">Provisional amount</Badge>}
           {p.status === "paid" && p.paidAt && <span className="text-xs text-muted-foreground">Paid {zonedDateTime(p.paidAt, timezone)}</span>}
         </div>
         <SheetTitle className="text-lg">
@@ -237,12 +271,12 @@ function PayoutDetail({
 
       <div className="flex flex-col gap-6 p-5">
         {(mismatches.length > 0 || warnings.length > 0) && (
-          <section aria-label="Warnings" className="flex flex-col gap-2 rounded-md border border-amber-500/40 bg-amber-500/5 p-3 text-sm">
-            <p className="flex items-center gap-2 font-medium text-amber-800 dark:text-amber-200">
+          <section aria-label="Warnings" className="flex flex-col gap-2 rounded-md border border-warning/50 bg-warning/10 p-3 text-sm">
+            <p className="flex items-center gap-2 font-medium text-warning-foreground">
               <AlertTriangle className="h-4 w-4" aria-hidden="true" />
               {mismatches.length ? "Latest Workiz data differs from this saved payout" : "Sync warnings saved with this payout"}
             </p>
-            <ul className="list-disc pl-5 text-amber-900/90 dark:text-amber-100/90">
+            <ul className="list-disc pl-5 text-foreground/90">
               {mismatches.map((m) => (
                 <li key={m}>{m}</li>
               ))}
@@ -251,7 +285,7 @@ function PayoutDetail({
               ))}
             </ul>
             {mismatches.length > 0 && (
-              <p className="text-xs text-amber-900/80 dark:text-amber-100/80">
+              <p className="text-xs text-muted-foreground">
                 {p.status === "paid" || p.status === "void"
                   ? "Paid and voided payouts are never rewritten by a sync; review manually if the difference matters."
                   : "Re-sync the job to recalculate from the latest Workiz data."}
@@ -270,18 +304,27 @@ function PayoutDetail({
           )}
           <Facts
             rows={[
-              ["Technician paid", p.status === "paid" ? `Yes · ${zonedDateTime(p.paidAt, timezone)}${p.paidBy ? ` by ${p.paidBy}` : ""}` : "Not yet"],
-              ["Message to technician", p.lastNotification ? <span className="inline-flex flex-wrap items-center gap-2"><StatusBadge status={p.lastNotification.status} />{p.lastNotification.sentAt ? <span className="text-xs text-muted-foreground">sent {zonedDateTime(p.lastNotification.sentAt, timezone)}</span> : null}</span> : "None rendered yet"],
+              [
+                "Technician paid",
+                p.status === "paid" ? (
+                  <span className="inline-flex flex-wrap items-center justify-end gap-x-2">
+                    <span>
+                      {p.settledKind === "opening" ? "Yes · previously settled (opening balance)" : `Yes · ${zonedDateTime(p.paidAt, timezone)}${p.paidBy ? ` by ${p.paidBy}` : ""}`}
+                    </span>
+                    {p.batchId != null && handlers.onOpenBatch && (
+                      <button type="button" className="text-primary underline-offset-4 hover:underline" onClick={() => handlers.onOpenBatch?.(p.batchId as number)}>
+                        Payment #{p.batchId}
+                      </button>
+                    )}
+                  </span>
+                ) : (
+                  "Not yet"
+                ),
+              ],
               p.adminNote ? ["Admin note", p.adminNote] : null,
               p.reviewedAt ? ["Last reviewed", `${zonedDateTime(p.reviewedAt, timezone)}${p.reviewedBy ? ` by ${p.reviewedBy}` : ""}`] : null,
             ]}
           />
-          {p.lastNotification && (
-            <p className="rounded border bg-muted/40 p-2 text-xs">
-              {p.lastNotification.message}
-              {p.lastNotification.error && <span className="text-destructive"> · {p.lastNotification.error}</span>}
-            </p>
-          )}
         </Section>
 
         <Section title="Job and customer">
@@ -292,11 +335,17 @@ function PayoutDetail({
               ["Customer", job?.clientName ?? "Unavailable"],
               ["Service address", job?.address ?? "Unavailable"],
               ["Workiz job status", job?.status ? `${job.status}${job.subStatus ? ` · ${job.subStatus}` : ""}` : "Unavailable"],
-              job?.jobType ? ["Job type", job.jobType] : null,
+              job?.jobType ? ["Work Type (Workiz)", job.jobType] : null,
               ["Team on job", job?.teamNames?.length ? job.teamNames.join(", ") : job?.teamIds?.length ? job.teamIds.join(", ") : "Unavailable"],
               snap.companionOf ? ["Why this technician", `${p.profileName} always works with ${snap.companionOf.name}; added although Workiz does not list them on this job`] : null,
+              snap.addedAsOwner ? ["Why this technician", `Work Type "${ownership?.workType ?? job?.jobType ?? ""}" belongs to ${p.profileName}; added although Workiz does not list them on this job`] : null,
+              ["Ownership rule", ownership?.reason === "work-type" ? "A · Work Type" : ownership?.reason === "marker" ? "B · marked items" : ownership?.reason === "crew" ? (ownership.workType ? "A · Work Type (owned by someone else)" : "C · regular crew") : "C · whole job"],
             ]}
           />
+          <p className="rounded-md border bg-muted/40 p-2 text-sm">
+            <span className="font-medium">Why {p.profileName} is paid on this: </span>
+            {whyPaid}
+          </p>
           {p.siblings.length > 0 && (
             <div className="flex flex-col gap-1 text-sm">
               <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Other technicians on this job (separate payouts)</p>
@@ -401,26 +450,46 @@ function PayoutDetail({
           />
         </Section>
 
-        <Section title={`Individual payout · ${p.profileName}`} hint="Saved calculation. Historical rates are shown, not today's.">
+        <Section title={`Individual payout · ${p.profileName}`} hint="Saved calculation. Historical rates are shown, not today's. Formula: eligible amount after discounts × (1 − card share × 3.5%) × rate, plus this technician's share of the business-held tip.">
           <Facts
             rows={[
-              ["Eligible service amount", money(p.jobTotal)],
-              separateColorSeal ? ["Regular work portion", money(nonColorAmount)] : [`${label && p.segmentKind === "dedicated" ? label : "Whole amount"} at one rate`, money(nonColorAmount)],
-              separateColorSeal ? ["Color-sealing portion", money(colorAmount)] : null,
-              ["Rates used", `${pct(p.nonColorRate)} regular${separateColorSeal ? ` · ${pct(p.colorRate)} color seal` : ""} · ${pct(p.tipShare)} of tips`],
-              ["Commission on regular work", money(p.nonColorPayout)],
-              separateColorSeal ? ["Commission on color sealing", money(p.colorPayout)] : null,
+              ["Eligible service amount (after discounts)", money(p.jobTotal)],
+              separateColorSeal ? ["Regular services portion", money(nonColorAmount)] : [`${label && p.segmentKind === "dedicated" ? label : "Whole amount"} at one rate`, money(nonColorAmount)],
+              separateColorSeal && colorAmount > 0 ? ["Color-sealing portion", money(colorAmount)] : null,
+              snap.serviceFactor !== undefined && snap.serviceFactor < 1
+                ? ["After invoice-wide card deduction", `× ${snap.serviceFactor.toFixed(10)} → ${money((snap.adjustedNonColorAmount ?? 0) + (snap.adjustedColorAmount ?? 0))}`]
+                : null,
+              ["Rates applied", `${pct(p.nonColorRate)} regular services${separateColorSeal ? ` · ${pct(p.colorRate)} color sealing` : ""}`],
+              ["Commission on regular services", money(p.nonColorPayout)],
+              separateColorSeal && colorAmount > 0 ? ["Commission on color sealing", money(p.colorPayout)] : null,
               [
-                "Card-fee adjustment",
+                "Effect of the card fee on this commission",
                 snap.cardFeeAdjustment !== undefined
                   ? snap.cardFeeAdjustment > 0
-                    ? `−${money(snap.cardFeeAdjustment)} · 3.5% on the ${pct(cardShare)} paid by card`
+                    ? `−${money(snap.cardFeeAdjustment)} · 3.5% on the ${pct(cardShare)} of services paid by card`
                     : "$0.00 · no card payments"
                   : hasCardMoney
                     ? `Unavailable · saved before fee tracking (${pct(cardShare)} paid by card)`
                     : "$0.00 · no card payments",
               ],
-              ["Payable tip share", `${money(p.tipPayout)}${snap.cardTipPayout !== undefined ? ` (card ${money(snap.cardTipPayout)} + other ${money(snap.nonCardTipPayout)})` : ""}`],
+              [
+                "Tip share",
+                tips && tips.total !== undefined && tips.total > 0
+                  ? num(p.tipShare) > 0
+                    ? `${pct(p.tipShare)} of ${money(tips.total)} → ${money(p.tipPayout)}${snap.cardTipPayout !== undefined && snap.cardTipPayout > 0 ? ` (card part after 3.5%: ${money(snap.cardTipPayout)}; other ${money(snap.nonCardTipPayout)})` : ""}`
+                    : `None · ${ownership?.reason === "work-type" || ownership?.reason === "marker" ? "paid on own work only, never shares tips" : "not eligible"}`
+                  : num(p.tipPayout) > 0
+                    ? `${money(p.tipPayout)}${snap.cardTipPayout !== undefined ? ` (card ${money(snap.cardTipPayout)} + other ${money(snap.nonCardTipPayout)})` : ""}`
+                    : "$0.00 · no tip recorded",
+              ],
+              tips && tips.total !== undefined && tips.total > 0
+                ? [
+                    "Tip recipients",
+                    tips.recipients?.length
+                      ? `${tips.recipients.map((r) => r.name).join(", ")} · ${pct(tips.share ?? 0)} each${tips.excluded?.length ? ` · ${tips.excluded.map((e) => e.name).join(", ")}: none` : ""}`
+                      : tips.needsReview ?? "Nobody eligible · needs review",
+                  ]
+                : null,
             ]}
           />
           <div className="flex items-baseline justify-between gap-3 border-t pt-2">
@@ -488,6 +557,17 @@ function PayoutDetail({
               ["Paid by", methods.count ? `${methods.label}${methods.mixed ? " (mixed)" : ""}${manualPayments.length && !fromWorkiz ? " · confirmed by admin" : ""}` : PAYMENT_DETAILS_UNAVAILABLE],
               ["Invoice subtotal", job?.subTotal != null ? money(job.subTotal) : "Not provided by Workiz"],
               ["Discount", job ? `−${money(job.discountAmount)}` : "Unavailable"],
+              ["Service subtotal after discounts (S)", job ? money(job.jobTotal) : "Unavailable"],
+              fee && fee.serviceSubtotal !== undefined
+                ? ["Paid by card (C) / other", `${money(fee.cardPaid ?? 0)} / ${money(fee.otherPaid ?? 0)}`]
+                : job
+                  ? ["Paid by card (C) / other", `${money(job.cardServiceAmount)} / ${money(job.nonCardServiceAmount)}`]
+                  : null,
+              fee && fee.cardShare !== undefined ? ["Card-paid share (C ÷ S)", fee.cardShare > 0 ? pctExact(fee.cardShare) : "0% · no card payments on file"] : null,
+              fee && fee.fee !== undefined && fee.fee > 0 ? ["Card processing fee (3.5% of C)", `${money(fee.fee)} · exact ${fee.fee.toFixed(4)}`] : null,
+              fee && fee.serviceFactor !== undefined && fee.serviceFactor < 1
+                ? ["Invoice-wide reduction on services", `${pctExact(1 - fee.serviceFactor)} → services × ${fee.serviceFactor.toFixed(10)} = ${money(fee.adjustedServiceSubtotal ?? 0)} (exact ${(fee.adjustedServiceSubtotal ?? 0).toFixed(4)})`]
+                : null,
               ["Tip", job ? money(tipsTotal) : "Unavailable"],
               ["Tax", tax != null ? money(tax) : unitemized > 0.005 ? `${money(unitemized)} · tax/fees not itemized by Workiz` : "Not provided by Workiz"],
               [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
@@ -505,16 +585,33 @@ function PayoutDetail({
         </Section>
 
         <Section title="Review">
+          {p.openingReview && p.status === "hold" && (
+            <div className="flex flex-col gap-2 rounded-md border border-warning/50 bg-warning/10 p-3 text-sm">
+              <p className="font-medium text-warning-foreground">Finished before your opening-balance cutoff</p>
+              <p className="text-muted-foreground">
+                This job was first seen after the opening balance was recorded, but it was completed and paid by the customer before the cutoff. If {p.profileName} was already paid for it, confirm that
+                here and it goes into history as previously settled. If not, release it and it becomes due.
+              </p>
+              <div className="flex flex-wrap gap-2">
+                <Button size="sm" disabled={pending} onClick={() => handlers.onConfirmPreviouslyPaid(p.id)}>
+                  Confirm previously paid
+                </Button>
+                <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction(p.id, "release", note)}>
+                  Not paid yet · make it due
+                </Button>
+              </div>
+            </div>
+          )}
           <Textarea value={note} onChange={(e) => setNote(e.target.value)} placeholder="Admin note (optional)" rows={2} className="text-sm" aria-label="Admin note" />
           <div className="flex flex-wrap gap-2">
-            {p.status !== "ready" && p.status !== "paid" && (
+            {p.status !== "ready" && p.status !== "paid" && !(p.openingReview && p.status === "hold") && (
               <Button size="sm" disabled={pending} onClick={() => onAction(p.id, "release", note)}>
                 Release
               </Button>
             )}
-            {p.status === "ready" && (
-              <Button size="sm" disabled={pending} onClick={() => onAction(p.id, "mark-paid", note)}>
-                Mark paid
+            {p.status === "ready" && handlers.onGoToDue && (
+              <Button size="sm" disabled={pending} onClick={() => handlers.onGoToDue?.(p.profileId)}>
+                Pay from Due
               </Button>
             )}
             {p.status !== "hold" && p.status !== "paid" && (
@@ -522,7 +619,7 @@ function PayoutDetail({
                 Hold
               </Button>
             )}
-            {p.status === "paid" && (
+            {p.status === "paid" && p.batchId == null && (
               <Button size="sm" variant="outline" disabled={pending} onClick={() => onAction(p.id, "reopen", note)}>
                 Reopen
               </Button>
@@ -533,7 +630,8 @@ function PayoutDetail({
               </Button>
             )}
           </div>
-          {p.status !== "ready" && <InlineMessage tone="info">Mark paid is only available once this payout is Ready.</InlineMessage>}
+          {p.status === "ready" && <InlineMessage tone="info">Payments are recorded per technician from the Due tab, so the amount you pay always matches what the app owes.</InlineMessage>}
+          {p.status === "paid" && p.batchId != null && <InlineMessage tone="info">Settled in a recorded payment. To take it back, undo that payment from Paid history; the payout returns to Due or Waiting on its own.</InlineMessage>}
         </Section>
       </div>
     </div>
