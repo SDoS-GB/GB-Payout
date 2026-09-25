@@ -5,7 +5,8 @@ import { addCompanions } from "@/lib/payout/companions"
 import { computeForProfile, gateReason, invoiceCardFee } from "@/lib/payout/engine"
 import { normalizeWorkType, planSegments, workTypeMatches, type PlannableProfile, type SegmentPlan } from "@/lib/payout/segments"
 import { DEFAULT_WORKIZ_SETTINGS } from "@/lib/settings"
-import { PAYMENT_METHOD_UNKNOWN_PREFIX, TIP_METHOD_UNCLEAR_PREFIX, normalizeJob, type NormalizedJob } from "@/lib/workiz/normalize"
+import { PAYMENT_METHOD_UNKNOWN_PREFIX, TIP_METHOD_UNCLEAR_PREFIX, UNITEMIZED_SURPLUS_PREFIX, normalizeJob, type NormalizedJob } from "@/lib/workiz/normalize"
+import { TIP_INCLUSION_RAW_KEY, externalRowsToPayments } from "@/lib/workiz/payments"
 
 /**
  * Synthetic fixtures for the 2026-09-23 payout corrections. Every expected
@@ -525,5 +526,84 @@ describe("Card fee distribution details", () => {
     const job = normalizeJob(raw760({ Payments: [{ id: "x", Amount: 760, Method: "Barter" }] }), settings, noCatalog)
     expect(job.warnings.some((w) => w.startsWith(PAYMENT_METHOD_UNKNOWN_PREFIX))).toBe(true)
     expect(gateReason(job, settings)).not.toBeNull()
+  })
+})
+
+describe("Fixture 5: live job #924884 — $2,376.06 less 5% discount, all card, $231.67 card tip inside the final charge", () => {
+  // Workiz's invoice: Subtotal 2,376.06, Discount 118.80, Tax 0.00, Tip 231.67, Total 2,488.93.
+  // Payments tab: 712.82 card deposit, 1,776.11 card final (the tip rode on it). Arthur and Viktor 20%/25%.
+  const raw924884 = {
+    UUID: "1N6S4G",
+    SerialId: "924884",
+    Status: "Done",
+    JobType: "Estimate",
+    Team: [TEAM.arthur, TEAM.viktor],
+    SubTotal: 2376.06,
+    JobTotalPrice: 2488.93,
+    JobAmountDue: 0,
+    LineItems: [
+      { Name: "Restorative Tile & Grout Floor Cleaning (All Areas)", Type: "service", Price: 677.69, Qty: 1 },
+      { Name: "Grout Color Sealing – Floors (All Areas)", Type: "service", Price: 948.37, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Master", Type: "service", Price: 95, Qty: 1 },
+      { Name: "Grout Sealing | Walk-in Shower | 2 Coats | Master", Type: "service", Price: 185, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Guest Shower", Type: "service", Price: 85, Qty: 1 },
+      { Name: "Grout Sealing | Walk-in Shower | 2 Coats | Guest Shower ", Type: "service", Price: 175, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Guest Tub Shower", Type: "service", Price: 75, Qty: 1 },
+      { Name: "Grout Sealing | Guest Tub Shower | 2 Coats", Type: "service", Price: 135, Qty: 1 },
+      { Name: "discount", Type: "DISCOUNT_TYPE", Price: 118.803, Qty: 1 },
+    ],
+  }
+  const confirmed = externalRowsToPayments(
+    [
+      { id: 1, externalId: null, source: "manual", method: "Card", amount: "712.82", tipAmount: "0.00", paidAt: new Date("2026-09-15T16:39:00.000Z"), recordedBy: "admin", raw: null },
+      { id: 2, externalId: null, source: "manual", method: "Card", amount: "1776.11", tipAmount: "231.67", paidAt: new Date("2026-09-25T21:38:00.000Z"), recordedBy: "admin", raw: { [TIP_INCLUSION_RAW_KEY]: "included" } },
+    ],
+    settings.cardMethodKeywords,
+  )
+  const job = normalizeJob(raw924884, settings, noCatalog, { externalPayments: confirmed })
+
+  it("normalizes to S = 2257.26 (color 900.95 / regular 1356.31), 100% card, tip 231.67 by card, paid in full, nothing blocking", () => {
+    expect(job.jobTotal).toBe(2257.26)
+    expect(job.colorSealTotal).toBe(900.95)
+    expect(job.cardServiceAmount).toBe(2257.26)
+    expect(job.cardTipAmount).toBe(231.67)
+    expect(job.nonCardTipAmount).toBe(0)
+    expect(job.fullyPaid).toBe(true)
+    expect(job.unitemizedSurplus).toBe(0)
+    expect(gateReason(job, settings)).toBeNull()
+    const fee = invoiceCardFee(job)
+    expect(fee.cardShare).toBe(1)
+    expect(fee.serviceFactor).toBeCloseTo(1 - CARD_FEE_RATE, 12)
+  })
+
+  it("Arthur and Viktor each receive $590.90: $479.12 commission + $111.78 tip share, after the 3.5% card fee on both", () => {
+    const plan = planSegments(job, [ARTHUR, VIKTOR], ROSTER)
+    expect(plan.warnings).toEqual([])
+    for (const t of [ARTHUR, VIKTOR]) {
+      const pay = payoutFor(job, plan, t)
+      // (1356.31 x 0.20 + 900.95 x 0.25) x 0.965 = 496.4995 x 0.965 = 479.1220...
+      expect(pay.basePayout).toBeCloseTo(496.4995 * (1 - CARD_FEE_RATE), 9)
+      expect(cents(pay.basePayout)).toBe(479.12)
+      // 231.67 x 0.965 / 2 = 111.7808...
+      expect(pay.tipPayout).toBeCloseTo((231.67 * (1 - CARD_FEE_RATE)) / 2, 9)
+      expect(cents(pay.tipPayout)).toBe(111.78)
+      expect(cents(pay.totalPayout)).toBe(590.9)
+    }
+  })
+
+  it("without the confirmed tip the same job is held for the $231.67 surplus and would pay only $479.12", () => {
+    const noTip = normalizeJob(raw924884, settings, noCatalog, {
+      externalPayments: externalRowsToPayments(
+        [
+          { id: 1, externalId: null, source: "manual", method: "Card", amount: "712.82", tipAmount: "0.00", paidAt: null, recordedBy: "admin", raw: null },
+          { id: 2, externalId: null, source: "manual", method: "Card", amount: "1776.11", tipAmount: "0.00", paidAt: null, recordedBy: "admin", raw: null },
+        ],
+        settings.cardMethodKeywords,
+      ),
+    })
+    expect(noTip.unitemizedSurplus).toBe(231.67)
+    expect(gateReason(noTip, settings)).toMatch(UNITEMIZED_SURPLUS_PREFIX)
+    const plan = planSegments(noTip, [ARTHUR, VIKTOR], ROSTER)
+    expect(cents(payoutFor(noTip, plan, ARTHUR).totalPayout)).toBe(479.12)
   })
 })

@@ -1,7 +1,8 @@
 import { describe, expect, it } from "vitest"
 import { calcLegacyJobPayout, calcPayoutWithPaymentSplit } from "@/lib/payout/calculator"
 import { DEFAULT_WORKIZ_SETTINGS } from "@/lib/settings"
-import { isPayableStatus, normalizeJob } from "@/lib/workiz/normalize"
+import { UNITEMIZED_SURPLUS_PREFIX, isBlockingWarning, isPayableStatus, normalizeJob } from "@/lib/workiz/normalize"
+import { externalRowsToPayments, TIP_INCLUSION_RAW_KEY } from "@/lib/workiz/payments"
 
 const settings = DEFAULT_WORKIZ_SETTINGS
 const noCatalog = new Map<string, boolean>()
@@ -63,7 +64,7 @@ describe("normalizeJob – revenue & discounts", () => {
     expect(job.warnings.some((w) => w.startsWith("Unitemized discount"))).toBe(true)
   })
 
-  it("does not lower the service total when JobTotalPrice is higher (unitemized tax or fees), only notes it", () => {
+  it("does not lower the service total when JobTotalPrice is higher; the surplus is a likely tip and holds the payout", () => {
     const job = normalizeJob(
       { ...baseJob, SubTotal: 450, JobTotalPrice: 457.43, JobAmountDue: 0, LineItems: [{ Name: "Regrout", Price: 450, Quantity: 1, Type: "service" }] },
       settings,
@@ -71,7 +72,10 @@ describe("normalizeJob – revenue & discounts", () => {
     )
     expect(job.jobTotal).toBe(450)
     expect(job.discountAmount).toBe(0)
-    expect(job.warnings.some((w) => w.startsWith("Workiz invoice total exceeds"))).toBe(true)
+    expect(job.unitemizedSurplus).toBe(7.43)
+    const surplus = job.warnings.find((w) => w.startsWith(UNITEMIZED_SURPLUS_PREFIX))
+    expect(surplus).toMatch(/\$7\.43 above the itemized service total \$450\.00/)
+    expect(isBlockingWarning(surplus!)).toBe(true)
   })
 
   it("derives discounts from negative line items when Workiz gives no Discount field", () => {
@@ -219,5 +223,102 @@ describe("payable status gating", () => {
     expect(isPayableStatus("Completed", settings)).toBe(true)
     expect(isPayableStatus("Submitted", settings)).toBe(false)
     expect(isPayableStatus(null, settings)).toBe(false)
+  })
+})
+
+describe("job #924884 (UUID 1N6S4G): Workiz folds its Tip field into JobTotalPrice without any API field", () => {
+  // Stored job/get payload, 2026-09-25. Workiz's own invoice screen: Subtotal 2,376.06, Discount 118.80,
+  // Tax 0.00, Tip 231.67, Total 2,488.93; Payments tab: 712.82 card deposit + 1,776.11 card (tip inside it).
+  const raw924884 = (over: Record<string, unknown> = {}) => ({
+    UUID: "1N6S4G",
+    SerialId: 924884,
+    Status: "Done",
+    JobType: "Estimate",
+    Team: [
+      { id: 9003, Name: "Arthur" },
+      { id: 9004, Name: "Viktor" },
+    ],
+    SubTotal: 2376.06,
+    JobTotalPrice: 2488.93,
+    JobAmountDue: 0,
+    LineItems: [
+      { Name: "Restorative Tile & Grout Floor Cleaning (All Areas)", Type: "service", Price: 677.69, Qty: 1 },
+      { Name: "Grout Color Sealing – Floors (All Areas)", Type: "service", Price: 948.37, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Master", Type: "service", Price: 95, Qty: 1 },
+      { Name: "Grout Sealing | Walk-in Shower | 2 Coats | Master", Type: "service", Price: 185, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Guest Shower", Type: "service", Price: 85, Qty: 1 },
+      { Name: "Grout Sealing | Walk-in Shower | 2 Coats | Guest Shower ", Type: "service", Price: 175, Qty: 1 },
+      { Name: "Shower Tile And Grout Deep Cleaning Service | Guest Tub Shower", Type: "service", Price: 75, Qty: 1 },
+      { Name: "Grout Sealing | Guest Tub Shower | 2 Coats", Type: "service", Price: 135, Qty: 1 },
+      { Name: "discount", Type: "DISCOUNT_TYPE", Price: 118.803, Qty: 1 },
+    ],
+    ...over,
+  })
+
+  const manualRow = (id: number, method: string, amount: number, tip: number) => ({
+    id,
+    externalId: null,
+    source: "manual",
+    method,
+    amount: amount.toFixed(2),
+    tipAmount: tip.toFixed(2),
+    paidAt: new Date("2026-09-25T21:00:00.000Z"),
+    recordedBy: "admin",
+    raw: tip > 0 ? { [TIP_INCLUSION_RAW_KEY]: "included" } : null,
+  })
+
+  it("from the job payload alone: S 2257.26, color 900.95, and a $231.67 surplus that is flagged as a likely tip", () => {
+    const job = normalizeJob(raw924884(), settings, noCatalog)
+    expect(job.subTotal).toBe(2376.06)
+    expect(job.discountAmount).toBe(118.8)
+    expect(job.jobTotal).toBe(2257.26)
+    // 948.37 x (2257.26 / 2376.06) = 948.37 x 0.95 = 900.9515
+    expect(job.colorSealTotal).toBe(900.95)
+    expect(job.cardTipAmount + job.nonCardTipAmount).toBe(0)
+    expect(job.unitemizedSurplus).toBe(231.67)
+    expect(job.warnings.some((w) => w.startsWith(UNITEMIZED_SURPLUS_PREFIX) && w.includes("$231.67"))).toBe(true)
+    // Clear grout sealing is regular work; it must not be reported as a missed color-seal item.
+    expect(job.warnings.some((w) => w.includes("mention"))).toBe(false)
+    expect(job.lineItems.filter((i) => i.isColorSeal).map((i) => i.name)).toEqual(["Grout Color Sealing – Floors (All Areas)"])
+  })
+
+  it("admin-confirmed card payments with the tip inside the final charge: paid in full, all card, tip $231.67 by card, no surplus left", () => {
+    const external = externalRowsToPayments([manualRow(1, "Card", 712.82, 0), manualRow(2, "Card", 1776.11, 231.67)], settings.cardMethodKeywords)
+    expect(external.map((p) => [p.isTip, p.amount])).toEqual([
+      [false, 712.82],
+      [false, 1544.44],
+      [true, 231.67],
+    ])
+    const job = normalizeJob(raw924884(), settings, noCatalog, { externalPayments: external })
+    expect(job.cardServiceAmount).toBe(2257.26)
+    expect(job.nonCardServiceAmount).toBe(0)
+    expect(job.cardTipAmount).toBe(231.67)
+    expect(job.nonCardTipAmount).toBe(0)
+    expect(job.totalPaid).toBe(2488.93)
+    expect(job.fullyPaid).toBe(true)
+    expect(job.paidEvidence).toBe("payments")
+    expect(job.unitemizedSurplus).toBe(0)
+    expect(job.warnings.filter(isBlockingWarning)).toEqual([])
+  })
+
+  it("confirming the two card payments without the tip keeps the surplus hold and records no tip", () => {
+    const external = externalRowsToPayments([manualRow(1, "Card", 712.82, 0), manualRow(2, "Card", 1776.11, 0)], settings.cardMethodKeywords)
+    const job = normalizeJob(raw924884(), settings, noCatalog, { externalPayments: external })
+    expect(job.fullyPaid).toBe(true)
+    expect(job.cardServiceAmount).toBe(2257.26) // 2488.93 of card money scaled onto the service total
+    expect(job.cardTipAmount + job.nonCardTipAmount).toBe(0)
+    expect(job.unitemizedSurplus).toBe(231.67)
+    expect(job.warnings.filter(isBlockingWarning).map((w) => w.split(":")[0])).toEqual([UNITEMIZED_SURPLUS_PREFIX])
+  })
+
+  it("a tip handed to the technician on top of the invoice never counts toward the balance", () => {
+    // Same job, but Workiz's total carries no tip; a $40 cash tip is recorded on its own.
+    const external = externalRowsToPayments([manualRow(1, "Card", 2257.26, 0), manualRow(2, "Cash", 40, 40)], settings.cardMethodKeywords)
+    const job = normalizeJob(raw924884({ JobTotalPrice: 2257.26 }), settings, noCatalog, { externalPayments: external })
+    expect(job.nonCardTipAmount).toBe(40)
+    expect(job.unitemizedSurplus).toBe(0)
+    expect(job.totalPaid).toBe(2297.26)
+    expect(job.fullyPaid).toBe(true)
+    expect(job.warnings.filter(isBlockingWarning)).toEqual([])
   })
 })

@@ -178,27 +178,33 @@ export async function replaceManualPayments(jobUuid: string, entries: ManualPaym
     await tx.delete(jobPayments).where(and(eq(jobPayments.jobUuid, jobUuid), eq(jobPayments.source, "manual")))
     if (entries.length) {
       await tx.insert(jobPayments).values(
-        entries.map((e) => ({
-          jobUuid,
-          externalId: null,
-          source: "manual",
-          method: e.method,
-          amount: e.amount.toFixed(2),
-          tipAmount: "0",
-          paidAt: e.paidAt ? new Date(e.paidAt) : null,
-          paidAtFromPayload: Boolean(e.paidAt),
-          invoiceId: null,
-          reference: e.reference ?? null,
-          recordedBy,
-          raw: null,
-        })),
+        entries.map((e) => {
+          const tip = e.tipAmount ?? 0
+          return {
+            jobUuid,
+            externalId: null,
+            source: "manual",
+            method: e.method,
+            amount: e.amount.toFixed(2),
+            tipAmount: tip.toFixed(2),
+            paidAt: e.paidAt ? new Date(e.paidAt) : null,
+            paidAtFromPayload: Boolean(e.paidAt),
+            invoiceId: null,
+            reference: e.reference ?? null,
+            recordedBy,
+            // The admin types the charge as Workiz shows it, tip included, so the service part is the remainder.
+            raw: tip > 0 ? { [TIP_INCLUSION_RAW_KEY]: "included" } : null,
+          }
+        }),
       )
     }
   })
   await logSyncEvent("payments", {
     jobUuid,
     ok: true,
-    summary: entries.length ? `Admin confirmed ${entries.length} payment(s) (recovery entry): ${entries.map((e) => `$${e.amount.toFixed(2)} ${e.method}`).join(", ")}` : "Admin cleared confirmed payments",
+    summary: entries.length
+      ? `Admin confirmed ${entries.length} payment(s) (recovery entry): ${entries.map((e) => `$${e.amount.toFixed(2)} ${e.method}${e.tipAmount ? ` incl. $${e.tipAmount.toFixed(2)} tip` : ""}`).join(", ")}`
+      : "Admin cleared confirmed payments",
     details: { entries, recordedBy },
   })
   return entries.length
