@@ -221,11 +221,12 @@ export function externalRowsToPayments(rows: ReadonlyArray<Pick<JobPaymentRow, "
       continue
     }
     const inclusion = tipInclusionOfRow(row.raw)
-    // "included": Workiz's amount already contains the tip, so the service part is the remainder.
+    // "included": the amount already contains the tip, so the service part is the remainder
+    //             (a payment that was entirely tip leaves no service row).
     // "separate": amount is the service payment and the tip is on top of it.
     // "unknown": kept as separate (the smaller card-fee base) but flagged so the payout is held.
-    const service = inclusion === "included" && tip < amount ? round2(amount - tip) : amount
-    out.push({ ...base, amount: service, isTip: false, tipAmbiguous: inclusion === "unknown" || undefined })
+    const service = inclusion === "included" ? round2(Math.max(0, amount - tip)) : amount
+    if (service > 0) out.push({ ...base, amount: service, isTip: false, tipAmbiguous: inclusion === "unknown" || undefined })
     out.push({ ...base, id: `${id}:tip`, amount: tip, isTip: true, tipAmbiguous: inclusion === "unknown" || undefined })
   }
   return out
@@ -247,11 +248,20 @@ export function mergePayments(primary: NormalizedPayment[], extra: NormalizedPay
   return out
 }
 
-export type ManualPaymentEntry = { method: string; amount: number; paidAt: string | null; reference?: string | null }
+export type ManualPaymentEntry = {
+  method: string
+  /** The charge as Workiz shows it on the Payments tab — tip included. */
+  amount: number
+  /** The part of `amount` that was a tip (Workiz's Tip field), 0 or omitted when none. */
+  tipAmount?: number
+  paidAt: string | null
+  reference?: string | null
+}
 
 /**
  * Validate what an admin typed from the Workiz Payments tab. The entries must add up to the
- * Workiz invoice total: the admin is transcribing Workiz, not deciding how much was paid.
+ * Workiz invoice total: the admin is transcribing Workiz, not deciding how much was paid. A tip
+ * is part of the payment it rode on (Workiz folds it into that charge and into the job total).
  */
 export function validateManualPayments(entries: ManualPaymentEntry[], invoiceTotal: number | null): { ok: true; entries: ManualPaymentEntry[] } | { ok: false; error: string } {
   if (entries.length === 0) return { ok: false, error: "Add at least one payment" }
@@ -261,13 +271,16 @@ export function validateManualPayments(entries: ManualPaymentEntry[], invoiceTot
     if (!MANUAL_PAYMENT_METHODS.includes(method as ManualPaymentMethod)) return { ok: false, error: `"${method || "blank"}" is not a payment method Workiz records; choose ${MANUAL_PAYMENT_METHODS.join(", ")}` }
     const amount = round2(num(e.amount))
     if (!(amount > 0)) return { ok: false, error: "Each payment amount must be greater than zero" }
+    const tipAmount = round2(num(e.tipAmount ?? 0))
+    if (tipAmount < 0) return { ok: false, error: "A tip cannot be negative" }
+    if (tipAmount > amount + 0.005) return { ok: false, error: `The $${tipAmount.toFixed(2)} tip is larger than the $${amount.toFixed(2)} payment it is part of; enter the payment amount as Workiz shows it, tip included` }
     let paidAt: string | null = null
     if (e.paidAt) {
       const d = new Date(e.paidAt)
       if (Number.isNaN(d.getTime())) return { ok: false, error: "Payment date is not a valid date" }
       paidAt = d.toISOString()
     }
-    cleaned.push({ method, amount, paidAt, reference: str(e.reference) })
+    cleaned.push({ method, amount, tipAmount, paidAt, reference: str(e.reference) })
   }
   if (invoiceTotal !== null && invoiceTotal > 0) {
     const sum = round2(cleaned.reduce((s, e) => s + e.amount, 0))

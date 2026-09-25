@@ -185,7 +185,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
   const payments = [...(job?.payments ?? [])].sort((a, b) => (a.date ?? "").localeCompare(b.date ?? ""))
   const methods = paymentMethodsSummary(job?.payments)
   const paymentDates = Array.from(new Set(payments.map((x) => (x.date ? zonedDate(x.date, timezone) : null)).filter(Boolean) as string[]))
-  const manualPayments = payments.filter((x) => x.source === "manual" && !x.isTip)
+  const manualPayments = payments.filter((x) => x.source === "manual")
   const fromWorkiz = hasWorkizPaymentRecords(payments)
   // Offer the confirmation form only where it is the missing piece: an unpaid-to-tech payout
   // whose payment type Workiz did not supply (or that an admin already transcribed).
@@ -196,9 +196,13 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
   // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
   const workizInvoiceTotal = job?.invoiceTotal != null && Number.isFinite(job.invoiceTotal) && job.invoiceTotal > 0 ? job.invoiceTotal : null
   const grandTotal = workizInvoiceTotal ?? jobTotal + (tax ?? 0)
-  const unitemized = workizInvoiceTotal !== null ? Math.max(0, workizInvoiceTotal - jobTotal - (tax ?? 0)) : 0
   const totalPaid = num(job?.totalPaid)
-  const tipsTotal = num(job?.cardTipAmount) + num(job?.nonCardTipAmount)
+  const cardTip = num(job?.cardTipAmount)
+  const otherTip = num(job?.nonCardTipAmount)
+  const tipsTotal = cardTip + otherTip
+  // Workiz folds its Tip field into JobTotalPrice without itemizing it; whatever recorded tips do
+  // not explain is shown as its own line (and holds the payout) rather than being passed off as tax.
+  const unexplainedSurplus = workizInvoiceTotal !== null ? Math.max(0, Math.round((workizInvoiceTotal - jobTotal - (tax ?? 0) - tipsTotal) * 100) / 100) : 0
   // Workiz's own balance figure is authoritative when the sync got no per-payment records.
   const workizDue = job?.amountDue != null && Number.isFinite(job.amountDue) ? Math.max(0, job.amountDue) : null
   const remaining = payments.length === 0 && workizDue !== null ? workizDue : Math.max(0, grandTotal - totalPaid)
@@ -543,9 +547,10 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
           )}
           {canConfirmPayments && (
             <PaymentConfirmationForm
-              key={manualPayments.map((x) => `${x.method}:${x.amount}:${x.date ?? ""}`).join("|")}
+              key={manualPayments.map((x) => `${x.method}:${x.amount}:${x.isTip ? "tip" : "svc"}:${x.date ?? ""}`).join("|")}
               jobUuid={p.jobUuid}
               invoiceTotal={workizInvoiceTotal}
+              tipCandidate={unexplainedSurplus}
               existing={manualPayments}
               pending={pending}
               onConfirm={paymentHandlers.onConfirmPayments}
@@ -568,8 +573,11 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
               fee && fee.serviceFactor !== undefined && fee.serviceFactor < 1
                 ? ["Invoice-wide reduction on services", `${pctExact(1 - fee.serviceFactor)} → services × ${fee.serviceFactor.toFixed(10)} = ${money(fee.adjustedServiceSubtotal ?? 0)} (exact ${(fee.adjustedServiceSubtotal ?? 0).toFixed(4)})`]
                 : null,
-              ["Tip", job ? money(tipsTotal) : "Unavailable"],
-              ["Tax", tax != null ? money(tax) : unitemized > 0.005 ? `${money(unitemized)} · tax/fees not itemized by Workiz` : "Not provided by Workiz"],
+              ["Tip", job ? (tipsTotal > 0 ? `${money(tipsTotal)}${cardTip > 0 && otherTip > 0 ? ` · card ${money(cardTip)} / other ${money(otherTip)}` : cardTip > 0 ? " · by card, 3.5% fee applies" : " · not by card, no fee"}` : money(0)) : "Unavailable"],
+              unexplainedSurplus > 0.005
+                ? ["Not itemized by Workiz", `${money(unexplainedSurplus)} · above the service total${tipsTotal > 0 ? " and recorded tips" : ""}; Workiz's API omits its Tip field, so this is most likely a tip — confirm it in the payment form`]
+                : null,
+              ["Tax", tax != null ? money(tax) : "None reported by Workiz"],
               [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
               ["Payments received", job ? (payments.length ? money(totalPaid) : collectedPerWorkiz !== null ? `${money(collectedPerWorkiz)} · per Workiz balance, payment details unavailable` : money(totalPaid)) : "Unavailable"],
               [

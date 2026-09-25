@@ -322,6 +322,35 @@ describe("admin confirmation validation", () => {
     expect(validateManualPayments([{ method: "Cash", amount: 50, paidAt: "yesterday" }], 50)).toMatchObject({ ok: false })
     expect(validateManualPayments([], 50)).toMatchObject({ ok: false })
   })
+
+  it("accepts a tip inside a payment (Workiz's Payments tab shows the charge tip-included) and defaults a missing tip to zero", () => {
+    const checked = validateManualPayments([{ method: "Card", amount: 712.82, paidAt: null }, { method: "Card", amount: 1776.11, tipAmount: 231.67, paidAt: null }], 2488.93)
+    expect(checked).toMatchObject({ ok: true })
+    if (checked.ok) expect(checked.entries.map((e) => e.tipAmount)).toEqual([0, 231.67])
+  })
+
+  it("rejects a tip larger than its payment or below zero", () => {
+    expect(validateManualPayments([{ method: "Card", amount: 100, tipAmount: 120, paidAt: null }], 100)).toMatchObject({ ok: false, error: expect.stringMatching(/\$120\.00 tip is larger than the \$100\.00 payment/) })
+    expect(validateManualPayments([{ method: "Card", amount: 100, tipAmount: -5, paidAt: null }], 100)).toMatchObject({ ok: false })
+    // A payment that was entirely tip is allowed.
+    expect(validateManualPayments([{ method: "Cash", amount: 20, tipAmount: 20, paidAt: null }], 20)).toMatchObject({ ok: true })
+  })
+
+  it("stored manual rows with an included tip split into service and tip records; an all-tip row has no service record", () => {
+    const rows = externalRowsToPayments(
+      [
+        { ...manualRow("Card", 1776.11, 7), tipAmount: "231.67", raw: { [TIP_INCLUSION_RAW_KEY]: "included" } },
+        { ...manualRow("Cash", 20, 8), tipAmount: "20.00", raw: { [TIP_INCLUSION_RAW_KEY]: "included" } },
+      ],
+      settings.cardMethodKeywords,
+    )
+    expect(rows.map((p) => [p.id, p.isTip, p.amount, p.isCard])).toEqual([
+      ["manual:7", false, 1544.44, true],
+      ["manual:7:tip", true, 231.67, true],
+      ["manual:8:tip", true, 20, false],
+    ])
+    expect(rows.every((p) => !p.tipAmbiguous)).toBe(true)
+  })
 })
 
 afterEach(() => {
