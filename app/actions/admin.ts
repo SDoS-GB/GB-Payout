@@ -623,7 +623,6 @@ export async function undoPaymentBatch(batchId: number, reason?: string): Promis
 }
 
 export type HistoryQuery = { profileId: number | null; search: string; from: string | null; to: string | null; kind: "all" | "payment" | "opening"; includeReversed: boolean }
-export const DEFAULT_HISTORY_QUERY: HistoryQuery = { profileId: null, search: "", from: null, to: null, kind: "all", includeReversed: true }
 
 const ISO_DAY = /^\d{4}-\d{2}-\d{2}$/
 const dayOrNull = (v: unknown) => (typeof v === "string" && ISO_DAY.test(v) ? v : null)

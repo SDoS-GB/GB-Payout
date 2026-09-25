@@ -161,7 +161,7 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
         </section>
 
         <Tabs value={tab} onValueChange={setTab} className="flex flex-col gap-4">
-          <TabsList className="flex h-auto w-full flex-wrap justify-start">
+          <TabsList className="flex h-auto w-full flex-wrap justify-start gap-1 group-data-[orientation=horizontal]/tabs:h-auto">
             <TabsTrigger value="due">
               Due
               {attention > 0 && (

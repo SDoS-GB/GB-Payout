@@ -12,6 +12,12 @@ export const pool =
   new Pool({
     connectionString: process.env.DATABASE_URL,
     max: 5,
+    // Without these, an unreachable database leaves page renders hanging until the
+    // platform kills the request. Failing fast lets the /admin error boundary offer
+    // Retry / Sign out instead of an endless spinner.
+    connectionTimeoutMillis: 10_000,
+    query_timeout: 30_000,
+    idleTimeoutMillis: 30_000,
   })
 
 if (process.env.NODE_ENV !== "production") {
