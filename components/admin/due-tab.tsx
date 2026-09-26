@@ -2,227 +2,283 @@
 
 import { useEffect, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
-import { CheckCircle2, ChevronDown, ChevronUp, Undo2 } from "lucide-react"
-import type { AdminDashboardData, DueTechnician, PayoutRecord, RecordPaidOutcome, SourceChangeRow, WaitingSummary } from "@/app/actions/admin"
-import { acknowledgeSourceChange, recordPaidBatch, undoPaymentBatch } from "@/app/actions/admin"
+import { CheckCircle2, ChevronDown, ChevronUp, ExternalLink, Info } from "lucide-react"
+import type { AdminDashboardData, DueTechnician, PayoutRecord, RecordPaidOutcome } from "@/app/actions/admin"
+import { clearConfirmedPayments, confirmJobPayments, confirmPreviouslyPaidPayouts, recordPaidBatch, reviewPayout } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
-import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
+import { Card, CardContent } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { DEFAULT_TECH_PAYMENT_METHOD, isoDateInZone } from "@/lib/payout/batch-rules"
-import { OpeningBalanceCard } from "./opening-balance-card"
-import { InlineMessage, money, zonedDate } from "./shared"
+import { customerPaymentMethod, groupCustomerPayments, jobMoneySummary, jobTotalQualifier } from "@/lib/payout/due-presentation"
+import { PAYMENT_DETAILS_UNAVAILABLE, workizJobUrl } from "@/lib/payout/presentation"
+import { PayoutDetailSheet } from "./payout-detail-sheet"
+import { InlineMessage, money, zonedDate, zonedDateTime } from "./shared"
 
 type Props = {
   due: AdminDashboardData["due"]
-  waiting: WaitingSummary
-  sourceChanges: SourceChangeRow[]
-  opening: AdminDashboardData["opening"]
   paymentMethods: readonly string[]
   timezone: string
   /** Technician whose card should scroll into view (set when arriving from a payout's detail panel). */
   focusProfileId: number | null
   focusToken: number
-  onOpenReview: (status: "hold" | "pending") => void
+  /** A payment was recorded on the server; open it in Paid history. */
+  onPaid: (batchId: number) => void
   onOpenBatch: (batchId: number) => void
 }
 
-export function DueTab({ due, waiting, sourceChanges, opening, paymentMethods, timezone, focusProfileId, focusToken, onOpenReview, onOpenBatch }: Props) {
+export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusToken, onPaid, onOpenBatch }: Props) {
   const router = useRouter()
-  const totalDue = due.technicians.reduce((cents, t) => cents + Math.round(t.total * 100), 0) / 100
-  const waitingTotal = waiting.customerUnpaid + waiting.notFinished + waiting.methodReview + waiting.openingReview + waiting.otherHolds
+  const [pending, startTransition] = useTransition()
+  const [detailId, setDetailId] = useState<number | null>(null)
+  const [message, setMessage] = useState<{ tone: "ok" | "error" | "info"; text: string } | null>(null)
+
+  const allJobs = due.technicians.flatMap((t) => t.jobs)
+  const detail = detailId != null ? allJobs.find((j) => j.id === detailId) ?? null : null
+
+  // Close the panel when its payout leaves Due (paid, held or voided).
+  useEffect(() => {
+    if (detailId != null && !allJobs.some((j) => j.id === detailId)) setDetailId(null)
+  }, [allJobs, detailId])
+
+  const act = (fn: () => Promise<{ ok: boolean; error?: string }>, okText: string) =>
+    startTransition(async () => {
+      setMessage(null)
+      const res = await fn()
+      if (!res.ok) return setMessage({ tone: "error", text: res.error ?? "Failed" })
+      setMessage({ tone: "ok", text: okText })
+      router.refresh()
+    })
 
   return (
     <div className="flex flex-col gap-4">
-      {!opening.openingInitializedAt && <OpeningBalanceCard timezone={timezone} onDone={() => router.refresh()} />}
+      {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
 
-      {sourceChanges.length > 0 && <SourceChangesCard rows={sourceChanges} timezone={timezone} onOpenBatch={onOpenBatch} />}
-
-      <section aria-label="Due by technician" className="flex flex-col gap-3">
-        <div className="flex flex-wrap items-end justify-between gap-2">
-          <div className="flex flex-col gap-1">
-            <h2 className="text-base font-semibold">Due now</h2>
-            <p className="text-sm text-muted-foreground">
-              {due.technicians.length === 0
-                ? "Nobody is owed anything right now."
-                : `${money(totalDue)} across ${due.technicians.length} technician${due.technicians.length === 1 ? "" : "s"} · pay one technician at a time, then click Paid.`}
-            </p>
-          </div>
-          <p className="text-xs text-muted-foreground">Amounts are what the app calculated from Workiz; pay the exact total shown.</p>
-        </div>
-
-        {due.technicians.length === 0 ? (
-          <Card>
-            <CardContent className="flex flex-col items-center gap-2 py-12 text-center">
-              <CheckCircle2 className="h-8 w-8 text-primary" aria-hidden="true" />
-              <p className="font-medium">All caught up</p>
-              <p className="max-w-md text-sm text-muted-foreground">
-                A payout becomes due when the Workiz job is finished, the customer has paid in full, and every team member on the job is mapped. New ones appear here after the next sync.
-              </p>
-            </CardContent>
-          </Card>
-        ) : (
-          <div className="grid gap-4 lg:grid-cols-2">
-            {due.technicians.map((t) => (
-              <TechnicianCard key={t.profileId} tech={t} timezone={timezone} paymentMethods={paymentMethods} focused={focusProfileId === t.profileId} focusToken={focusToken} onOpenBatch={onOpenBatch} />
-            ))}
-          </div>
-        )}
-      </section>
-
-      <Card>
-        <CardHeader className="pb-3">
-          <CardTitle className="text-base">Not due yet</CardTitle>
-          <CardDescription>{waitingTotal === 0 ? "Every open payout is either due or settled." : `${waitingTotal} open payout${waitingTotal === 1 ? "" : "s"} still waiting on something.`}</CardDescription>
-        </CardHeader>
-        {waitingTotal > 0 && (
-          <CardContent className="grid gap-2 sm:grid-cols-2">
-            <WaitingRow count={waiting.customerUnpaid} label="Customer has not paid in full" detail="Finished in Workiz, balance still open. Becomes due when Workiz shows it paid." onClick={() => onOpenReview("pending")} />
-            <WaitingRow count={waiting.notFinished} label="Job not finished" detail="Still scheduled or in progress in Workiz." onClick={() => onOpenReview("pending")} />
-            <WaitingRow count={waiting.methodReview} label="Payment method needs your call" detail="Workiz recorded 'Other' or nothing. Confirm how the customer paid so card fees apply correctly." tone="warn" onClick={() => onOpenReview("hold")} />
-            <WaitingRow count={waiting.openingReview} label="Pre-cutoff work found after setup" detail="Finished before your opening-balance cutoff. Confirm previously paid, or release it." tone="warn" onClick={() => onOpenReview("hold")} />
-            <WaitingRow count={waiting.otherHolds} label="Other holds" detail="Unmapped team member, tip split, discount or calculation check." tone="warn" onClick={() => onOpenReview("hold")} />
+      {due.technicians.length === 0 ? (
+        <Card>
+          <CardContent className="flex flex-col items-center gap-2 py-12 text-center">
+            <CheckCircle2 className="h-8 w-8 text-primary" aria-hidden="true" />
+            <p className="font-medium">Nobody is owed anything right now</p>
+            <p className="max-w-md text-sm text-muted-foreground">A payout becomes due when the Workiz job is finished, the customer has paid in full, and every team member on the job is mapped.</p>
           </CardContent>
-        )}
-      </Card>
+        </Card>
+      ) : (
+        <section aria-label="Due by technician" className="grid gap-4 lg:grid-cols-2">
+          {due.technicians.map((t) => (
+            <TechnicianCard
+              key={t.profileId}
+              tech={t}
+              timezone={timezone}
+              paymentMethods={paymentMethods}
+              focused={focusProfileId === t.profileId}
+              focusToken={focusToken}
+              onPaid={onPaid}
+              onOpenDetail={setDetailId}
+            />
+          ))}
+        </section>
+      )}
+
+      <PayoutDetailSheet
+        record={detail}
+        open={detail != null}
+        onOpenChange={(o) => {
+          if (!o) setDetailId(null)
+        }}
+        timezone={timezone}
+        pending={pending}
+        handlers={{
+          onAction: (id, action, note) => act(() => reviewPayout(id, action, note), `Payout #${id}: ${action}`),
+          payments: {
+            onConfirmPayments: (jobUuid, entries) => act(() => confirmJobPayments(jobUuid, entries), "Payments confirmed and job re-synced"),
+            onClearPayments: (jobUuid) => act(() => clearConfirmedPayments(jobUuid), "Payment confirmation cleared and job re-synced"),
+          },
+          onConfirmPreviouslyPaid: (id) => act(() => confirmPreviouslyPaidPayouts([id]), `Payout #${id} recorded as previously paid`),
+          onOpenBatch,
+        }}
+      />
     </div>
   )
 }
 
-function WaitingRow({ count, label, detail, tone = "muted", onClick }: { count: number; label: string; detail: string; tone?: "muted" | "warn"; onClick: () => void }) {
-  if (count === 0) return null
-  return (
-    <button type="button" onClick={onClick} className="flex items-start gap-3 rounded-md border bg-card p-3 text-left transition-colors hover:bg-accent/40 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
-      <span className={`min-w-8 text-xl font-semibold tabular-nums ${tone === "warn" ? "text-warning-foreground" : "text-foreground"}`}>{count}</span>
-      <span className="flex flex-col gap-0.5">
-        <span className="text-sm font-medium">{label}</span>
-        <span className="text-xs text-muted-foreground">{detail}</span>
-      </span>
-    </button>
-  )
-}
+type Selection = Map<number, number>
 
 /**
- * One technician: every due job, a total, and the form that records the payment. The selection
- * defaults to everything due so the normal path is "pay the total, click Paid"; unticking a job
- * keeps it due for next time.
+ * One technician: their due jobs, an explicit selection (nothing is ticked for them), and the
+ * PAID action. Every new batch starts on Zelle regardless of what the last one used.
  */
-function TechnicianCard({ tech, timezone, paymentMethods, focused, focusToken, onOpenBatch }: { tech: DueTechnician; timezone: string; paymentMethods: readonly string[]; focused: boolean; focusToken: number; onOpenBatch: (batchId: number) => void }) {
+function TechnicianCard({
+  tech,
+  timezone,
+  paymentMethods,
+  focused,
+  focusToken,
+  onPaid,
+  onOpenDetail,
+}: {
+  tech: DueTechnician
+  timezone: string
+  paymentMethods: readonly string[]
+  focused: boolean
+  focusToken: number
+  onPaid: (batchId: number) => void
+  onOpenDetail: (payoutId: number) => void
+}) {
   const router = useRouter()
   const ref = useRef<HTMLDivElement>(null)
   const [pending, startTransition] = useTransition()
-  const [excluded, setExcluded] = useState<Set<number>>(new Set())
+  const [selection, setSelection] = useState<Selection>(new Map())
   const [method, setMethod] = useState<string>(DEFAULT_TECH_PAYMENT_METHOD)
   const [paidOn, setPaidOn] = useState(() => isoDateInZone(new Date(), timezone))
   const [reference, setReference] = useState("")
-  const [showJobs, setShowJobs] = useState(tech.count <= 8)
-  const [result, setResult] = useState<{ tone: "ok" | "error" | "info"; text: string; batchId?: number; undone?: boolean } | null>(null)
-  // A fresh key per selection so a double click or a retry after a network blip records one payment.
+  const [showOptions, setShowOptions] = useState(false)
+  const [showJobs, setShowJobs] = useState(tech.count <= 6)
+  const [error, setError] = useState<string | null>(null)
+  const [notice, setNotice] = useState<string | null>(null)
+  // A fresh key per selection so a double tap or a retry after a network blip records one payment.
   const keyRef = useRef(newKey())
 
   useEffect(() => {
     if (focused && focusToken > 0) ref.current?.scrollIntoView({ behavior: "smooth", block: "start" })
   }, [focused, focusToken])
 
-  // Rows that left the board (paid elsewhere, held) drop out of the exclusion set on their own.
+  // After a refresh, drop selected jobs that left the list or whose amount changed, and say so.
   useEffect(() => {
-    const ids = new Set(tech.jobs.map((j) => j.id))
-    setExcluded((prev) => {
-      const next = new Set(Array.from(prev).filter((id) => ids.has(id)))
-      return next.size === prev.size ? prev : next
+    setSelection((prev) => {
+      if (prev.size === 0) return prev
+      const next: Selection = new Map()
+      const gone: string[] = []
+      const changed: string[] = []
+      for (const [id, amountWhenTicked] of prev) {
+        const job = tech.jobs.find((j) => j.id === id)
+        if (!job) gone.push(`#${id}`)
+        else if (Math.abs(job.amount - amountWhenTicked) > 0.005) changed.push(`#${job.job?.serialId ?? id}: ${money(amountWhenTicked)} → ${money(job.amount)}`)
+        else next.set(id, amountWhenTicked)
+      }
+      if (gone.length === 0 && changed.length === 0) return prev
+      const parts: string[] = []
+      if (gone.length) parts.push(`${gone.length} selected job${gone.length === 1 ? "" : "s"} left Due after the refresh`)
+      if (changed.length) parts.push(`amount changed after the refresh (${changed.join(", ")}); re-tick to include`)
+      setNotice(parts.join(" · "))
+      keyRef.current = newKey()
+      return next
     })
-    keyRef.current = newKey()
   }, [tech.jobs])
 
-  const selected = tech.jobs.filter((j) => !excluded.has(j.id))
-  const selectedTotal = selected.reduce((cents, j) => cents + Math.round(j.amount * 100), 0) / 100
+  const selectedJobs = tech.jobs.filter((j) => selection.has(j.id))
+  const selectedTotal = selectedJobs.reduce((cents, j) => cents + Math.round(j.amount * 100), 0) / 100
+  const allSelected = selection.size > 0 && selection.size === tech.jobs.length
   const today = isoDateInZone(new Date(), timezone)
 
-  const toggle = (id: number, on: boolean) => {
-    setExcluded((prev) => {
-      const next = new Set(prev)
-      if (on) next.delete(id)
-      else next.add(id)
+  const setTicked = (job: PayoutRecord, on: boolean) => {
+    setNotice(null)
+    setSelection((prev) => {
+      const next = new Map(prev)
+      if (on) next.set(job.id, job.amount)
+      else next.delete(job.id)
       return next
     })
     keyRef.current = newKey()
   }
 
-  const pay = () =>
+  const toggleAll = () => {
+    setNotice(null)
+    setSelection(allSelected ? new Map() : new Map(tech.jobs.map((j) => [j.id, j.amount])))
+    keyRef.current = newKey()
+  }
+
+  const pay = () => {
+    if (pending || selectedJobs.length === 0) return
     startTransition(async () => {
-      setResult(null)
+      setError(null)
       const res: RecordPaidOutcome = await recordPaidBatch({
         profileId: tech.profileId,
-        items: selected.map((j) => ({ payoutId: j.id, amount: j.amount, inputHash: j.inputHash ?? null })),
+        items: selectedJobs.map((j) => ({ payoutId: j.id, amount: j.amount, inputHash: j.inputHash ?? null })),
         method,
         paidOn,
         reference: reference.trim() || null,
         idempotencyKey: keyRef.current,
       })
       if (!res.ok) {
-        setResult({ tone: "error", text: res.error })
+        setError(res.error)
         if (res.stale) router.refresh()
         return
       }
-      const d = res.data
-      setResult({ tone: "ok", text: `${money(d.total)} to ${d.profileName} by ${d.method} on ${d.paidOn} recorded as payment #${d.batchId} (${d.count} job${d.count === 1 ? "" : "s"}).`, batchId: d.batchId })
+      setSelection(new Map())
+      setMethod(DEFAULT_TECH_PAYMENT_METHOD)
       setReference("")
+      setPaidOn(isoDateInZone(new Date(), timezone))
+      setShowOptions(false)
       keyRef.current = newKey()
       router.refresh()
+      onPaid(res.data.batchId)
     })
-
-  const undo = (batchId: number) =>
-    startTransition(async () => {
-      const res = await undoPaymentBatch(batchId, "Undone right after recording")
-      if (!res.ok) return setResult({ tone: "error", text: res.error })
-      setResult({ tone: "info", text: `Payment #${batchId} undone; ${res.data!.payouts} job${res.data!.payouts === 1 ? "" : "s"} returned to Due.`, undone: true })
-      router.refresh()
-    })
+  }
 
   return (
-    <div ref={ref} className={`scroll-mt-4 rounded-lg border bg-card ${focused ? "ring-2 ring-primary/40" : ""}`}>
-      <div className="flex flex-wrap items-start justify-between gap-3 border-b p-4">
-        <div className="flex flex-col gap-0.5">
-          <h3 className="text-lg font-semibold">{tech.name}</h3>
-          <p className="text-sm text-muted-foreground">
-            {tech.count} job{tech.count === 1 ? "" : "s"} due · oldest {zonedDate(tech.jobs[0]?.job?.lastStatusUpdate ?? tech.jobs[0]?.updatedAt, timezone)}
-          </p>
+    <div ref={ref} className={`flex scroll-mt-28 flex-col rounded-lg border bg-card shadow-sm ${focused ? "ring-2 ring-primary/40" : ""}`}>
+      <div className="flex flex-col gap-3 p-4">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex min-w-0 flex-col gap-0.5">
+            <h2 className="truncate text-xl font-semibold">{tech.name}</h2>
+            <p className="text-sm text-muted-foreground">
+              {tech.count} unpaid job{tech.count === 1 ? "" : "s"}
+            </p>
+          </div>
+          <div className="flex flex-col items-end">
+            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Total due</span>
+            <span className="text-2xl font-semibold tabular-nums text-primary">{money(tech.total)}</span>
+          </div>
         </div>
-        <div className="flex flex-col items-end">
-          <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{excluded.size ? "Selected" : "Total due"}</span>
-          <span className="text-2xl font-semibold tabular-nums text-primary">{money(selectedTotal)}</span>
-          {excluded.size > 0 && <span className="text-xs text-muted-foreground">of {money(tech.total)} due</span>}
+        <div className="flex flex-wrap items-center justify-between gap-2">
+          <button
+            type="button"
+            onClick={() => setShowJobs((v) => !v)}
+            aria-expanded={showJobs}
+            aria-controls={`jobs-${tech.profileId}`}
+            className="inline-flex min-h-10 items-center gap-1.5 rounded-md px-2 text-sm font-medium text-foreground hover:bg-accent focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+          >
+            {showJobs ? <ChevronUp className="h-4 w-4" aria-hidden="true" /> : <ChevronDown className="h-4 w-4" aria-hidden="true" />}
+            {showJobs ? "Hide jobs" : `Show ${tech.count} job${tech.count === 1 ? "" : "s"}`}
+          </button>
+          {showJobs && tech.jobs.length > 1 && (
+            <Button type="button" variant="ghost" size="sm" onClick={toggleAll} disabled={pending} className="min-h-10">
+              {allSelected ? "Clear selection" : "Select all"}
+            </Button>
+          )}
         </div>
       </div>
 
-      <div className="flex flex-col gap-2 p-4">
-        <button type="button" onClick={() => setShowJobs((v) => !v)} className="flex items-center justify-between text-sm font-medium text-muted-foreground hover:text-foreground" aria-expanded={showJobs}>
-          <span>{showJobs ? "Hide" : "Show"} jobs</span>
-          {showJobs ? <ChevronUp className="h-4 w-4" /> : <ChevronDown className="h-4 w-4" />}
-        </button>
-        {showJobs && (
-          <ul className="flex flex-col divide-y rounded-md border">
-            {tech.jobs.map((j) => (
-              <JobLine key={j.id} p={j} timezone={timezone} checked={!excluded.has(j.id)} onCheck={(on) => toggle(j.id, on)} disabled={pending} />
-            ))}
-          </ul>
-        )}
-      </div>
+      {showJobs && (
+        <ul id={`jobs-${tech.profileId}`} className="flex flex-col divide-y border-t">
+          {tech.jobs.map((j) => (
+            <JobRow key={j.id} p={j} techName={tech.name} timezone={timezone} checked={selection.has(j.id)} disabled={pending} onCheck={(on) => setTicked(j, on)} onMore={() => onOpenDetail(j.id)} />
+          ))}
+        </ul>
+      )}
 
       <form
-        className="flex flex-col gap-3 border-t bg-muted/30 p-4"
+        className="mt-auto flex flex-col gap-2 border-t bg-muted/30 p-3 sm:p-4"
         onSubmit={(e) => {
           e.preventDefault()
           pay()
         }}
       >
-        <div className="grid gap-3 sm:grid-cols-3">
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor={`method-${tech.profileId}`}>Paid by</Label>
-            <Select value={method} onValueChange={setMethod}>
-              <SelectTrigger id={`method-${tech.profileId}`}>
+        <div className="flex flex-wrap items-center justify-between gap-3">
+          <p className="text-sm" aria-live="polite">
+            {selectedJobs.length === 0 ? (
+              <span className="text-muted-foreground">Tick the jobs to pay</span>
+            ) : (
+              <>
+                {selectedJobs.length} of {tech.count} selected · <span className="text-base font-semibold tabular-nums">{money(selectedTotal)}</span>
+              </>
+            )}
+          </p>
+          <div className="flex items-center gap-2">
+            <Select value={method} onValueChange={setMethod} disabled={pending}>
+              <SelectTrigger aria-label={`How ${tech.name} is paid`} className="h-12 w-28 bg-card">
                 <SelectValue />
               </SelectTrigger>
               <SelectContent>
@@ -233,111 +289,134 @@ function TechnicianCard({ tech, timezone, paymentMethods, focused, focusToken, o
                 ))}
               </SelectContent>
             </Select>
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor={`paidon-${tech.profileId}`}>Paid on</Label>
-            <Input id={`paidon-${tech.profileId}`} type="date" value={paidOn} max={today} onChange={(e) => setPaidOn(e.target.value)} required />
-          </div>
-          <div className="flex flex-col gap-1.5">
-            <Label htmlFor={`ref-${tech.profileId}`}>Reference (optional)</Label>
-            <Input id={`ref-${tech.profileId}`} value={reference} maxLength={120} onChange={(e) => setReference(e.target.value)} placeholder="Zelle confirmation, check #" />
+            <Button
+              type="submit"
+              disabled={pending || selectedJobs.length === 0}
+              aria-busy={pending}
+              className="h-12 min-w-28 px-6 text-base font-bold tracking-wide bg-foreground text-background hover:bg-foreground/90 focus-visible:ring-primary"
+            >
+              {pending ? "Saving…" : "PAID"}
+            </Button>
           </div>
         </div>
-        <div className="flex flex-wrap items-center justify-between gap-2">
-          <p className="text-xs text-muted-foreground">
-            {selected.length === 0 ? "Tick at least one job to record a payment." : `Records ${selected.length} of ${tech.count} job${tech.count === 1 ? "" : "s"} as paid at exactly ${money(selectedTotal)}.`}
-          </p>
-          <Button type="submit" disabled={pending || selected.length === 0}>
-            {pending ? "Recording…" : `Paid ${money(selectedTotal)}`}
-          </Button>
-        </div>
-        {result && (
-          <div className="flex flex-wrap items-center justify-between gap-2">
-            <InlineMessage tone={result.tone}>{result.text}</InlineMessage>
-            {result.batchId && !result.undone && (
-              <div className="flex items-center gap-2">
-                <Button type="button" size="sm" variant="ghost" onClick={() => onOpenBatch(result.batchId!)}>
-                  View in Paid history
-                </Button>
-                <Button type="button" size="sm" variant="outline" disabled={pending} onClick={() => undo(result.batchId!)}>
-                  <Undo2 className="h-4 w-4" />
-                  Undo
-                </Button>
-              </div>
-            )}
+
+        <button type="button" onClick={() => setShowOptions((v) => !v)} aria-expanded={showOptions} className="self-start text-xs text-muted-foreground underline-offset-4 hover:underline">
+          {showOptions ? "Hide options" : "Note or earlier date"}
+        </button>
+        {showOptions && (
+          <div className="grid gap-3 sm:grid-cols-2">
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor={`paidon-${tech.profileId}`}>Paid on</Label>
+              <Input id={`paidon-${tech.profileId}`} type="date" value={paidOn} max={today} onChange={(e) => setPaidOn(e.target.value)} required className="bg-card" />
+            </div>
+            <div className="flex flex-col gap-1.5">
+              <Label htmlFor={`ref-${tech.profileId}`}>Note / reference</Label>
+              <Input id={`ref-${tech.profileId}`} value={reference} maxLength={120} onChange={(e) => setReference(e.target.value)} placeholder="Zelle confirmation, check #" className="bg-card" />
+            </div>
           </div>
         )}
+        {notice && <InlineMessage tone="info">{notice}</InlineMessage>}
+        {error && <InlineMessage tone="error">{error}</InlineMessage>}
       </form>
     </div>
   )
 }
 
-function JobLine({ p, timezone, checked, onCheck, disabled }: { p: PayoutRecord; timezone: string; checked: boolean; onCheck: (on: boolean) => void; disabled: boolean }) {
+/** One due job with the numbers the owner needs to check it against Workiz, without leaving the page. */
+function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: { p: PayoutRecord; techName: string; timezone: string; checked: boolean; disabled: boolean; onCheck: (on: boolean) => void; onMore: () => void }) {
   const id = `due-${p.id}`
-  return (
-    <li className="flex items-center gap-3 px-3 py-2 text-sm">
-      <Checkbox id={id} checked={checked} disabled={disabled} onCheckedChange={(v) => onCheck(Boolean(v))} aria-label={`Include job ${p.job?.serialId ?? p.jobUuid}`} />
-      <label htmlFor={id} className="flex flex-1 cursor-pointer flex-wrap items-center justify-between gap-x-3 gap-y-0.5">
-        <span className="flex flex-col">
-          <span className="font-medium">
-            #{p.job?.serialId ?? "—"} <span className="font-normal text-muted-foreground">· {p.job?.clientName ?? "Unknown customer"}</span>
-          </span>
-          <span className="text-xs text-muted-foreground">
-            Completed {zonedDate(p.job?.lastStatusUpdate ?? p.updatedAt, timezone)}
-            {p.siblings.length > 0 && ` · shared with ${p.siblings.map((s) => s.profileName).join(", ")}`}
-          </span>
-        </span>
-        <span className={`tabular-nums font-medium ${checked ? "" : "text-muted-foreground line-through"}`}>{money(p.amount)}</span>
-      </label>
-    </li>
-  )
-}
+  const job = p.job
+  const url = workizJobUrl(p.jobUuid)
+  const serial = job?.serialId ?? null
+  const summary = job
+    ? jobMoneySummary({ jobTotal: job.jobTotal, taxAmount: job.taxAmount, discountAmount: job.discountAmount, colorSealTotal: job.colorSealTotal, cardTipAmount: job.cardTipAmount, nonCardTipAmount: job.nonCardTipAmount, invoiceTotal: job.invoiceTotal })
+    : null
+  const payments = groupCustomerPayments(job?.payments)
+  const techTip = Number(p.tipPayout ?? 0)
+  const completed = p.completion?.state === "completed" ? p.completion.at : null
 
-/** Settled payouts whose Workiz inputs changed afterwards. Nothing is altered until the owner decides. */
-function SourceChangesCard({ rows, timezone, onOpenBatch }: { rows: SourceChangeRow[]; timezone: string; onOpenBatch: (batchId: number) => void }) {
-  const router = useRouter()
-  const [pending, startTransition] = useTransition()
-  const [error, setError] = useState<string | null>(null)
-  const ack = (id: number) =>
-    startTransition(async () => {
-      setError(null)
-      const res = await acknowledgeSourceChange(id)
-      if (!res.ok) return setError(res.error)
-      router.refresh()
-    })
   return (
-    <Card className="border-warning/50">
-      <CardHeader className="pb-3">
-        <CardTitle className="text-base text-warning-foreground">Paid jobs changed in Workiz</CardTitle>
-        <CardDescription>
-          These payouts were already paid, then the job changed in Workiz (a payment, line item or team edit). The paid amount stays as recorded. If the technician is owed a difference, settle it outside the
-          app or undo the original payment from Paid history so it comes back Due at the new amount.
-        </CardDescription>
-      </CardHeader>
-      <CardContent className="flex flex-col gap-2">
-        {error && <InlineMessage tone="error">{error}</InlineMessage>}
-        <ul className="flex flex-col divide-y rounded-md border">
-          {rows.map((r) => (
-            <li key={r.id} className="flex flex-wrap items-center justify-between gap-2 px-3 py-2 text-sm">
-              <span className="flex flex-col">
-                <span className="font-medium">
-                  #{r.serialId ?? "—"} · {r.clientName ?? "Unknown customer"} · {r.profileName}
-                </span>
-                <span className="text-xs text-muted-foreground">
-                  {r.summary ?? "Inputs changed"} · paid {money(r.settledAmount)} → now calculates {money(r.recomputedAmount)} · noticed {zonedDate(r.detectedAt, timezone)}
-                </span>
-              </span>
-              <Button size="sm" variant="outline" disabled={pending} onClick={() => ack(r.id)}>
-                Reviewed
-              </Button>
-            </li>
-          ))}
-        </ul>
-        <p className="text-xs text-muted-foreground">
-          Undo lives in <button type="button" className="text-primary underline-offset-4 hover:underline" onClick={() => onOpenBatch(0)}>Paid history</button>.
-        </p>
-      </CardContent>
-    </Card>
+    <li className={`flex flex-col gap-3 p-3 sm:p-4 ${checked ? "bg-accent/30" : ""}`}>
+      <div className="flex items-start gap-3">
+        <Checkbox id={id} checked={checked} disabled={disabled} onCheckedChange={(v) => onCheck(Boolean(v))} aria-label={`Select job ${serial ?? p.jobUuid} for ${techName}`} className="mt-1 h-5 w-5" />
+        <div className="flex min-w-0 flex-1 flex-col gap-3">
+          <div className="flex items-start justify-between gap-3">
+            <div className="flex min-w-0 flex-col gap-0.5">
+              <label htmlFor={id} className="cursor-pointer text-base font-medium leading-tight">
+                {job?.clientName ?? "Unknown customer"}
+              </label>
+              <p className="flex flex-wrap items-center gap-x-2 text-sm text-muted-foreground">
+                {url && serial ? (
+                  <a href={url} target="_blank" rel="noreferrer noopener" className="inline-flex items-center gap-1 font-medium text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring" aria-label={`Open job ${serial} in Workiz (new tab)`}>
+                    #{serial}
+                    <ExternalLink className="h-3.5 w-3.5" aria-hidden="true" />
+                  </a>
+                ) : (
+                  <span>#{serial ?? "—"}</span>
+                )}
+                <span>· {completed ? `completed ${zonedDate(completed, timezone)}` : job?.status ? `status ${job.status}` : "completion date unavailable"}</span>
+                {p.siblings.length > 0 && <span>· shared with {p.siblings.map((s) => s.profileName).join(", ")}</span>}
+              </p>
+            </div>
+            <div className="flex shrink-0 flex-col items-end">
+              <span className="text-xs text-muted-foreground">Owed to {techName}</span>
+              <span className="text-lg font-semibold tabular-nums">{money(p.amount)}</span>
+            </div>
+          </div>
+
+          {summary ? (
+            <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 rounded-md bg-muted/40 px-3 py-2 text-sm">
+              <dt className="text-muted-foreground">
+                Job total <span className="text-xs">· {jobTotalQualifier(summary)}</span>
+              </dt>
+              <dd className="text-right font-medium tabular-nums">{money(summary.jobTotal)}</dd>
+              <dt className="text-muted-foreground">
+                Color sealing <span className="text-xs">· after discount</span>
+              </dt>
+              <dd className="text-right tabular-nums">{summary.colorSealAfterDiscount > 0 ? money(summary.colorSealAfterDiscount) : "—"}</dd>
+              <dt className="text-muted-foreground">Discount</dt>
+              <dd className="text-right tabular-nums">{summary.discount > 0 ? `−${money(summary.discount)}` : "—"}</dd>
+              <dt className="text-muted-foreground">
+                Tip <span className="text-xs">· customer total{techTip > 0 ? `, ${money(techTip)} of it to ${techName}` : ""}</span>
+              </dt>
+              <dd className="text-right tabular-nums">{summary.tip > 0 ? money(summary.tip) : "—"}</dd>
+            </dl>
+          ) : (
+            <p className="text-sm text-muted-foreground">Workiz job details are not stored for this payout.</p>
+          )}
+
+          <div className="flex flex-col gap-1">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">Customer payments</p>
+            {payments.length === 0 ? (
+              <p className="text-sm text-muted-foreground">{PAYMENT_DETAILS_UNAVAILABLE} from Workiz</p>
+            ) : (
+              <ul className="flex flex-col gap-0.5 text-sm">
+                {payments.map((line) => (
+                  <li key={line.key} className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-baseline gap-x-3">
+                    <span className="font-medium">{line.label}</span>
+                    <span className="min-w-0 text-muted-foreground">
+                      {customerPaymentMethod(line)}
+                      {!line.methodKnown && <span className="text-warning-foreground"> (not recognised)</span>}
+                      {" · "}
+                      {line.date ? zonedDateTime(line.date, timezone) : <span className="italic">date not recorded</span>}
+                      {line.tipAmount > 0 && !line.tipOnly && <span> · incl. {money(line.tipAmount)} tip</span>}
+                    </span>
+                    <span className="tabular-nums">{money(line.amount)}</span>
+                  </li>
+                ))}
+              </ul>
+            )}
+          </div>
+
+          <div>
+            <button type="button" onClick={onMore} className="inline-flex min-h-8 items-center gap-1 text-sm text-primary underline-offset-4 hover:underline focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+              <Info className="h-3.5 w-3.5" aria-hidden="true" />
+              More details
+            </button>
+          </div>
+        </div>
+      </div>
+    </li>
   )
 }
 

@@ -2,7 +2,11 @@
 
 import { Badge } from "@/components/ui/badge"
 
-export const money = (v: string | number | null | undefined) => `$${Number(v ?? 0).toFixed(2)}`
+export const money = (v: string | number | null | undefined) => {
+  const n = Number(v ?? 0)
+  const abs = Math.abs(n).toLocaleString("en-US", { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  return n < 0 ? `−$${abs}` : `$${abs}`
+}
 
 export const shortDate = (d: Date | string | null | undefined) => {
   if (!d) return "—"

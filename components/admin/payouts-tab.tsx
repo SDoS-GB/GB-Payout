@@ -40,7 +40,11 @@ type Props = {
   timezone: string
   onGoToDue: (profileId: number) => void
   onOpenBatch: (batchId: number) => void
+  /** Pin the list to one status (Review = hold, Waiting = pending) and hide the status filter. */
+  fixedStatus?: "hold" | "pending"
 }
+
+const FIXED_TITLES: Record<"hold" | "pending", string> = { hold: "Needs your call", pending: "Waiting on the job or the customer" }
 
 export function PayoutsTab(props: Props) {
   return (
@@ -58,8 +62,9 @@ export function payoutAmountLabel(p: Pick<PayoutRecord, "jobTotal" | "totalPayou
   return { text: money(total), provisional: p.status === "pending" || p.status === "hold", unavailable: false }
 }
 
-function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone, onGoToDue, onOpenBatch }: Props) {
+function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone, onGoToDue, onOpenBatch, fixedStatus }: Props) {
   const router = useRouter()
+  const baseQuery: PayoutQuery = fixedStatus ? { ...DEFAULT_PAYOUT_QUERY, status: fixedStatus } : DEFAULT_PAYOUT_QUERY
   const { mutate: mutateAll } = useSWRConfig()
   const [pending, startTransition] = useTransition()
   const [openId, setOpenId] = useState<number | null>(null)
@@ -123,7 +128,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
       await refreshAll()
     })
 
-  const filtered = query.status !== "all" || query.profileId != null || query.search !== ""
+  const filtered = query.status !== baseQuery.status || query.profileId != null || query.search !== ""
   const selectedProfile = query.profileId != null ? profiles.find((p) => p.id === query.profileId) ?? null : null
   const openRecord = openId != null ? items.find((i) => i.id === openId) ?? null : null
 
@@ -156,7 +161,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
             <div className="flex flex-col gap-3">
               <div className="flex flex-wrap items-start justify-between gap-3">
                 <div className="flex flex-col gap-1">
-                  <CardTitle className="text-base">Every payout</CardTitle>
+                  <CardTitle className="text-base">{fixedStatus ? FIXED_TITLES[fixedStatus] : "Every payout"}</CardTitle>
                   <CardDescription aria-live="polite">
                     {isLoading && !data
                       ? "Loading payouts…"
@@ -171,9 +176,9 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
                 </div>
                 <div className="flex flex-wrap items-center gap-2">
                   {filtered && (
-                    <Button size="sm" variant="ghost" onClick={() => onQueryChange({ ...DEFAULT_PAYOUT_QUERY })}>
+                    <Button size="sm" variant="ghost" onClick={() => onQueryChange({ ...baseQuery })}>
                       <X className="h-4 w-4" />
-                      All payouts
+                      {fixedStatus ? "Clear filters" : "All payouts"}
                     </Button>
                   )}
                   <form
@@ -200,7 +205,7 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
               </div>
               {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
 
-              <div className="grid gap-3 sm:grid-cols-[minmax(0,1fr)_10rem_12rem]">
+              <div className={`grid gap-3 ${fixedStatus ? "sm:grid-cols-[minmax(0,1fr)_12rem]" : "sm:grid-cols-[minmax(0,1fr)_10rem_12rem]"}`}>
                 <div className="flex flex-col gap-1">
                   <Label htmlFor="payout-search" className="text-xs">
                     Search job number or customer
@@ -210,23 +215,25 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
                     <Input id="payout-search" value={searchDraft} onChange={(e) => setSearchDraft(e.target.value)} placeholder="e.g. 924738 or Smith" className="pl-8" />
                   </div>
                 </div>
-                <div className="flex flex-col gap-1">
-                  <Label htmlFor="payout-status" className="text-xs">
-                    Status
-                  </Label>
-                  <Select value={query.status} onValueChange={(v) => onQueryChange((q) => ({ ...q, status: v as PayoutStatusFilter, page: 1 }))}>
-                    <SelectTrigger id="payout-status" aria-label="Filter by status">
-                      <SelectValue />
-                    </SelectTrigger>
-                    <SelectContent>
-                      {PAYOUT_STATUS_FILTERS.map((f) => (
-                        <SelectItem key={f} value={f}>
-                          {STATUS_LABELS[f]}
-                        </SelectItem>
-                      ))}
-                    </SelectContent>
-                  </Select>
-                </div>
+                {!fixedStatus && (
+                  <div className="flex flex-col gap-1">
+                    <Label htmlFor="payout-status" className="text-xs">
+                      Status
+                    </Label>
+                    <Select value={query.status} onValueChange={(v) => onQueryChange((q) => ({ ...q, status: v as PayoutStatusFilter, page: 1 }))}>
+                      <SelectTrigger id="payout-status" aria-label="Filter by status">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {PAYOUT_STATUS_FILTERS.map((f) => (
+                          <SelectItem key={f} value={f}>
+                            {STATUS_LABELS[f]}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </div>
+                )}
                 <div className="flex flex-col gap-1">
                   <Label htmlFor="payout-tech" className="text-xs">
                     Technician
@@ -279,8 +286,8 @@ function PayoutsTabInner({ profiles, query, onQueryChange, focusToken, timezone,
                           <p className="text-sm text-muted-foreground">{emptyState().body}</p>
                           {filtered && (
                             <div>
-                              <Button size="sm" variant="outline" onClick={() => onQueryChange({ ...DEFAULT_PAYOUT_QUERY })}>
-                                Show all payouts
+                              <Button size="sm" variant="outline" onClick={() => onQueryChange({ ...baseQuery })}>
+                                {fixedStatus ? "Clear filters" : "Show all payouts"}
                               </Button>
                             </div>
                           )}

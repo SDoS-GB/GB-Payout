@@ -2,10 +2,11 @@
 
 import { useEffect, useMemo, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
-import { ChevronDown, ChevronUp, Search, Undo2, X } from "lucide-react"
+import { ArrowLeft, ChevronDown, ChevronUp, Download, Printer, Search, Undo2, X } from "lucide-react"
 import type { AdminDashboardData, LegacyPaidRow } from "@/app/actions/admin"
 import { undoPaymentBatch } from "@/app/actions/admin"
 import type { BatchSummary } from "@/lib/payout/batches"
+import { historyCsvFilename, historyToCsv } from "@/lib/payout/history-export"
 import { Badge } from "@/components/ui/badge"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/components/ui/card"
@@ -26,9 +27,10 @@ type Props = {
   /** Batch to expand and scroll to (set when arriving from a payout or a fresh payment). */
   openBatchId: number | null
   focusToken: number
+  onBackToDue: () => void
 }
 
-export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBatchId, focusToken }: Props) {
+export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBatchId, focusToken, onBackToDue }: Props) {
   const [profileId, setProfileId] = useState<number | null>(null)
   const [kind, setKind] = useState<Kind>("all")
   const [showReversed, setShowReversed] = useState(true)
@@ -36,8 +38,21 @@ export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBa
   const [expanded, setExpanded] = useState<Set<number>>(new Set())
 
   useEffect(() => {
-    if (openBatchId && focusToken > 0) setExpanded((prev) => new Set(prev).add(openBatchId))
+    if (openBatchId) setExpanded((prev) => (prev.has(openBatchId) ? prev : new Set(prev).add(openBatchId)))
   }, [openBatchId, focusToken])
+
+  const openBatch = openBatchId ? batches.find((b) => b.id === openBatchId) ?? null : null
+
+  const exportCsv = () => {
+    const csv = historyToCsv(filtered)
+    const blob = new Blob([csv], { type: "text/csv;charset=utf-8" })
+    const url = URL.createObjectURL(blob)
+    const a = document.createElement("a")
+    a.href = url
+    a.download = historyCsvFilename()
+    a.click()
+    setTimeout(() => URL.revokeObjectURL(url), 1000)
+  }
 
   const filtered = useMemo(() => {
     const q = search.trim().toLowerCase()
@@ -66,6 +81,8 @@ export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBa
 
   return (
     <div className="flex flex-col gap-4">
+      {openBatchId && <OpenBatchBanner batchId={openBatchId} batch={openBatch} timezone={timezone} onBackToDue={onBackToDue} />}
+
       <Card>
         <CardHeader className="pb-3">
           <div className="flex flex-wrap items-start justify-between gap-3">
@@ -75,23 +92,33 @@ export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBa
                 {filtered.length === 0 ? "No payments match." : `${filtered.length} payment${filtered.length === 1 ? "" : "s"}${isFiltered ? " matching" : ""} · ${money(paidTotal)} paid out${kind === "opening" ? "" : " (excluding opening balance and undone payments)"}`}
               </CardDescription>
             </div>
-            {isFiltered && (
-              <Button
-                size="sm"
-                variant="ghost"
-                onClick={() => {
-                  setProfileId(null)
-                  setKind("all")
-                  setShowReversed(true)
-                  setSearch("")
-                }}
-              >
-                <X className="h-4 w-4" />
-                Clear filters
+            <div className="flex flex-wrap items-center gap-2 print:hidden">
+              {isFiltered && (
+                <Button
+                  size="sm"
+                  variant="ghost"
+                  onClick={() => {
+                    setProfileId(null)
+                    setKind("all")
+                    setShowReversed(true)
+                    setSearch("")
+                  }}
+                >
+                  <X className="h-4 w-4" />
+                  Clear filters
+                </Button>
+              )}
+              <Button size="sm" variant="outline" onClick={exportCsv} disabled={filtered.length === 0}>
+                <Download className="h-4 w-4" />
+                Export CSV
               </Button>
-            )}
+              <Button size="sm" variant="outline" onClick={() => window.print()} disabled={filtered.length === 0}>
+                <Printer className="h-4 w-4" />
+                Print
+              </Button>
+            </div>
           </div>
-          <div className="flex flex-wrap items-end gap-3 pt-2">
+          <div className="flex flex-wrap items-end gap-3 pt-2 print:hidden">
             <div className="flex flex-col gap-1.5">
               <Label htmlFor="hist-tech">Technician</Label>
               <Select value={profileId == null ? "all" : String(profileId)} onValueChange={(v) => setProfileId(v === "all" ? null : Number(v))}>
@@ -156,6 +183,69 @@ export function PaidHistoryTab({ batches, legacyPaid, profiles, timezone, openBa
       </Card>
 
       {legacyPaid.length > 0 && <LegacyCard rows={legacyPaid} timezone={timezone} profileId={profileId} />}
+    </div>
+  )
+}
+
+/**
+ * Shown when the page was opened for one payment (right after PAID, or from a payout's detail
+ * panel): what was recorded, an undo that reverses the saved settlement, and the way back to Due.
+ */
+function OpenBatchBanner({ batchId, batch, timezone, onBackToDue }: { batchId: number; batch: BatchSummary | null; timezone: string; onBackToDue: () => void }) {
+  const router = useRouter()
+  const [pending, startTransition] = useTransition()
+  const [message, setMessage] = useState<{ tone: "ok" | "error" | "info"; text: string } | null>(null)
+  const [waitedTooLong, setWaitedTooLong] = useState(false)
+
+  // The fresh payment arrives with the next server refresh; say so if it never shows up.
+  useEffect(() => {
+    if (batch) return
+    setWaitedTooLong(false)
+    const t = setTimeout(() => setWaitedTooLong(true), 8000)
+    return () => clearTimeout(t)
+  }, [batch, batchId])
+
+  const undo = () =>
+    startTransition(async () => {
+      setMessage(null)
+      const res = await undoPaymentBatch(batchId, "Undone right after recording")
+      if (!res.ok) return setMessage({ tone: "error", text: res.error })
+      setMessage({ tone: "info", text: `Payment #${batchId} undone; ${res.data!.payouts} job${res.data!.payouts === 1 ? "" : "s"} returned to Due.` })
+      router.refresh()
+    })
+
+  const reversed = batch?.status === "reversed"
+  const amount = batch ? Number(batch.paidAmount ?? batch.calculatedTotal) : null
+
+  return (
+    <div role="status" className="flex flex-col gap-2 rounded-lg border border-primary/40 bg-card p-3 shadow-sm sm:p-4 print:hidden">
+      <div className="flex flex-wrap items-center justify-between gap-3">
+        <div className="flex flex-col gap-0.5">
+          <p className="text-base font-semibold">
+            {batch ? `Payment #${batch.id} · ${money(amount)} to ${batch.profileName}${batch.method ? ` by ${batch.method}` : ""}` : `Payment #${batchId}`}
+          </p>
+          <p className="text-sm text-muted-foreground">
+            {batch
+              ? `${batch.itemCount} job${batch.itemCount === 1 ? "" : "s"} · paid on ${batch.paidOn ?? zonedDate(batch.recordedAt, timezone)} · recorded ${zonedDateTime(batch.recordedAt, timezone)}${reversed ? " · undone" : ""}`
+              : waitedTooLong
+                ? "Not in the loaded history. It may have been recorded under a different number, or the page needs a refresh."
+                : "Loading the recorded payment…"}
+          </p>
+        </div>
+        <div className="flex flex-wrap items-center gap-2">
+          {batch && !reversed && (
+            <Button type="button" variant="outline" disabled={pending} onClick={undo} className="h-10">
+              <Undo2 className="h-4 w-4" />
+              {pending ? "Undoing…" : "Undo"}
+            </Button>
+          )}
+          <Button type="button" variant="secondary" onClick={onBackToDue} className="h-10">
+            <ArrowLeft className="h-4 w-4" />
+            Back to Due
+          </Button>
+        </div>
+      </div>
+      {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
     </div>
   )
 }
