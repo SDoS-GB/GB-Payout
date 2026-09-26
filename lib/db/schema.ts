@@ -406,6 +406,26 @@ export const syncEvents = pgTable("sync_events", {
   createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
 })
 
+/**
+ * Admin notifications the owner cleared from the bell panel. A row dismisses one underlying
+ * record identity (lib/admin/notices.ts builds the keys from the Workiz job id plus the
+ * specific issue, never from message text or sync times), so repeated syncs cannot bring a
+ * cleared notice back while a genuinely new issue on the same job still gets its own key.
+ * Dismissing never changes a payout, a hold, a source change or Workiz.
+ */
+export const adminNoticeDismissals = pgTable(
+  "admin_notice_dismissals",
+  {
+    id: serial("id").primaryKey(),
+    /** Admin account the dismissal belongs to (one shared admin login today). */
+    account: text("account").notNull().default("admin"),
+    noticeKey: text("notice_key").notNull(),
+    dismissedAt: timestamp("dismissed_at", { withTimezone: true }).notNull().defaultNow(),
+    dismissedBy: text("dismissed_by").notNull().default("admin"),
+  },
+  (t) => [uniqueIndex("admin_notice_dismissals_unique").on(t.account, t.noticeKey)],
+)
+
 export type NormalizedLineItem = {
   id: string | null
   name: string

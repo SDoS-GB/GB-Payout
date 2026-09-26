@@ -1,10 +1,10 @@
 "use client"
 
-import { useEffect, useRef, useState, useTransition } from "react"
+import { useEffect, useLayoutEffect, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
-import { CheckCircle2, ChevronDown, ExternalLink, Info } from "lucide-react"
+import { CheckCircle2, ChevronDown, ExternalLink, Info, Undo2, X } from "lucide-react"
 import type { AdminDashboardData, DueTechnician, PayoutRecord, RecordPaidOutcome } from "@/app/actions/admin"
-import { clearConfirmedPayments, confirmJobPayments, confirmPreviouslyPaidPayouts, recordPaidBatch, reviewPayout } from "@/app/actions/admin"
+import { clearConfirmedPayments, confirmJobPayments, confirmPreviouslyPaidPayouts, recordPaidBatch, reviewPayout, undoPaymentBatch } from "@/app/actions/admin"
 import { Button } from "@/components/ui/button"
 import { Card, CardContent } from "@/components/ui/card"
 import { Checkbox } from "@/components/ui/checkbox"
@@ -25,16 +25,31 @@ type Props = {
   /** Technician whose card should scroll into view (set when arriving from a payout's detail panel). */
   focusProfileId: number | null
   focusToken: number
-  /** A payment was recorded on the server; open it in Paid history. */
-  onPaid: (batchId: number) => void
   onOpenBatch: (batchId: number) => void
 }
 
-export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusToken, onPaid, onOpenBatch }: Props) {
+/** What one PAID click recorded, for the receipt at the bottom of the page. */
+export type PaidOutcome = {
+  batchId: number
+  profileId: number
+  profileName: string
+  total: number
+  count: number
+  /** Due jobs this technician still has after the payment (left unticked). */
+  remaining: number
+}
+
+type Receipt = PaidOutcome & { phase: "paid" | "undoing" | "undone" | "error"; error?: string }
+
+export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusToken, onOpenBatch }: Props) {
   const router = useRouter()
   const [pending, startTransition] = useTransition()
   const [detailId, setDetailId] = useState<number | null>(null)
   const [message, setMessage] = useState<{ tone: "ok" | "error" | "info"; text: string } | null>(null)
+  const [receipt, setReceipt] = useState<Receipt | null>(null)
+  const listRef = useRef<HTMLElement>(null)
+  // The card that should keep its place on screen while a paid card leaves the list.
+  const anchorRef = useRef<{ profileId: number; top: number } | null>(null)
 
   const allJobs = due.technicians.flatMap((t) => t.jobs)
   const detail = detailId != null ? allJobs.find((j) => j.id === detailId) ?? null : null
@@ -43,6 +58,26 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
   useEffect(() => {
     if (detailId != null && !allJobs.some((j) => j.id === detailId)) setDetailId(null)
   }, [allJobs, detailId])
+
+  // After the refreshed list renders, scroll by however much the anchored card moved, so the
+  // owner stays where they were and the next card simply takes the paid card's place.
+  useLayoutEffect(() => {
+    const anchor = anchorRef.current
+    if (!anchor) return
+    anchorRef.current = null
+    const el = listRef.current?.querySelector<HTMLElement>(`[data-tech-id="${anchor.profileId}"]`)
+    if (!el) return
+    const delta = el.getBoundingClientRect().top - anchor.top
+    if (Math.abs(delta) > 1) window.scrollBy({ top: delta })
+  }, [due.technicians])
+
+  const handlePaid = (outcome: PaidOutcome) => {
+    const cards = Array.from(listRef.current?.querySelectorAll<HTMLElement>("[data-tech-id]") ?? [])
+    const index = cards.findIndex((c) => Number(c.dataset.techId) === outcome.profileId)
+    const anchor = outcome.remaining > 0 ? cards[index] : cards[index + 1] ?? cards[index - 1] ?? null
+    anchorRef.current = anchor ? { profileId: Number(anchor.dataset.techId), top: anchor.getBoundingClientRect().top } : null
+    setReceipt({ ...outcome, phase: "paid" })
+  }
 
   const act = (fn: () => Promise<{ ok: boolean; error?: string }>, okText: string) =>
     startTransition(async () => {
@@ -66,7 +101,7 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
           </CardContent>
         </Card>
       ) : (
-        <section aria-label="Due by technician" className="grid gap-4 lg:grid-cols-2">
+        <section ref={listRef} aria-label="Due by technician" className="grid gap-4 lg:grid-cols-2">
           {due.technicians.map((t) => (
             <TechnicianCard
               key={t.profileId}
@@ -75,12 +110,14 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
               paymentMethods={paymentMethods}
               focused={focusProfileId === t.profileId}
               focusToken={focusToken}
-              onPaid={onPaid}
+              onPaid={handlePaid}
               onOpenDetail={setDetailId}
             />
           ))}
         </section>
       )}
+
+      {receipt && <PaidReceipt receipt={receipt} onChange={setReceipt} onOpenBatch={onOpenBatch} />}
 
       <PayoutDetailSheet
         record={detail}
@@ -124,7 +161,7 @@ function TechnicianCard({
   paymentMethods: readonly string[]
   focused: boolean
   focusToken: number
-  onPaid: (batchId: number) => void
+  onPaid: (outcome: PaidOutcome) => void
   onOpenDetail: (payoutId: number) => void
 }) {
   const router = useRouter()
@@ -197,20 +234,23 @@ function TechnicianCard({
         if (res.stale) router.refresh()
         return
       }
-      commit({ ticked: new Map(), unticked: new Set() })
+      // Only the paid rows leave the selection; a job the owner left unticked stays unticked.
+      const paidIds = new Set(selectedRecords.map((j) => j.id))
+      const ticked = new Map(Array.from(selectionRef.current.ticked).filter(([id]) => !paidIds.has(id)))
+      commit({ ticked, unticked: selectionRef.current.unticked })
       setMethod(DEFAULT_TECH_PAYMENT_METHOD)
       setReference("")
       setPaidOn(isoDateInZone(new Date(), timezone))
       setShowOptions(false)
+      onPaid({ batchId: res.data.batchId, profileId: tech.profileId, profileName: res.data.profileName, total: res.data.total, count: res.data.count, remaining: tech.jobs.length - paidIds.size })
       router.refresh()
-      onPaid(res.data.batchId)
     })
   }
 
   const jobWord = tech.count === 1 ? "job" : "jobs"
 
   return (
-    <div ref={ref} className={`flex scroll-mt-28 flex-col rounded-lg border bg-card shadow-sm ${focused ? "ring-2 ring-primary/40" : ""}`}>
+    <div ref={ref} data-tech-id={tech.profileId} className={`flex scroll-mt-28 flex-col rounded-lg border bg-card shadow-sm ${focused ? "ring-2 ring-primary/40" : ""}`}>
       <div className="flex flex-col gap-2 p-4 pb-3">
         <div className="flex items-start justify-between gap-3">
           <div className="flex min-w-0 flex-col gap-0.5">
@@ -293,6 +333,81 @@ function TechnicianCard({
         {notice && <InlineMessage tone="info">{notice}</InlineMessage>}
         {error && <InlineMessage tone="error">{error}</InlineMessage>}
       </form>
+    </div>
+  )
+}
+
+const RECEIPT_MS = { paid: 20_000, undone: 8_000 } as const
+
+/**
+ * Small receipt after PAID, pinned to the bottom so the list stays where it is. Undo runs the
+ * same audited reversal as Paid history and leaves the owner on Due; the receipt hides itself
+ * after a while unless the owner is on it, and never blocks the next PAID.
+ */
+function PaidReceipt({ receipt, onChange, onOpenBatch }: { receipt: Receipt; onChange: (r: Receipt | null) => void; onOpenBatch: (batchId: number) => void }) {
+  const router = useRouter()
+  const [pending, startTransition] = useTransition()
+  const [held, setHeld] = useState(false)
+  const jobs = `${receipt.count} job${receipt.count === 1 ? "" : "s"}`
+
+  useEffect(() => {
+    if (held || receipt.phase === "undoing" || receipt.phase === "error") return
+    const t = setTimeout(() => onChange(null), RECEIPT_MS[receipt.phase])
+    return () => clearTimeout(t)
+  }, [receipt.batchId, receipt.phase, held, onChange])
+
+  const undo = () => {
+    if (pending || (receipt.phase !== "paid" && receipt.phase !== "error")) return
+    startTransition(async () => {
+      onChange({ ...receipt, phase: "undoing", error: undefined })
+      const res = await undoPaymentBatch(receipt.batchId, "Undo from Due")
+      if (!res.ok) {
+        onChange({ ...receipt, phase: "error", error: res.error })
+        return
+      }
+      router.refresh()
+      onChange({ ...receipt, phase: "undone", error: undefined })
+    })
+  }
+
+  const text =
+    receipt.phase === "undone"
+      ? `Payment to ${receipt.profileName} undone · ${jobs} back in Due`
+      : receipt.phase === "undoing"
+        ? `Undoing payment to ${receipt.profileName}…`
+        : `Paid ${receipt.profileName} ${money(receipt.total)} · ${jobs}`
+
+  return (
+    <div
+      role="status"
+      aria-live="polite"
+      onMouseEnter={() => setHeld(true)}
+      onMouseLeave={() => setHeld(false)}
+      onFocus={() => setHeld(true)}
+      onBlur={(e) => {
+        if (!e.currentTarget.contains(e.relatedTarget as Node | null)) setHeld(false)
+      }}
+      className="fixed inset-x-3 bottom-3 z-30 flex flex-col gap-2 rounded-lg border bg-card p-3 text-sm text-card-foreground shadow-lg print:hidden sm:inset-x-auto sm:bottom-6 sm:right-6 sm:w-96"
+    >
+      <div className="flex items-start gap-2">
+        {receipt.phase === "undone" ? <Undo2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden="true" /> : <CheckCircle2 className="mt-0.5 h-4 w-4 shrink-0 text-primary" aria-hidden="true" />}
+        <p className="min-w-0 flex-1 font-medium leading-snug">{text}</p>
+        <button type="button" onClick={() => onChange(null)} aria-label="Dismiss" className="-mr-1 -mt-1 flex h-9 w-9 shrink-0 items-center justify-center rounded-md text-muted-foreground hover:bg-accent hover:text-foreground focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring">
+          <X className="h-4 w-4" aria-hidden="true" />
+        </button>
+      </div>
+      {receipt.phase === "error" && <InlineMessage tone="error">{receipt.error ?? "Undo failed"}</InlineMessage>}
+      {receipt.phase !== "undone" && (
+        <div className="flex flex-wrap items-center gap-2">
+          <Button type="button" variant="outline" size="sm" onClick={undo} disabled={pending || receipt.phase === "undoing"} aria-busy={pending} className="h-10">
+            <Undo2 className="h-4 w-4" aria-hidden="true" />
+            {receipt.phase === "error" ? "Try undo again" : "Undo"}
+          </Button>
+          <button type="button" onClick={() => onOpenBatch(receipt.batchId)} className="min-h-10 px-2 text-sm text-muted-foreground underline-offset-4 hover:underline">
+            Open in Paid history
+          </button>
+        </div>
+      )}
     </div>
   )
 }

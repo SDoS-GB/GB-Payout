@@ -12,6 +12,8 @@ import {
   workizJobs,
   workizTeamMappings,
 } from "@/lib/db/schema"
+import { dismissNoticeKeys, listDismissedNoticeKeys } from "@/lib/admin/notice-dismissals"
+import { MAX_NOTICE_KEYS_PER_CLEAR, NOTICE_ACCOUNT, buildAdminNotices, type AdminNotice, type HeldPayoutInput, type UnmappedInput } from "@/lib/admin/notices"
 import { TECH_PAYMENT_METHODS, isoDateInZone, round2, validateBatchForm, type SelectionItem, type StaleItem } from "@/lib/payout/batch-rules"
 import { getBatch, listBatches, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
 import { isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
@@ -699,11 +701,11 @@ export async function confirmPreviouslyPaidPayouts(payoutIds: number[]): Promise
 
 // --- Source changes on settled payouts ----------------------------------------
 
-export type SourceChangeRow = { id: number; payoutId: number; jobUuid: string; serialId: string | null; clientName: string | null; profileName: string; settledAmount: number | null; recomputedAmount: number | null; summary: string | null; detectedAt: Date }
+export type SourceChangeRow = { id: number; payoutId: number; jobUuid: string; serialId: string | null; clientName: string | null; profileName: string; newHash: string; settledAmount: number | null; recomputedAmount: number | null; summary: string | null; detectedAt: Date }
 
 async function openSourceChanges(limit = 100): Promise<SourceChangeRow[]> {
   const rows = await db
-    .select({ id: payoutSourceChanges.id, payoutId: payoutSourceChanges.payoutId, jobUuid: payoutSourceChanges.jobUuid, serialId: workizJobs.serialId, clientName: workizJobs.clientName, profileName: technicianProfiles.name, settledAmount: payoutSourceChanges.settledAmount, recomputedAmount: payoutSourceChanges.recomputedAmount, summary: payoutSourceChanges.summary, detectedAt: payoutSourceChanges.detectedAt })
+    .select({ id: payoutSourceChanges.id, payoutId: payoutSourceChanges.payoutId, jobUuid: payoutSourceChanges.jobUuid, serialId: workizJobs.serialId, clientName: workizJobs.clientName, profileName: technicianProfiles.name, newHash: payoutSourceChanges.newHash, settledAmount: payoutSourceChanges.settledAmount, recomputedAmount: payoutSourceChanges.recomputedAmount, summary: payoutSourceChanges.summary, detectedAt: payoutSourceChanges.detectedAt })
     .from(payoutSourceChanges)
     .leftJoin(workizJobs, eq(payoutSourceChanges.jobUuid, workizJobs.uuid))
     .leftJoin(technicianProfiles, eq(payoutSourceChanges.profileId, technicianProfiles.id))
@@ -721,6 +723,48 @@ export async function acknowledgeSourceChange(id: number): Promise<Result> {
     await logSyncEvent("source-change", { jobUuid: row.jobUuid, ok: true, summary: `Acknowledged: ${row.summary ?? `source change #${id}`}` })
     revalidatePath("/admin")
     return { ok: true }
+  } catch (err) {
+    return fail(err)
+  }
+}
+
+// --- Admin notifications (bell) -------------------------------------------------
+
+/** Every payout on hold with the job and technician the notice names. */
+async function heldPayoutRows(limit = 500): Promise<HeldPayoutInput[]> {
+  const rows = await db
+    .select({ payoutId: payouts.id, jobUuid: payouts.jobUuid, serialId: workizJobs.serialId, clientName: workizJobs.clientName, profileName: technicianProfiles.name, holdReason: payouts.holdReason, updatedAt: payouts.updatedAt })
+    .from(payouts)
+    .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
+    .leftJoin(technicianProfiles, eq(payouts.profileId, technicianProfiles.id))
+    .where(eq(payouts.status, "hold"))
+    .orderBy(desc(payouts.updatedAt), desc(payouts.id))
+    .limit(limit)
+  return rows.map((r) => ({ ...r, profileName: r.profileName ?? "Unknown" }))
+}
+
+/**
+ * The bell's list: current facts minus what this admin already cleared. Built on every
+ * dashboard load, so a Refresh, a scheduled sync or another device all show the same thing.
+ */
+async function loadAdminNotices(input: { sourceChanges: SourceChangeRow[]; unmapped: UnmappedInput[]; openingMissing: boolean }): Promise<AdminNotice[]> {
+  const [holds, dismissed] = await Promise.all([heldPayoutRows(), listDismissedNoticeKeys(NOTICE_ACCOUNT)])
+  return buildAdminNotices({ holds, sourceChanges: input.sourceChanges, unmapped: input.unmapped, openingMissing: input.openingMissing }, dismissed)
+}
+
+/**
+ * CLEAR in the bell panel: dismiss exactly the notifications the owner was looking at. This
+ * hides them for good on every device; it never marks anything paid, releases a hold,
+ * acknowledges a source change, records an opening balance or touches Workiz.
+ */
+export async function dismissAdminNotices(keys: string[]): Promise<Result<{ recorded: number; requested: number }>> {
+  try {
+    await requireAdmin()
+    const res = await dismissNoticeKeys(NOTICE_ACCOUNT, keys, "admin")
+    if (!res.ok) return res
+    await logSyncEvent("notice:dismiss", { ok: true, summary: `Cleared ${res.requested} notification${res.requested === 1 ? "" : "s"} from the bell (${res.recorded} new)`, details: { keys: Array.from(new Set(keys)).slice(0, MAX_NOTICE_KEYS_PER_CLEAR) } })
+    revalidatePath("/admin")
+    return { ok: true, data: { recorded: res.recorded, requested: res.requested } }
   } catch (err) {
     return fail(err)
   }
@@ -1018,10 +1062,15 @@ export async function loadAdminDashboard() {
     countWebhookEventsByStatus(),
   ])
 
-  const unmappedIds = mappings.filter((m) => m.profileId == null && !m.excluded).map((m) => m.workizTeamId)
-  const unmappedImpact = await unmappedTeamImpact(unmappedIds)
+  const unmappedPeople = mappings.filter((m) => m.profileId == null && !m.excluded)
+  const unmappedIds = unmappedPeople.map((m) => m.workizTeamId)
+  const [unmappedImpact, notices] = await Promise.all([
+    unmappedTeamImpact(unmappedIds),
+    loadAdminNotices({ sourceChanges, unmapped: unmappedPeople.map((m) => ({ workizTeamId: m.workizTeamId, workizName: m.workizName })), openingMissing: !payoutSettings.openingInitializedAt }),
+  ])
 
   return {
+    notices,
     profiles: profiles.map((p) => ({ ...p, pinHash: undefined })),
     mappings,
     unmappedImpact,

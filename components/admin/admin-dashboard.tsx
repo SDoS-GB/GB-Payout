@@ -2,21 +2,19 @@
 
 import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from "react"
 import { useRouter, useSearchParams } from "next/navigation"
-import { AlertCircle } from "lucide-react"
 import type { AdminDashboardData } from "@/app/actions/admin"
 import { signOutSession } from "@/app/actions/session"
 import { DEFAULT_PAYOUT_QUERY, type PayoutQuery } from "@/lib/payout/presentation"
 import { adminHref, adminPageTitle, parseAdminLocation, type AdminLocation } from "@/lib/admin/navigation"
 import { AdminMenu, type MenuCounts } from "./admin-menu"
 import { LastUpdatedLine, RefreshButton, useSyncRefresh } from "./refresh-control"
+import { NotificationBell } from "./notification-bell"
 import { DueTab } from "./due-tab"
 import { PaidHistoryTab } from "./paid-history-tab"
 import { PayoutsTab } from "./payouts-tab"
 import { ReviewTab } from "./review-tab"
 import { WaitingTab } from "./waiting-tab"
 import { SettingsTab } from "./settings-tab"
-
-const plural = (n: number, word: string) => `${n} ${word}${n === 1 ? "" : "s"}`
 
 /**
  * One route, several pages. The current page lives in the URL (see lib/admin/navigation.ts) and
@@ -72,11 +70,14 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
     settings: unmappedPeople.length + (openingMissing ? 1 : 0),
   }
 
-  const attention: Array<{ text: string; loc: Partial<AdminLocation> }> = []
-  if (holdCount > 0) attention.push({ text: `${plural(holdCount, "payout")} need${holdCount === 1 ? "s" : ""} your call`, loc: { view: "review" } })
-  if (data.sourceChanges.length > 0) attention.push({ text: `${plural(data.sourceChanges.length, "paid job")} changed in Workiz`, loc: { view: "review" } })
-  if (unmappedPeople.length > 0) attention.push({ text: `${plural(unmappedPeople.length, "unmapped team member")}`, loc: { view: "settings", section: "team", teamFilter: "unmapped" } })
-  if (openingMissing) attention.push({ text: "Opening balance not recorded", loc: { view: "settings", section: "opening" } })
+  // A notification about one held job opens Review already filtered to that job.
+  const openReviewJob = useCallback(
+    (search: string) => {
+      setReviewQuery({ ...DEFAULT_PAYOUT_QUERY, status: "hold", search })
+      navigate({ view: "review" })
+    },
+    [navigate],
+  )
 
   const title = adminPageTitle(location)
 
@@ -89,7 +90,10 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
               <AdminMenu current={location.view} counts={counts} onNavigate={navigate} onSignOut={signOut} signingOut={signingOut} />
               <h1 className="truncate text-xl font-semibold tracking-tight">{title}</h1>
             </div>
-            <RefreshButton sync={sync} />
+            <div className="flex shrink-0 items-center gap-1">
+              <NotificationBell notices={data.notices} onNavigate={navigate} onReviewJob={openReviewJob} />
+              <RefreshButton sync={sync} />
+            </div>
           </div>
           <div className="pl-12">
             <LastUpdatedLine sync={sync} timezone={timezone} />
@@ -98,28 +102,6 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
       </header>
 
       <div className="mx-auto flex max-w-6xl flex-col gap-4 px-3 py-4 sm:px-4 sm:py-6">
-        {location.view === "due" && attention.length > 0 && (
-          <div role="status" className="flex flex-wrap items-center gap-x-2 gap-y-1 rounded-md border border-warning/50 bg-warning/10 px-3 py-2 text-sm text-foreground">
-            <AlertCircle className="h-4 w-4 shrink-0 text-warning-foreground" aria-hidden="true" />
-            {attention.map((a, i) => (
-              <span key={a.text} className="flex items-center gap-2">
-                {i > 0 && <span aria-hidden="true">·</span>}
-                <a
-                  href={adminHref(a.loc)}
-                  onClick={(e) => {
-                    if (e.metaKey || e.ctrlKey) return
-                    e.preventDefault()
-                    navigate(a.loc)
-                  }}
-                  className="font-medium text-warning-foreground underline-offset-4 hover:underline"
-                >
-                  {a.text}
-                </a>
-              </span>
-            ))}
-          </div>
-        )}
-
         {location.view === "due" && (
           <DueTab
             due={data.due}
@@ -127,7 +109,6 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
             timezone={timezone}
             focusProfileId={location.techId}
             focusToken={focusToken}
-            onPaid={(batchId) => navigate({ view: "history", batchId })}
             onOpenBatch={(batchId) => navigate({ view: "history", batchId: batchId || null })}
           />
         )}
