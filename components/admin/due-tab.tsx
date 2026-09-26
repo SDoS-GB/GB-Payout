@@ -350,8 +350,11 @@ function PaidReceipt({ receipt, onChange, onOpenBatch }: { receipt: Receipt; onC
   const [held, setHeld] = useState(false)
   const jobs = `${receipt.count} job${receipt.count === 1 ? "" : "s"}`
 
+  // Hovering or focusing the receipt keeps Undo available; the "undone" note has nothing left
+  // to act on, so it always goes away (a tap on Undo leaves focus and emulated hover behind).
   useEffect(() => {
-    if (held || receipt.phase === "undoing" || receipt.phase === "error") return
+    if (receipt.phase === "undoing" || receipt.phase === "error") return
+    if (receipt.phase === "paid" && held) return
     const t = setTimeout(() => onChange(null), RECEIPT_MS[receipt.phase])
     return () => clearTimeout(t)
   }, [receipt.batchId, receipt.phase, held, onChange])
