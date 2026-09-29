@@ -37,11 +37,9 @@ export type DocumentKind = "invoice" | "estimate"
 /**
  * Whether the `amount` on a Workiz payment record already contains its `tipAmount`.
  * Workiz's article shows `{ amount: 100, tipAmount: 10 }` without saying; the live account
- * has only tipless payments so far. Decided per event from the document's own totals:
- *   - sum(amount) == totalPrice − amountDue        → amounts EXCLUDE tips ("separate")
- *   - sum(amount) − sum(tip) == totalPrice − amountDue → amounts INCLUDE tips ("included")
- * Anything else (or no totals) is "unknown"; with a non-zero tip that holds the job for review
- * instead of guessing the tip in or out of the card-fee base.
+ * has only tipless provider events so far. A verdict needs both the document's collected
+ * amount AND evidence of whether its total includes tips. A balance alone is insufficient.
+ * Ambiguous non-zero tips hold the job rather than guessing a card-fee base.
  */
 export type TipInclusion = "separate" | "included" | "unknown"
 
@@ -129,6 +127,7 @@ export type InvoiceWebhookPayments = {
   amountDue: number | null
   /** Whether each payment's `amount` already contains its tip, decided from the document totals. */
   tipInclusion: TipInclusion
+  snapshotUpdatedAt: string | null
   payments: ExternalPaymentInput[]
 }
 
@@ -165,7 +164,7 @@ export function extractDocumentPayments(data: Record<string, unknown> | null | u
       source,
       method: str(pick(r, "type", "Type", "method", "Method", "paymentMethod", "payment_method")) ?? "",
       amount,
-      tipAmount: round2(Math.max(0, num(pick(r, "tipAmount", "tip_amount", "tip", "Tip")))),
+      tipAmount: round2(Number(pick(r, "tipAmount", "tip_amount", "tip", "Tip") ?? 0)),
       paidAt: explicitDate,
       paidAtFromPayload: explicitDate !== null,
       sourceUpdatedAt: str(pick(r, "updatedAt", "updated_at", "updated")) ?? str(pick(data, "updatedAt", "updated", "statusUpdatedAt")) ?? receivedAt ?? null,
@@ -188,6 +187,7 @@ export function extractDocumentPayments(data: Record<string, unknown> | null | u
     invoiceTotal,
     amountDue,
     tipInclusion: inferTipInclusion(payments, invoiceTotal, amountDue, documentTotalIncludesTips(data)),
+    snapshotUpdatedAt: str(pick(data, "updatedAt", "updated", "statusUpdatedAt")) ?? receivedAt ?? null,
     payments,
   }
 }

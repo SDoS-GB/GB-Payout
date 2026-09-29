@@ -4,9 +4,9 @@ import { useState } from "react"
 import { Plus, Trash2 } from "lucide-react"
 import type { NormalizedPayment } from "@/lib/db/schema"
 import { Button } from "@/components/ui/button"
+import { Field, FieldGroup, FieldLabel } from "@/components/ui/field"
 import { Input } from "@/components/ui/input"
-import { Label } from "@/components/ui/label"
-import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { Select, SelectContent, SelectGroup, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { MANUAL_PAYMENT_METHODS, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { InlineMessage, money } from "./shared"
 
@@ -107,63 +107,57 @@ export function PaymentConfirmationForm({
   return (
     <div className="flex flex-col gap-3 rounded-md border border-dashed p-3">
       <div className="flex flex-col gap-0.5">
-        <p className="text-sm font-medium">Confirm payments from Workiz</p>
-        <p className="text-xs text-muted-foreground">
-          Open the job&apos;s Payments tab in Workiz and copy each payment here exactly as shown, tip included. Put the tip in the Tip column of the payment it was added to. Only card payments (and card tips) get the 3.5% deduction; cash, check and Zelle do not. Nothing is assumed — leave the method blank and the payout stays on hold.
+        <p className="text-sm font-medium">Manual recovery · Workiz payments</p>
+        <p className="text-sm leading-relaxed text-muted-foreground">
+          This is a recovery entry, not automatic payment retrieval. Copy every existing payment from the job&apos;s Workiz Payments tab, tip included. Record each tip beside its payment. Card payments and card tips receive the 3.5% deduction; cash, check and Zelle do not. A missing method keeps the payout on hold.
         </p>
       </div>
 
-      <div className="flex flex-col gap-2">
+      <div className="flex flex-col gap-4">
         {rows.map((row, i) => (
-          <div key={row.key} className="grid grid-cols-[minmax(0,1fr)_minmax(0,6.5rem)_minmax(0,5.5rem)_minmax(0,1fr)_auto] items-end gap-2">
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-method-${row.key}`} className="text-xs">
-                Method
-              </Label>
-              <Select value={row.method || undefined} onValueChange={(v) => update(row.key, { method: v })}>
-                <SelectTrigger id={`pay-method-${row.key}`} aria-label={`Payment ${i + 1} method`}>
+          <FieldGroup key={row.key} className="grid grid-cols-1 items-end gap-3 sm:grid-cols-2" role="group" aria-label={`Recovery payment ${i + 1}`}>
+            <Field data-disabled={pending}>
+              <FieldLabel htmlFor={`pay-method-${row.key}`}>Method</FieldLabel>
+              <Select value={row.method || undefined} disabled={pending} onValueChange={(v) => update(row.key, { method: v })}>
+                <SelectTrigger id={`pay-method-${row.key}`} className="w-full" aria-label={`Payment ${i + 1} method`}>
                   <SelectValue placeholder="Choose method" />
                 </SelectTrigger>
                 <SelectContent>
-                  {MANUAL_PAYMENT_METHODS.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
+                  <SelectGroup>
+                    {MANUAL_PAYMENT_METHODS.map((m) => (
+                      <SelectItem key={m} value={m}>{m}</SelectItem>
+                    ))}
+                  </SelectGroup>
                 </SelectContent>
               </Select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-amount-${row.key}`} className="text-xs">
-                Amount
-              </Label>
-              <Input id={`pay-amount-${row.key}`} inputMode="decimal" value={row.amount} onChange={(e) => update(row.key, { amount: e.target.value })} className="tabular-nums" aria-label={`Payment ${i + 1} amount`} />
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-tip-${row.key}`} className="text-xs">
-                Tip included
-              </Label>
+            </Field>
+            <Field data-disabled={pending}>
+              <FieldLabel htmlFor={`pay-amount-${row.key}`}>Amount</FieldLabel>
+              <Input id={`pay-amount-${row.key}`} inputMode="decimal" disabled={pending} value={row.amount} onChange={(e) => update(row.key, { amount: e.target.value })} className="tabular-nums" aria-label={`Payment ${i + 1} amount`} />
+            </Field>
+            <Field data-disabled={pending} data-invalid={parse(row.tip) > parse(row.amount) + 0.005 || undefined}>
+              <FieldLabel htmlFor={`pay-tip-${row.key}`}>Tip included</FieldLabel>
               <Input
                 id={`pay-tip-${row.key}`}
                 inputMode="decimal"
                 placeholder="0.00"
+                disabled={pending}
                 value={row.tip}
                 onChange={(e) => update(row.key, { tip: e.target.value })}
                 className="tabular-nums"
                 aria-label={`Payment ${i + 1} tip included in the amount`}
                 aria-invalid={parse(row.tip) > parse(row.amount) + 0.005 || undefined}
               />
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-date-${row.key}`} className="text-xs">
-                Paid on (optional)
-              </Label>
-              <Input id={`pay-date-${row.key}`} type="datetime-local" value={row.paidAt} onChange={(e) => update(row.key, { paidAt: e.target.value })} aria-label={`Payment ${i + 1} date`} />
-            </div>
-            <Button type="button" size="icon" variant="ghost" onClick={() => remove(row.key)} disabled={rows.length === 1 || pending} aria-label={`Remove payment ${i + 1}`}>
-              <Trash2 className="size-4" />
+            </Field>
+            <Field data-disabled={pending}>
+              <FieldLabel htmlFor={`pay-date-${row.key}`}>Paid on (optional)</FieldLabel>
+              <Input id={`pay-date-${row.key}`} type="datetime-local" disabled={pending} value={row.paidAt} onChange={(e) => update(row.key, { paidAt: e.target.value })} aria-label={`Payment ${i + 1} date`} />
+            </Field>
+            <Button type="button" size="sm" variant="ghost" className="justify-self-end sm:col-span-2" onClick={() => remove(row.key)} disabled={rows.length === 1 || pending} aria-label={`Remove payment ${i + 1}`}>
+              <Trash2 data-icon="inline-start" />
+              Remove payment
             </Button>
-          </div>
+          </FieldGroup>
         ))}
       </div>
 
@@ -183,7 +177,7 @@ export function PaymentConfirmationForm({
       {tipTooLarge && <InlineMessage tone="error">A tip cannot be larger than the payment it is part of. Enter the amount as Workiz shows it (tip included) and the tip portion beside it.</InlineMessage>}
       {!mismatch && tipGap && (
         <InlineMessage tone="info">
-          Workiz&apos;s total is {money(expectedTip)} above the itemized services. Its API does not send the Tip field, so that is most likely the tip{tipSum > 0 ? ` — you have entered ${money(tipSum)}` : ""}. Leave it out only if the customer was charged something other than a tip; the payout stays on hold until the numbers agree.
+          Workiz&apos;s total is {money(expectedTip)} above the itemized services{tipSum > 0 ? ` — you have entered ${money(tipSum)} as tip` : ""}. The job response does not identify that extra amount. Verify the recorded tip in Workiz rather than assuming it; the payout stays on hold until the numbers agree.
         </InlineMessage>
       )}
 

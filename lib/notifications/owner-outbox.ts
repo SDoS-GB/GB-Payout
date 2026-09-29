@@ -34,18 +34,24 @@ export async function materializeOwnerNotification(job: NormalizedJob, engine: E
       status = "blocked"; blockReason = "Historical job: automatic backfill texts are suppressed. Use Send payout to owner for this job only."
     }
   }
+  const changedRequest = Boolean(previous?.requestedAt && previous.snapshotHash !== snapshotHash)
+  if (changedRequest) { status = "blocked"; blockReason = "The explicitly requested payout changed. Review the current message and request this job again." }
   if (previous?.requiresReview) { status = "failed"; blockReason = previous.lastError ?? "Ambiguous delivery needs review; no automatic resend" }
   else if (previous && previous.attempts >= OWNER_MAX_ATTEMPTS && !previous.sentAt) { status = "failed"; blockReason = "Owner send retry limit reached; investigate the last error" }
-  if (previous && ["sending", "provider_accepted", "delivered"].includes(previous.status)) {
-    status = previous.status
+  else if (previous?.status === "failed" && previous.attempts > 0 && previous.snapshotHash === snapshotHash) { status = "failed"; blockReason = previous.lastError ?? "The provider rejected this attempt; review the error before requesting it again" }
+  if (previous && (previous.sentAt || ["sending", "provider_accepted", "delivered"].includes(previous.status))) {
+    status = previous.deliveredAt ? "delivered" : previous.sentAt ? "provider_accepted" : previous.status
     blockReason = previous.sentSnapshotHash && previous.sentSnapshotHash !== snapshotHash ? "Payout inputs changed after the Workiz trigger; no second text will be sent automatically" : blockReason
   }
+  const preserveDestination = previous && (previous.sentAt || previous.requiresReview || previous.status === "sending")
   const values = {
     jobUuid: job.uuid, status, blockReason, snapshotHash, message,
-    destinationId: settings.ownerRecipient?.workizTeamId ?? null,
-    destinationLabel: settings.ownerRecipient?.name ?? null,
-    destinationMasked: settings.ownerRecipient?.phoneMasked ?? null,
-    nextAttemptAt: status === "queued" ? previous?.nextAttemptAt ?? new Date() : status === "sending" ? previous?.nextAttemptAt ?? null : null,
+    requestedAt: changedRequest ? null : previous?.requestedAt ?? null,
+    requestedBy: changedRequest ? null : previous?.requestedBy ?? null,
+    destinationId: preserveDestination ? previous.destinationId : settings.ownerRecipient?.workizTeamId ?? null,
+    destinationLabel: preserveDestination ? previous.destinationLabel : settings.ownerRecipient?.name ?? null,
+    destinationMasked: preserveDestination ? previous.destinationMasked : settings.ownerRecipient?.phoneMasked ?? null,
+    nextAttemptAt: status === "queued" ? previous?.nextAttemptAt ?? new Date() : status === "sending" || previous?.requiresReview ? previous?.nextAttemptAt ?? null : null,
     updatedAt: new Date(),
   }
   const [row] = await database.insert(ownerNotifications).values(values).onConflictDoUpdate({ target: ownerNotifications.jobUuid, set: values }).returning()

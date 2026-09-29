@@ -273,7 +273,7 @@ describe("invoice webhooks carry the payment type", () => {
     expect(parsed.uuidCandidates).toEqual(["CC6YKK"])
     expect(parsed.invoice).toMatchObject({ invoiceId: "IV-bK9r2XyZL54aWDR0", jobId: "JOB-BA5r7o4bqzR9MONa", invoiceTotal: 50, amountDue: 0 })
     expect(parsed.invoice?.payments).toEqual([
-      expect.objectContaining({ externalId: "PAY-BA5r7o4bqzR9MONa", source: "invoice-webhook", method: "Cash", amount: 50, tipAmount: 0, paidAt: "2026-09-21T17:56:00Z", invoiceId: "IV-bK9r2XyZL54aWDR0" }),
+      expect.objectContaining({ externalId: "PAY-BA5r7o4bqzR9MONa", source: "invoice-webhook", method: "Cash", amount: 50, tipAmount: 0, paidAt: null, paidAtFromPayload: false, sourceUpdatedAt: "2026-09-21T17:56:00Z", invoiceId: "IV-bK9r2XyZL54aWDR0" }),
     ])
   })
 
@@ -284,8 +284,7 @@ describe("invoice webhooks carry the payment type", () => {
       expect.objectContaining({ id: "PAY-2:tip", amount: 10, isTip: true }),
     ])
 
-    // Default verdict is "separate": the amount is the service payment and the tip sits on top.
-    const separate = [{ id: 8, externalId: "PAY-3", source: "invoice-webhook", method: "Cash", amount: "100.00", tipAmount: "10.00", paidAt: null, recordedBy: null, raw: null }]
+    const separate = [{ id: 8, externalId: "PAY-3", source: "invoice-webhook", method: "Cash", amount: "100.00", tipAmount: "10.00", paidAt: null, recordedBy: null, raw: { [TIP_INCLUSION_RAW_KEY]: "separate" } }]
     expect(externalRowsToPayments(separate, settings.cardMethodKeywords)).toEqual([
       expect.objectContaining({ id: "PAY-3", amount: 100, isTip: false }),
       expect.objectContaining({ id: "PAY-3:tip", amount: 10, isTip: true }),
@@ -296,11 +295,14 @@ describe("invoice webhooks carry the payment type", () => {
     expect(externalRowsToPayments(unknown, settings.cardMethodKeywords).every((p) => p.tipAmbiguous === true)).toBe(true)
   })
 
-  it("decides whether webhook amounts include their tips from the document totals", () => {
+  it("requires evidence about the total's tip semantics, not just a balance", () => {
     const pays = [{ amount: 100, tipAmount: 10 }]
-    expect(inferTipInclusion(pays, 100, 0)).toBe("separate")
-    expect(inferTipInclusion(pays, 90, 0)).toBe("included")
-    expect(inferTipInclusion(pays, 95, 0)).toBe("unknown")
+    expect(inferTipInclusion(pays, 100, 0)).toBe("unknown")
+    expect(inferTipInclusion(pays, 100, 0, false)).toBe("separate")
+    expect(inferTipInclusion(pays, 90, 0, false)).toBe("included")
+    expect(inferTipInclusion(pays, 110, 0, true)).toBe("separate")
+    expect(inferTipInclusion(pays, 100, 0, true)).toBe("included")
+    expect(inferTipInclusion(pays, 95, 0, false)).toBe("unknown")
     expect(inferTipInclusion(pays, null, 0)).toBe("unknown")
     expect(inferTipInclusion([{ amount: 100, tipAmount: 0 }], null, null)).toBe("separate")
   })

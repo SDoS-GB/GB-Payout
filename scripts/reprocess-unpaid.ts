@@ -8,13 +8,16 @@
  *   set -a && source /vercel/share/.env.project && set +a && pnpm dlx tsx scripts/reprocess-unpaid.ts
  * Pass --dry-run to only print the before snapshot.
  */
-import { eq, inArray, sql } from "drizzle-orm"
+import { and, eq, inArray, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { payouts, technicianProfiles, workizJobs } from "@/lib/db/schema"
 import { getWorkizClient, loadSyncContext, processRawJob } from "@/lib/workiz/sync"
 
 const VIA = `reprocess-unpaid-${new Date().toISOString().slice(0, 10)}`
 const dryRun = process.argv.includes("--dry-run")
+const jobArg = process.argv.indexOf("--job")
+const selectedJob = jobArg === -1 ? null : process.argv[jobArg + 1]
+if (jobArg !== -1 && (!selectedJob || !/^[A-Za-z0-9_-]+$/.test(selectedJob))) throw new Error("--job requires one Workiz job UUID")
 
 type Row = {
   id: number
@@ -55,9 +58,9 @@ async function main() {
   const unpaid = await db
     .selectDistinct({ jobUuid: payouts.jobUuid })
     .from(payouts)
-    .where(inArray(payouts.status, ["pending", "hold", "ready"]))
+    .where(and(inArray(payouts.status, ["pending", "hold", "ready"]), selectedJob ? eq(payouts.jobUuid, selectedJob) : undefined))
   const uuids = unpaid.map((r) => r.jobUuid)
-  console.log(`Jobs with unpaid payouts: ${uuids.length}`)
+  console.log(`Jobs with unpaid payouts: ${uuids.length}${selectedJob ? ` (only ${selectedJob})` : ""}. Reprocessing only; no owner send is requested.`)
 
   const before = await snapshot(uuids)
   console.log("\nBEFORE")

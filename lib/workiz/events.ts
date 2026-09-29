@@ -1,6 +1,6 @@
 import { randomUUID } from "node:crypto"
 import { and, asc, desc, eq, inArray, lt, lte, or, isNull, sql } from "drizzle-orm"
-import { db } from "@/lib/db"
+import { db, type Database } from "@/lib/db"
 import { webhookEvents, workizJobIds, type WebhookEventRow } from "@/lib/db/schema"
 import type { ParsedWebhook } from "./webhook"
 
@@ -100,6 +100,16 @@ export async function pendingUnresolvedEvents(opts: { internalId?: string; limit
     .where(and(...conds))
     .orderBy(asc(webhookEvents.receivedAt))
     .limit(opts.limit ?? 50)
+}
+
+export async function unprocessedEventsForJob(uuid: string, database: Database = db) {
+  const internalIds = database.select({ id: workizJobIds.internalId }).from(workizJobIds).where(eq(workizJobIds.uuid, uuid))
+  return database.select({ id: webhookEvents.id, kind: webhookEvents.kind, status: webhookEvents.status, error: webhookEvents.error, attempts: webhookEvents.attempts, nextAttemptAt: webhookEvents.nextAttemptAt })
+    .from(webhookEvents).where(and(
+      or(eq(webhookEvents.jobUuid, uuid), inArray(webhookEvents.jobInternalId, internalIds)),
+      inArray(webhookEvents.kind, ["job", "invoice", "estimate", "unknown"]),
+      inArray(webhookEvents.status, ["received", "processing", "unresolved", "failed"]),
+    )).orderBy(asc(webhookEvents.id)).limit(20)
 }
 
 export const WEBHOOK_MAX_ATTEMPTS = 12

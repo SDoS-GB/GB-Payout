@@ -2,7 +2,7 @@ import { and, eq, inArray, sql } from "drizzle-orm"
 import { db, type Database } from "@/lib/db"
 import { lockPayoutJob } from "@/lib/payout/lock"
 import { materializeOwnerNotification } from "@/lib/notifications/owner-outbox"
-import { paymentEvidence, persistPayments } from "./payment-store"
+import { paymentEvidence, persistPayments, type PaymentMergeOptions } from "./payment-store"
 import { parseWorkizDate } from "./time"
 import { appSettings, colorSealItems, jobPayments, payouts, syncEvents, workizJobs, workizTeamMappings, type NormalizedPayment } from "@/lib/db/schema"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
@@ -115,12 +115,11 @@ export async function loadExternalPayments(jobUuid: string, settings: WorkizSett
 /**
  * Persist payments delivered by an invoice or estimate webhook. Keyed by Workiz's payment id
  * ("PAY-…"), so a retried or duplicated webhook updates the same row instead of doubling the
- * paid total. Live payloads carry no per-payment date, so `paidAt` is the arrival time of the
- * FIRST event that mentioned the payment and is never moved forward by a later re-delivery
- * (the Sep 15 deposit must still read Sep 15 when the Sep 23 invoice event repeats it).
- * Records without an id cannot be de-duplicated safely and are skipped with a log entry.
+ * paid total. Missing payment dates remain unknown; event arrival is never shown as payment
+ * date. A provider-supplied deposit date survives later re-deliveries without dates.
+ * Records without a stable ID fail processing and remain in the durable event log.
  */
-export async function recordExternalPayments(jobUuid: string, inputs: ExternalPaymentInput[], opts: { tipInclusion?: TipInclusion; timezone?: string; database?: Database } = {}) {
+export async function recordExternalPayments(jobUuid: string, inputs: ExternalPaymentInput[], opts: PaymentMergeOptions = {}) {
   return persistPayments(jobUuid, inputs, opts)
 }
 
@@ -131,6 +130,7 @@ export async function recordExternalPayments(jobUuid: string, inputs: ExternalPa
  */
 export async function replaceManualPayments(jobUuid: string, entries: ManualPaymentEntry[], recordedBy: string): Promise<number> {
   await db.transaction(async (tx) => {
+    await lockPayoutJob(tx, jobUuid)
     await tx.delete(jobPayments).where(and(eq(jobPayments.jobUuid, jobUuid), eq(jobPayments.source, "manual")))
     if (entries.length) {
       await tx.insert(jobPayments).values(
@@ -227,13 +227,13 @@ export async function processRawJob(raw: WorkizRawJob, source: SyncSource, ctx?:
   const fetchedAt = ctx?.fetchedAt ?? new Date()
   const apply = async (tx: Database): Promise<JobSyncResult> => {
     await lockPayoutJob(tx, uuid)
-    const [saved] = await tx.select({ raw: workizJobs.raw }).from(workizJobs).where(eq(workizJobs.uuid, uuid)).limit(1)
+    const [saved] = await tx.select({ raw: workizJobs.raw, lastSeenAt: workizJobs.lastSeenAt }).from(workizJobs).where(eq(workizJobs.uuid, uuid)).limit(1)
     const previous = (saved?.raw ?? {}) as WorkizRawJob
     const oldStatusAt = parseWorkizDate(typeof previous.LastStatusUpdate === "string" ? previous.LastStatusUpdate : null, settings.businessTimezone)
     const newStatusAt = parseWorkizDate(typeof raw.LastStatusUpdate === "string" ? raw.LastStatusUpdate : null, settings.businessTimezone)
     const stale = (oldStatusAt && newStatusAt && newStatusAt < oldStatusAt) || (!ctx?.storedOnly && typeof previous._gbFetchedAt === "string" && new Date(previous._gbFetchedAt) > fetchedAt)
     // An omitted array is not an empty array. Partial job summaries never erase full details.
-    const merged = stale ? previous : { ...previous, ...raw, _gbFetchedAt: ctx?.storedOnly ? previous._gbFetchedAt ?? null : fetchedAt.toISOString() }
+    const merged = stale ? previous : { ...previous, ...raw, _gbFetchedAt: ctx?.storedOnly ? previous._gbFetchedAt ?? saved?.lastSeenAt.toISOString() ?? null : fetchedAt.toISOString() }
     if (!ctx?.storedOnly && !stale && (Array.isArray(raw.Payments) || Array.isArray(raw.payments))) {
       const document = extractDocumentPayments({ ...raw, totalPrice: raw.JobTotalPrice, amountDue: raw.JobAmountDue }, fetchedAt.toISOString())
       if (document) await persistPayments(uuid, document.payments.map((p) => ({ ...p, source: "workiz-job" as const })), { tipInclusion: document.tipInclusion, timezone: settings.businessTimezone, database: tx })
@@ -292,12 +292,20 @@ export async function syncDocumentWebhook(args: { parsed: Pick<ParsedWebhook, "u
   const context = await loadSyncContext(settings)
   const invoice: InvoiceWebhookPayments | null = args.parsed.invoice
   const kind = args.parsed.kind === "estimate" ? "estimate" : "invoice"
+  const paymentOptions: PaymentMergeOptions = {
+    tipInclusion: invoice?.tipInclusion,
+    timezone: settings.businessTimezone,
+    documentSnapshot: invoice ? { id: invoice.invoiceId, updatedAt: invoice.snapshotUpdatedAt } : undefined,
+  }
 
   const mapped = await resolveJobUuid(args.parsed.jobInternalId)
+  if (mapped && args.parsed.uuidCandidates.length && !args.parsed.uuidCandidates.includes(mapped)) {
+    throw new Error("Document job UUID conflicts with the learned Workiz job ID mapping; payment event retained for review")
+  }
   const candidates = mapped ? [mapped] : args.parsed.uuidCandidates.slice(0, 2)
   let recorded: { stored: number; skipped: number } | null = null
   // Once the association is known, persist the older deposit even if job/get is down.
-  if (mapped && invoice) recorded = await recordExternalPayments(mapped, invoice.payments, { tipInclusion: invoice.tipInclusion, timezone: settings.businessTimezone })
+  if (mapped && invoice) recorded = await recordExternalPayments(mapped, invoice.payments, paymentOptions)
 
   let lastError: string | null = null
   for (const candidate of candidates) {
@@ -313,7 +321,7 @@ export async function syncDocumentWebhook(args: { parsed: Pick<ParsedWebhook, "u
     let stored = 0
     let skipped = 0
     if (invoice) {
-      ;({ stored, skipped } = recorded ?? await recordExternalPayments(raw.UUID, invoice.payments, { tipInclusion: invoice.tipInclusion, timezone: settings.businessTimezone }))
+      ;({ stored, skipped } = recorded ?? await recordExternalPayments(raw.UUID, invoice.payments, paymentOptions))
       await logSyncEvent("payments", {
         jobUuid: raw.UUID,
         ok: true,
@@ -393,8 +401,11 @@ async function openJobUuids(limit: number): Promise<string[]> {
     .groupBy(payouts.jobUuid)
   const open = Array.from(new Set(fromPayouts.map((r) => r.uuid)))
   if (!open.length) return []
-  const rows = await db.select({ uuid: workizJobs.uuid, updatedAt: workizJobs.updatedAt }).from(workizJobs).where(inArray(workizJobs.uuid, open))
-  const fetchedAt = new Map(rows.map((r) => [r.uuid, r.updatedAt.getTime()]))
+  const rows = await db.select({ uuid: workizJobs.uuid, raw: workizJobs.raw, lastSeenAt: workizJobs.lastSeenAt }).from(workizJobs).where(inArray(workizJobs.uuid, open))
+  const fetchedAt = new Map(rows.map((r) => {
+    const stamp = (r.raw as { _gbFetchedAt?: string } | null)?._gbFetchedAt
+    return [r.uuid, stamp ? new Date(stamp).getTime() : r.lastSeenAt.getTime()]
+  }))
   return open.sort((a, b) => (fetchedAt.get(a) ?? 0) - (fetchedAt.get(b) ?? 0)).slice(0, limit)
 }
 
@@ -517,7 +528,7 @@ async function runReconcile(opts: ReconcileOptions, trigger: string): Promise<Re
   let offset = 0
   let hasMore = true
   let listingFailed: string | null = null
-  while (hasMore && summary.scanned < maxJobs) {
+  while (!summary.quotaHit && hasMore && summary.scanned < maxJobs) {
     let page: Awaited<ReturnType<typeof client.listJobs>>
     try {
       page = await client.listJobs({ startDate, offset, records: 100 })

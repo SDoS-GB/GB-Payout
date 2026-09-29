@@ -1,5 +1,5 @@
 import { eq } from "drizzle-orm"
-import { db } from "@/lib/db"
+import { db, type Database } from "@/lib/db"
 import { appSettings } from "@/lib/db/schema"
 
 export type WorkizSettings = {
@@ -121,15 +121,15 @@ const KEYS = {
   payout: "payout",
 } as const
 
-async function readSetting<T>(key: string, fallback: T): Promise<T> {
-  const rows = await db.select().from(appSettings).where(eq(appSettings.key, key)).limit(1)
+async function readSetting<T>(key: string, fallback: T, database: Database = db): Promise<T> {
+  const rows = await database.select().from(appSettings).where(eq(appSettings.key, key)).limit(1)
   const row = rows[0]
   if (!row) return fallback
   return { ...fallback, ...(row.value as Partial<T>) }
 }
 
-async function writeSetting<T>(key: string, value: T, updatedBy: string | null): Promise<void> {
-  await db
+async function writeSetting<T>(key: string, value: T, updatedBy: string | null, database: Database = db): Promise<void> {
+  await database
     .insert(appSettings)
     .values({ key, value: value as object, updatedBy })
     .onConflictDoUpdate({
@@ -138,19 +138,19 @@ async function writeSetting<T>(key: string, value: T, updatedBy: string | null):
     })
 }
 
-export async function getWorkizSettings(): Promise<WorkizSettings> {
-  return readSetting(KEYS.workiz, DEFAULT_WORKIZ_SETTINGS)
+export async function getWorkizSettings(database: Database = db): Promise<WorkizSettings> {
+  return readSetting(KEYS.workiz, DEFAULT_WORKIZ_SETTINGS, database)
 }
 
-export async function saveWorkizSettings(patch: Partial<WorkizSettings>, updatedBy: string | null) {
-  const current = await getWorkizSettings()
+export async function saveWorkizSettings(patch: Partial<WorkizSettings>, updatedBy: string | null, database: Database = db) {
+  const current = await getWorkizSettings(database)
   const next = { ...current, ...patch }
-  await writeSetting(KEYS.workiz, next, updatedBy)
+  await writeSetting(KEYS.workiz, next, updatedBy, database)
   return next
 }
 
-export async function getNotificationSettings(): Promise<NotificationSettings> {
-  const stored = await readSetting<NotificationSettings & Record<string, unknown>>(KEYS.notifications, DEFAULT_NOTIFICATION_SETTINGS)
+export async function getNotificationSettings(database: Database = db): Promise<NotificationSettings> {
+  const stored = await readSetting<NotificationSettings & Record<string, unknown>>(KEYS.notifications, DEFAULT_NOTIFICATION_SETTINGS, database)
   const r = stored.ownerRecipient as Partial<OwnerRecipient> | null | undefined
   // Retired technician-message settings must not silently activate the owner sender.
   return {
@@ -163,10 +163,10 @@ export async function getNotificationSettings(): Promise<NotificationSettings> {
   }
 }
 
-export async function saveNotificationSettings(patch: Partial<NotificationSettings>, updatedBy: string | null) {
-  const current = await getNotificationSettings()
+export async function saveNotificationSettings(patch: Partial<NotificationSettings>, updatedBy: string | null, database: Database = db) {
+  const current = await getNotificationSettings(database)
   const next = { ...current, ...patch }
-  await writeSetting(KEYS.notifications, next, updatedBy)
+  await writeSetting(KEYS.notifications, next, updatedBy, database)
   return next
 }
 

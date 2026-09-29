@@ -295,8 +295,8 @@ export const jobPayments = pgTable(
     raw: jsonb("raw"),
     /**
      * True when `paidAt` came from the Workiz payload itself. Workiz's invoice/estimate
-     * webhooks carry no per-payment date, so `paidAt` is usually the time the FIRST event
-     * mentioning the payment arrived; a later re-delivery must not move it forward.
+     * webhooks often carry no per-payment date, so `paidAt` stays null unless a date was
+     * supplied. A known date is preserved when later events omit it.
      */
     paidAtFromPayload: boolean("paid_at_from_payload").notNull().default(false),
     sourceUpdatedAt: timestamp("source_updated_at", { withTimezone: true }),

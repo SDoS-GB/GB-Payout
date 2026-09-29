@@ -8,7 +8,7 @@
 export const ADMIN_VIEWS = ["due", "history", "payouts", "review", "waiting", "settings"] as const
 export type AdminView = (typeof ADMIN_VIEWS)[number]
 
-export const SETTINGS_SECTIONS = ["team", "technicians", "workiz", "sync", "activity", "opening"] as const
+export const SETTINGS_SECTIONS = ["team", "technicians", "workiz", "owner", "sync", "activity", "opening"] as const
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
 
 export const ADMIN_VIEW_LABELS: Record<AdminView, string> = {
@@ -24,6 +24,7 @@ export const SETTINGS_SECTION_LABELS: Record<SettingsSection, string> = {
   team: "Team mapping",
   technicians: "Technicians",
   workiz: "Workiz connection",
+  owner: "Owner texts",
   sync: "Sync schedule",
   activity: "Activity",
   opening: "Opening balance",

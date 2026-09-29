@@ -3,7 +3,7 @@ import { mergePayoutNote } from "@/lib/workiz/payout-note"
 import { hasTag } from "@/lib/workiz/tags"
 
 export type OwnerTransport = Pick<WorkizClient, "getJob" | "updateJob">
-export type DeliveryOutcome = { accepted: boolean; ambiguous: boolean; retryable: boolean; error: string | null; evidence: Record<string, unknown> }
+export type DeliveryOutcome = { accepted: boolean; ambiguous: boolean; retryable: boolean; blocked?: boolean; error: string | null; evidence: Record<string, unknown> }
 
 export function verifyOwnerTrigger(job: WorkizRawJob | null, message: string, tag: string): boolean {
   const description = typeof job?.JobNotes === "string" ? job.JobNotes : ""
@@ -34,7 +34,7 @@ export async function deliverOwnerTrigger(input: { client: OwnerTransport; uuid:
     return { accepted: false, ambiguous: true, retryable: false, error: "Workiz update was acknowledged but the tag/summary could not be verified. Delivery is unconfirmed; no automatic resend.", evidence: { response, tagVerified: false } }
   } catch (error) {
     const detail = error instanceof Error ? error.message : "Workiz request failed"
-    const rejected = error instanceof WorkizApiError && error.status >= 400 && error.status < 500
+    const rejected = error instanceof WorkizApiError && ((error.status >= 400 && error.status < 500) || (error.body && typeof error.body === "object" && (error.body as { flag?: boolean }).flag === false))
     const quota = error instanceof WorkizApiError && error.status === 429
     if (triggerStarted && !rejected) {
       try {

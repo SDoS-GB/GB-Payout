@@ -7,6 +7,7 @@ import { Card, CardContent, CardDescription, CardHeader, CardTitle } from "@/com
 import { SETTINGS_SECTIONS, SETTINGS_SECTION_LABELS, adminHref, type AdminLocation, type SettingsSection } from "@/lib/admin/navigation"
 import { ActivityTab } from "./activity-tab"
 import { OpeningBalanceCard } from "./opening-balance-card"
+import { OwnerSettingsTab } from "./owner-settings-tab"
 import { ProfilesTab } from "./profiles-tab"
 import { NavLink } from "./review-tab"
 import { SyncStatusStrip } from "./sync-status-strip"
@@ -73,6 +74,7 @@ export function SettingsTab({ data, section, teamFilter, focusToken, webhookUrl,
       )}
       {section === "technicians" && <ProfilesTab profiles={data.profiles} />}
       {section === "workiz" && <WorkizSettingsTab workiz={data.workiz} catalog={data.catalog} webhookUrl={webhookUrl} cronConfigured={cronConfigured} />}
+      {section === "owner" && <OwnerSettingsTab />}
       {section === "sync" && (
         <div className="flex flex-col gap-4">
           <SyncStatusStrip initial={data.sync} timezone={timezone} onOpenWorkizTab={() => onNavigate({ view: "settings", section: "workiz" })} />

@@ -22,6 +22,7 @@ import {
 } from "@/lib/payout/presentation"
 import { paymentSplitKnown, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { PaymentConfirmationForm } from "./payment-confirmation-form"
+import { OwnerJobCard } from "./owner-job-card"
 import { InlineMessage, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
 
 type ReviewAction = Parameters<typeof reviewPayout>[1]
@@ -576,7 +577,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
                 : null,
               ["Tip", job ? (tipsTotal > 0 ? `${money(tipsTotal)}${cardTip > 0 && otherTip > 0 ? ` · card ${money(cardTip)} / other ${money(otherTip)}` : cardTip > 0 ? " · by card, 3.5% fee applies" : " · not by card, no fee"}` : money(0)) : "Unavailable"],
               unexplainedSurplus > 0.005
-                ? ["Not itemized by Workiz", `${money(unexplainedSurplus)} · above the service total${tipsTotal > 0 ? " and recorded tips" : ""}; Workiz's API omits its Tip field, so this is most likely a tip — confirm it in the payment form`]
+                ? ["Not itemized by Workiz", `${money(unexplainedSurplus)} · above the service total${tipsTotal > 0 ? " and recorded tips" : ""}; the job response does not identify this amount. Verify it from a payment event or the Workiz Payments tab before using manual recovery`]
                 : null,
               ["Tax", tax != null ? money(tax) : "None reported by Workiz"],
               [workizInvoiceTotal !== null ? "Invoice total (Workiz)" : "Invoice total (service + tax)", job ? money(grandTotal) : "Unavailable"],
@@ -592,6 +593,8 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
             ]}
           />
         </Section>
+
+        <OwnerJobCard jobUuid={p.jobUuid} timezone={timezone} />
 
         <Section title="Review">
           {p.openingReview && p.status === "hold" && (

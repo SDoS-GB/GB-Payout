@@ -1,4 +1,4 @@
-import { and, eq, sql } from "drizzle-orm"
+import { and, eq } from "drizzle-orm"
 import { db, type Database } from "@/lib/db"
 import { jobPayments, syncEvents } from "@/lib/db/schema"
 import { lockPayoutJob } from "@/lib/payout/lock"
@@ -19,7 +19,9 @@ export async function paymentEvidence(uuid: string, settings: WorkizSettings, da
   return { payments: externalRowsToPayments(selected.filter((p) => p.paymentState === "active"), settings.cardMethodKeywords), issues }
 }
 
-export async function persistPayments(uuid: string, inputs: ExternalPaymentInput[], options: { tipInclusion?: TipInclusion; timezone?: string; database?: Database } = {}) {
+export type PaymentMergeOptions = { tipInclusion?: TipInclusion; timezone?: string; database?: Database; documentSnapshot?: { id: string | null; updatedAt: string | null } }
+
+export async function persistPayments(uuid: string, inputs: ExternalPaymentInput[], options: PaymentMergeOptions = {}) {
   const apply = async (tx: Database) => {
     await lockPayoutJob(tx, uuid)
     const result = { stored: 0, skipped: 0, stale: 0, conflicts: 0 }
@@ -54,6 +56,24 @@ export async function persistPayments(uuid: string, inputs: ExternalPaymentInput
       if (previous) await tx.update(jobPayments).set(values).where(eq(jobPayments.id, previous.id))
       else await tx.insert(jobPayments).values(values)
       result.stored++
+    }
+    const snapshot = options.documentSnapshot
+    if (snapshot?.id) {
+      const snapshotAt = parseWorkizDate(snapshot.updatedAt, options.timezone ?? "America/New_York")
+      const known = await tx.select().from(jobPayments).where(and(eq(jobPayments.jobUuid, uuid), eq(jobPayments.invoiceId, snapshot.id)))
+      for (const previous of known) {
+        if (inputs.some((p) => p.externalId === previous.externalId) || previous.paymentState !== "active") continue
+        if (snapshotAt && previous.sourceUpdatedAt && snapshotAt < previous.sourceUpdatedAt) continue
+        // An explicit newer payment list that drops a known row may be a deletion/refund or
+        // a partial list. Retain the money and identity, but never silently count it as settled.
+        await tx.update(jobPayments).set({
+          paymentState: "review",
+          reviewReason: `Payment records conflict: ${previous.externalId} is absent from a newer ${snapshot.id} payment list; verify removal/refund in Workiz`,
+          sourceUpdatedAt: snapshotAt ?? previous.sourceUpdatedAt,
+          updatedAt: new Date(),
+        }).where(eq(jobPayments.id, previous.id))
+        result.conflicts++
+      }
     }
     await tx.insert(syncEvents).values({ kind: "payments:merge", jobUuid: uuid, ok: result.conflicts === 0, summary: `Payment records stored ${result.stored}, stale ${result.stale}, conflicts ${result.conflicts}`, details: result })
     return result
