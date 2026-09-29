@@ -79,6 +79,8 @@ export function paymentSourceLabel(payment: Pick<NormalizedPayment, "source" | "
   switch (payment.source) {
     case "invoice-webhook":
       return "From Workiz invoice webhook"
+    case "estimate-webhook":
+      return "From Workiz estimate webhook"
     case "manual":
       return `Confirmed by ${payment.recordedBy ?? "admin"} from the Workiz Payments tab`
     default:
@@ -168,9 +170,9 @@ export function explainPayoutStatus(input: {
     return {
       headline: "On hold: payment details unavailable from Workiz",
       detail:
-        "Workiz's job API reports the balance but not how the customer paid, and it has no endpoint that lists payments, so the sync cannot tell card from cash/check/Zelle. The amount shown assumes no card fee.",
+        "Workiz's job API reports the balance but not how the customer paid. No complete payment history has reached this app. The provisional amount is not an approved payout or a verified non-card payment.",
       action:
-        "Open the job's Payments tab in Workiz and confirm the payments below (method, amount, date); card portions get the 3.5% deduction automatically and the payout is re-gated. Creating a Workiz invoice also works: its webhook reports the payment type.",
+        "Verify invoice/estimate payment webhooks in Workiz, including offline payments. Newly enabled hooks do not replay old deposits. For this job, obtain a Workiz payment export or use the labelled recovery entry from its Payments tab. Creating an invoice alone does not recover the history.",
     }
   }
   if (/invoice total .* less than the service total/i.test(reason)) {

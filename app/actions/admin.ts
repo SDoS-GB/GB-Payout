@@ -16,7 +16,7 @@ import { dismissNoticeKeys, listDismissedNoticeKeys } from "@/lib/admin/notice-d
 import { MAX_NOTICE_KEYS_PER_CLEAR, NOTICE_ACCOUNT, buildAdminNotices, type AdminNotice, type HeldPayoutInput, type UnmappedInput } from "@/lib/admin/notices"
 import { TECH_PAYMENT_METHODS, isoDateInZone, round2, validateBatchForm, type SelectionItem, type StaleItem } from "@/lib/payout/batch-rules"
 import { getBatch, listBatches, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
-import { isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
+import { gateReason, isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
 import { confirmPreviouslyPaid, initializeOpeningBalance, previewOpeningBalance } from "@/lib/payout/opening"
 import { listProfiles } from "@/lib/payout/profiles"
 import {
@@ -497,7 +497,11 @@ export async function reviewPayout(id: number, action: ReviewAction, note?: stri
           .from(workizJobs)
           .where(eq(workizJobs.uuid, payout.jobUuid))
           .limit(1)
-        const blocker = releaseBlocker(job ? { status: job.status, fullyPaid: job.fullyPaid, jobTotal: Number(job.jobTotal) } : null, await getWorkizSettings())
+        const settings = await getWorkizSettings()
+        const evaluated = await reevaluateStoredJob(payout.jobUuid, "release-validation")
+        const blocker = releaseBlocker(job ? { status: job.status, fullyPaid: job.fullyPaid, jobTotal: Number(job.jobTotal) } : null, settings)
+          ?? (evaluated ? gateReason(evaluated.normalized, settings) : "No calculation could be verified")
+          ?? (evaluated?.engine.unmappedTeamIds.length ? "Resolve every technician mapping first" : null)
         if (blocker) throw new Error(`Cannot release: ${blocker}`)
         set.status = "ready"
         set.holdReason = null
@@ -506,7 +510,7 @@ export async function reviewPayout(id: number, action: ReviewAction, note?: stri
       case "hold":
         if (payout.status === "paid") throw new Error("A paid payout cannot be put on hold; reverse its payment batch instead")
         set.status = "hold"
-        set.holdReason = note?.trim() || "Held by admin"
+        set.holdReason = `Held by admin${note?.trim() ? `: ${note.trim()}` : ""}`
         break
       case "void":
         if (payout.status === "paid") throw new Error("A paid payout cannot be voided; reverse its payment batch instead")

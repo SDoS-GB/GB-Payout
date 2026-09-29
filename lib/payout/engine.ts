@@ -1,6 +1,6 @@
 import { createHash } from "node:crypto"
 import { and, eq, inArray, notInArray } from "drizzle-orm"
-import { db } from "@/lib/db"
+import { db as appDb, type Database } from "@/lib/db"
 import {
   payoutSourceChanges,
   payouts,
@@ -43,6 +43,7 @@ export type EngineResult = {
 }
 
 export type EngineOptions = {
+  database?: Database
   /**
    * The owner's "everything paid through" declaration. A NEW payout for a job completed and
    * customer-paid at or before this instant is not new debt: it is held for the owner to confirm
@@ -182,7 +183,7 @@ export function releaseBlocker(
   return null
 }
 
-async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook") {
+async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook", db: Database) {
   if (job.teamIds.length === 0) return { profiles: [] as TechnicianProfile[], unmapped: [] as string[], mappingByProfile: new Map<number, string>() }
 
   // Ensure every team id has a mapping row so admins can see and map it.
@@ -207,13 +208,16 @@ async function resolveTeam(job: NormalizedJob, source: "rest" | "webhook") {
     ? await db.select().from(technicianProfiles).where(and(inArray(technicianProfiles.id, profileIds), eq(technicianProfiles.active, true)))
     : []
 
+  for (const mapping of mapped) {
+    if (!profiles.some((p) => p.id === mapping.profileId)) unmapped.push(mapping.workizTeamId)
+  }
   const mappingByProfile = new Map<number, string>()
   for (const m of mapped) if (m.profileId != null) mappingByProfile.set(m.profileId, m.workizTeamId)
   return { profiles, unmapped, mappingByProfile }
 }
 
 /** Every active technician: the source for marker / Work Type owners and for companions who are never assigned in Workiz. */
-async function loadActiveRoster(): Promise<TechnicianProfile[]> {
+async function loadActiveRoster(db: Database): Promise<TechnicianProfile[]> {
   return db.select().from(technicianProfiles).where(eq(technicianProfiles.active, true))
 }
 
@@ -250,6 +254,7 @@ export async function upsertPayoutsForJob(
   source: "rest" | "webhook" = "rest",
   options: EngineOptions = {},
 ): Promise<EngineResult> {
+  const db = options.database ?? appDb
   const result: EngineResult = {
     jobUuid: job.uuid,
     created: 0,
@@ -264,11 +269,11 @@ export async function upsertPayoutsForJob(
   }
   const preCutoff = completedBeforeCutoff(job, settings, options.openingCutoff)
 
-  const { profiles: assigned, unmapped, mappingByProfile } = await resolveTeam(job, source)
+  const { profiles: assigned, unmapped, mappingByProfile } = await resolveTeam(job, source, db)
   result.unmappedTeamIds = unmapped
   if (unmapped.length) result.notes.push(`Unmapped Workiz team ids: ${unmapped.join(", ")}`)
 
-  const roster = await loadActiveRoster()
+  const roster = await loadActiveRoster(db)
   const existing = await db.select().from(payouts).where(eq(payouts.jobUuid, job.uuid))
   const existingByProfile = new Map(existing.map((p) => [p.profileId, p]))
   const settledProfileIds = new Set(existing.filter((p) => p.status === "paid" || p.status === "void").map((p) => p.profileId))
@@ -289,6 +294,8 @@ export async function upsertPayoutsForJob(
 
   if (assigned.length === 0 && addedOwners.length === 0) {
     result.notes.push("No mapped technicians on this job")
+    await db.update(payouts).set({ status: "hold", holdReason: "No active mapped technicians remain on this Workiz job", inputHash: null, updatedAt: new Date() })
+      .where(and(eq(payouts.jobUuid, job.uuid), notInArray(payouts.status, ["paid", "void"])))
     return result
   }
 
@@ -297,6 +304,8 @@ export async function upsertPayoutsForJob(
     settledPrimaryIds: settledProfileIds,
     existingPayoutProfileIds: new Set(existing.map((p) => p.profileId)),
   })
+  const removed = existing.filter((p) => !profiles.some((profile) => profile.id === p.profileId) && p.status !== "paid" && p.status !== "void")
+  if (removed.length) await db.update(payouts).set({ status: "hold", holdReason: "Technician is no longer assigned to this job; review the crew before sending", inputHash: null, updatedAt: new Date() }).where(inArray(payouts.id, removed.map((p) => p.id)))
   const companionPrimary = new Map(companions.map((c) => [c.companion.id, { id: c.primary.id, name: c.primary.name }]))
   for (const c of companions) result.notes.push(`${describeCompanion(c)}; added to this job although Workiz does not list them`)
 
@@ -387,6 +396,7 @@ export async function upsertPayoutsForJob(
     const breakdown = computeForProfile(segment, profile, computeOpts)
     const cardFeeAdjustment = cardFeeWithheld(breakdown, segment, profile, tipShare)
     let holdReason = baseGate ?? (unmapped.length ? `Job has unmapped team members (${unmapped.join(", ")})` : null)
+    if (!holdReason && prior?.status === "hold" && prior.holdReason?.startsWith("Held by admin")) holdReason = prior.holdReason
     if (nothingOwed) holdReason = `${ownership.explanation} Nothing is owed on this row; void it if that is right.`
     // Work finished and paid before the owner's declaration is not new debt. A row first created
     // now (late import, newly mapped technician) waits for the owner to confirm it was settled;

@@ -1,6 +1,10 @@
 {
   "crons": [
     {
+      "path": "/api/cron/automation",
+      "schedule": "10,30,50 * * * *"
+    },
+    {
       "path": "/api/cron/reconcile",
       "schedule": "0 18,19 * * *"
     },

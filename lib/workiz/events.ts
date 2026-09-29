@@ -1,4 +1,5 @@
-import { and, asc, desc, eq, inArray, lt } from "drizzle-orm"
+import { randomUUID } from "node:crypto"
+import { and, asc, desc, eq, inArray, lt, lte, or, isNull, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { webhookEvents, workizJobIds, type WebhookEventRow } from "@/lib/db/schema"
 import type { ParsedWebhook } from "./webhook"
@@ -14,6 +15,12 @@ import type { ParsedWebhook } from "./webhook"
  */
 
 export type StoredEvent = { row: WebhookEventRow; duplicate: boolean }
+
+function redactWebhookCredentials(value: unknown): unknown {
+  if (Array.isArray(value)) return value.map(redactWebhookCredentials)
+  if (!value || typeof value !== "object") return value ?? null
+  return Object.fromEntries(Object.entries(value).filter(([key]) => !/^(authorization|auth[_-]?secret|api[_-]?(token|key|secret)|password|webhookSecret|cardNumber|cvv)$/i.test(key)).map(([key, item]) => [key, redactWebhookCredentials(item)]))
+}
 
 const isUniqueViolation = (err: unknown) => {
   const code = (err as { code?: string; cause?: { code?: string } })?.code ?? (err as { cause?: { code?: string } })?.cause?.code
@@ -31,7 +38,7 @@ export async function storeWebhookEvent(parsed: ParsedWebhook, payload: unknown,
     jobInternalId: parsed.jobInternalId,
     serialId: parsed.serialId,
     documentId: parsed.kind === "invoice" || parsed.kind === "estimate" ? parsed.documentId : null,
-    payload: (payload ?? null) as object | null,
+    payload: redactWebhookCredentials(payload) as object | null,
     status: "received",
   }
   try {
@@ -57,10 +64,9 @@ export async function markWebhookEvent(id: number, status: "processed" | "unreso
 }
 
 export async function bumpWebhookEventAttempt(id: number) {
-  const [row] = await db.select({ attempts: webhookEvents.attempts }).from(webhookEvents).where(eq(webhookEvents.id, id)).limit(1)
   await db
     .update(webhookEvents)
-    .set({ attempts: (row?.attempts ?? 0) + 1 })
+    .set({ attempts: sql`${webhookEvents.attempts} + 1` })
     .where(eq(webhookEvents.id, id))
 }
 
@@ -68,10 +74,13 @@ export async function bumpWebhookEventAttempt(id: number) {
 export async function rememberJobIds(input: { internalId: string | null | undefined; uuid: string | null | undefined; serialId?: string | number | null }) {
   if (!input.internalId || !input.uuid) return
   const serialId = input.serialId === null || input.serialId === undefined ? null : String(input.serialId)
-  await db
+  const rows = await db
     .insert(workizJobIds)
     .values({ internalId: input.internalId, uuid: input.uuid, serialId })
-    .onConflictDoUpdate({ target: workizJobIds.internalId, set: { uuid: input.uuid, serialId: serialId ?? undefined, updatedAt: new Date() } })
+    .onConflictDoUpdate({ target: workizJobIds.internalId, set: { serialId: serialId ?? undefined, updatedAt: new Date() }, setWhere: eq(workizJobIds.uuid, input.uuid) })
+    .returning({ uuid: workizJobIds.uuid })
+  if (!rows.length) throw new Error("Conflicting Workiz internal job ID mapping; event retained for review")
+  await db.update(webhookEvents).set({ nextAttemptAt: new Date() }).where(and(eq(webhookEvents.jobInternalId, input.internalId), eq(webhookEvents.status, "unresolved")))
 }
 
 export async function resolveJobUuid(internalId: string | null | undefined): Promise<string | null> {
@@ -91,6 +100,38 @@ export async function pendingUnresolvedEvents(opts: { internalId?: string; limit
     .where(and(...conds))
     .orderBy(asc(webhookEvents.receivedAt))
     .limit(opts.limit ?? 50)
+}
+
+export const WEBHOOK_MAX_ATTEMPTS = 12
+
+export async function pendingWebhookEvents(limit = 6, internalId?: string) {
+  return db.select().from(webhookEvents).where(and(
+    inArray(webhookEvents.status, ["received", "processing", "failed", "unresolved"]),
+    lt(webhookEvents.attempts, WEBHOOK_MAX_ATTEMPTS),
+    or(isNull(webhookEvents.lockedUntil), lte(webhookEvents.lockedUntil, new Date())),
+    or(lte(webhookEvents.nextAttemptAt, new Date()), eq(webhookEvents.status, "processing")),
+    internalId ? eq(webhookEvents.jobInternalId, internalId) : undefined,
+  )).orderBy(asc(webhookEvents.nextAttemptAt), asc(webhookEvents.id)).limit(limit)
+}
+
+export async function claimWebhookEvent(id: number) {
+  const token = randomUUID()
+  const [row] = await db.update(webhookEvents).set({ status: "processing", lockToken: token, lockedUntil: new Date(Date.now() + 120_000), attempts: sql`${webhookEvents.attempts} + 1` })
+    .where(and(eq(webhookEvents.id, id), inArray(webhookEvents.status, ["received", "processing", "failed", "unresolved"]), lt(webhookEvents.attempts, WEBHOOK_MAX_ATTEMPTS), or(isNull(webhookEvents.lockedUntil), lte(webhookEvents.lockedUntil, new Date())))).returning()
+  return row ?? null
+}
+
+export async function finishWebhookAttempt(event: WebhookEventRow, status: "processed" | "unresolved" | "failed" | "ignored", options: { error?: string; jobUuid?: string; quota?: boolean } = {}) {
+  const waitingForMap = status === "unresolved"
+  const retry = status === "failed" && event.attempts < WEBHOOK_MAX_ATTEMPTS
+  const delay = options.quota ? 20 * 60_000 : Math.min(60 * 60_000, 60_000 * 2 ** Math.min(event.attempts, 6))
+  await db.update(webhookEvents).set({
+    status, error: options.error ?? null, jobUuid: options.jobUuid ?? event.jobUuid,
+    processedAt: status === "processed" || status === "ignored" ? new Date() : null,
+    nextAttemptAt: waitingForMap ? new Date(Date.now() + 6 * 60 * 60_000) : retry ? new Date(Date.now() + delay) : null,
+    attempts: waitingForMap || options.quota ? Math.max(0, event.attempts - 1) : event.attempts,
+    lockedUntil: null, lockToken: null,
+  }).where(and(eq(webhookEvents.id, event.id), eq(webhookEvents.lockToken, event.lockToken!)))
 }
 
 export async function recentWebhookEvents(limit = 30): Promise<WebhookEventRow[]> {

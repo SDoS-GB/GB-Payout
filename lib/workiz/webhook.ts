@@ -61,7 +61,7 @@ export function classifyTrigger(type: string | null): WebhookEventKind {
   if (t.startsWith("job")) return "job"
   if (t.startsWith("invoice") || t.startsWith("payment")) return "invoice"
   if (t.startsWith("estimate")) return "estimate"
-  if (t.startsWith("lead")) return "ignored"
+  if (t.startsWith("lead") || t.startsWith("client")) return "ignored"
   return "unknown"
 }
 
@@ -77,10 +77,10 @@ export function parseWebhookBody(body: unknown, query?: URLSearchParams): Parsed
   const kind = classifyTrigger(triggerType)
 
   const candidates = [
-    data?.uuid,
-    data?.UUID,
     data?.jobUuid,
     data?.job_uuid,
+    kind === "estimate" ? null : data?.uuid,
+    kind === "estimate" ? null : data?.UUID,
     root.UUID,
     root.uuid,
     root.Uuid,
@@ -121,7 +121,9 @@ export function parseWebhookBody(body: unknown, query?: URLSearchParams): Parsed
 export function eventKeyFor(parsed: Pick<ParsedWebhook, "triggerType" | "triggerTimestamp" | "documentId" | "uuidCandidates">, body: unknown): string {
   const recordId = parsed.documentId ?? parsed.uuidCandidates[0] ?? null
   if (parsed.triggerType && parsed.triggerTimestamp && recordId) {
-    return sha256(`${parsed.triggerType}|${parsed.triggerTimestamp}|${recordId}`)
+    const root = record(body)
+    const content = root?.data ?? root?.job ?? body
+    return sha256(`${parsed.triggerType}|${parsed.triggerTimestamp}|${recordId}|${stableStringify(content)}`)
   }
   return sha256(`body|${stableStringify(body)}`)
 }

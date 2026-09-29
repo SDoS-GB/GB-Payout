@@ -49,6 +49,11 @@ export type OwnerRecipient = {
 
 export type NotificationSettings = {
   ownerRecipient: OwnerRecipient | null
+  sendEnabled: boolean
+  automationConfirmedAt: string | null
+  automationRuleName: string | null
+  verifiedDeliveryAt: string | null
+  automaticSince: string | null
 }
 
 export type AdminSettings = {
@@ -95,6 +100,11 @@ export const DEFAULT_WORKIZ_SETTINGS: WorkizSettings = {
 
 export const DEFAULT_NOTIFICATION_SETTINGS: NotificationSettings = {
   ownerRecipient: null,
+  sendEnabled: false,
+  automationConfirmedAt: null,
+  automationRuleName: null,
+  verifiedDeliveryAt: null,
+  automaticSince: null,
 }
 
 /** "•••• 1234" from any phone formatting; null when there is nothing to mask. */
@@ -142,8 +152,13 @@ export async function saveWorkizSettings(patch: Partial<WorkizSettings>, updated
 export async function getNotificationSettings(): Promise<NotificationSettings> {
   const stored = await readSetting<NotificationSettings & Record<string, unknown>>(KEYS.notifications, DEFAULT_NOTIFICATION_SETTINGS)
   const r = stored.ownerRecipient as Partial<OwnerRecipient> | null | undefined
-  // Rows saved by the retired technician-message feature carry template/channel keys; only the recipient matters now.
+  // Retired technician-message settings must not silently activate the owner sender.
   return {
+    sendEnabled: stored.sendEnabled === true && Boolean(stored.verifiedDeliveryAt),
+    automationConfirmedAt: typeof stored.automationConfirmedAt === "string" ? stored.automationConfirmedAt : null,
+    automationRuleName: typeof stored.automationRuleName === "string" ? stored.automationRuleName : null,
+    verifiedDeliveryAt: typeof stored.verifiedDeliveryAt === "string" ? stored.verifiedDeliveryAt : null,
+    automaticSince: typeof stored.automaticSince === "string" ? stored.automaticSince : null,
     ownerRecipient: r && typeof r.workizTeamId === "string" && r.workizTeamId && typeof r.name === "string" ? { workizTeamId: r.workizTeamId, name: r.name, phoneMasked: typeof r.phoneMasked === "string" ? r.phoneMasked : null } : null,
   }
 }

@@ -20,7 +20,7 @@ import {
   paymentSourceLabel,
   workizJobUrl,
 } from "@/lib/payout/presentation"
-import type { ManualPaymentEntry } from "@/lib/workiz/payments"
+import { paymentSplitKnown, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { PaymentConfirmationForm } from "./payment-confirmation-form"
 import { InlineMessage, StatusBadge, money, zonedDate, zonedDateTime } from "./shared"
 
@@ -196,6 +196,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
   // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
   const workizInvoiceTotal = job?.invoiceTotal != null && Number.isFinite(job.invoiceTotal) && job.invoiceTotal > 0 ? job.invoiceTotal : null
   const grandTotal = workizInvoiceTotal ?? jobTotal + (tax ?? 0)
+  const splitKnown = paymentSplitKnown(payments, workizInvoiceTotal, warnings)
   const totalPaid = num(job?.totalPaid)
   const cardTip = num(job?.cardTipAmount)
   const otherTip = num(job?.nonCardTipAmount)
@@ -468,7 +469,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
               separateColorSeal && colorAmount > 0 ? ["Commission on color sealing", money(p.colorPayout)] : null,
               [
                 "Effect of the card fee on this commission",
-                snap.cardFeeAdjustment !== undefined
+                !splitKnown ? "Unavailable — payment methods are not fully verified" : snap.cardFeeAdjustment !== undefined
                   ? snap.cardFeeAdjustment > 0
                     ? `−${money(snap.cardFeeAdjustment)} · 3.5% on the ${pct(cardShare)} of services paid by card`
                     : "$0.00 · no card payments"
@@ -501,7 +502,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
             <span className="text-lg font-semibold tabular-nums">{notCalculated ? "Not calculated" : money(p.totalPayout)}</span>
           </div>
           <p className="text-xs text-muted-foreground">
-            Snapshot {snap.calcVersion ?? "legacy"} · mode {p.calcMode ?? "—"} · {p.splitCount} technician{p.splitCount === 1 ? "" : "s"} on job · card-paid service {money(p.cardServiceAmount)} · other {money(p.nonCardServiceAmount)} · tips card {money(p.cardTipAmount)} / other {money(p.nonCardTipAmount)}
+            Snapshot {snap.calcVersion ?? "legacy"} · mode {p.calcMode ?? "—"} · {p.splitCount} technician{p.splitCount === 1 ? "" : "s"} on job · {splitKnown ? `card-paid service ${money(p.cardServiceAmount)} · other ${money(p.nonCardServiceAmount)} · tips card ${money(p.cardTipAmount)} / other ${money(p.nonCardTipAmount)}` : "Payment split unavailable; numeric buckets in this provisional calculation are not verified payment facts."}
           </p>
         </Section>
 
@@ -563,14 +564,14 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
               ["Invoice subtotal", job?.subTotal != null ? money(job.subTotal) : "Not provided by Workiz"],
               ["Discount", job ? `−${money(job.discountAmount)}` : "Unavailable"],
               ["Service subtotal after discounts (S)", job ? money(job.jobTotal) : "Unavailable"],
-              fee && fee.serviceSubtotal !== undefined
+              !splitKnown ? ["Paid by card (C) / other", "Unknown / unavailable"] : fee && fee.serviceSubtotal !== undefined
                 ? ["Paid by card (C) / other", `${money(fee.cardPaid ?? 0)} / ${money(fee.otherPaid ?? 0)}`]
                 : job
                   ? ["Paid by card (C) / other", `${money(job.cardServiceAmount)} / ${money(job.nonCardServiceAmount)}`]
                   : null,
-              fee && fee.cardShare !== undefined ? ["Card-paid share (C ÷ S)", fee.cardShare > 0 ? pctExact(fee.cardShare) : "0% · no card payments on file"] : null,
-              fee && fee.fee !== undefined && fee.fee > 0 ? ["Card processing fee (3.5% of C)", `${money(fee.fee)} · exact ${fee.fee.toFixed(4)}`] : null,
-              fee && fee.serviceFactor !== undefined && fee.serviceFactor < 1
+              !splitKnown ? ["Card-paid share (C ÷ S)", "Unavailable"] : fee && fee.cardShare !== undefined ? ["Card-paid share (C ÷ S)", pctExact(fee.cardShare)] : null,
+              !splitKnown ? ["Card processing fee", "Unavailable until the full payment split is known"] : fee && fee.fee !== undefined ? ["Card processing fee (3.5% of C)", `${money(fee.fee)} · exact ${fee.fee.toFixed(4)}`] : null,
+              splitKnown && fee && fee.serviceFactor !== undefined && fee.serviceFactor < 1
                 ? ["Invoice-wide reduction on services", `${pctExact(1 - fee.serviceFactor)} → services × ${fee.serviceFactor.toFixed(10)} = ${money(fee.adjustedServiceSubtotal ?? 0)} (exact ${(fee.adjustedServiceSubtotal ?? 0).toFixed(4)})`]
                 : null,
               ["Tip", job ? (tipsTotal > 0 ? `${money(tipsTotal)}${cardTip > 0 && otherTip > 0 ? ` · card ${money(cardTip)} / other ${money(otherTip)}` : cardTip > 0 ? " · by card, 3.5% fee applies" : " · not by card, no fee"}` : money(0)) : "Unavailable"],

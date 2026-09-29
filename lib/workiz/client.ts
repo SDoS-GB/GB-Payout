@@ -110,6 +110,7 @@ export class WorkizClient {
       headers,
       body: body ? JSON.stringify(body) : undefined,
       cache: "no-store",
+      signal: AbortSignal.timeout(12_000),
     })
     const text = await res.text()
     let json: unknown = null

@@ -299,11 +299,17 @@ export const jobPayments = pgTable(
      * mentioning the payment arrived; a later re-delivery must not move it forward.
      */
     paidAtFromPayload: boolean("paid_at_from_payload").notNull().default(false),
+    sourceUpdatedAt: timestamp("source_updated_at", { withTimezone: true }),
+    paymentState: text("payment_state").notNull().default("active"),
+    reviewReason: text("review_reason"),
     createdAt: timestamp("created_at", { withTimezone: true }).notNull().defaultNow(),
     updatedAt: timestamp("updated_at", { withTimezone: true }).notNull().defaultNow(),
   },
   // The same Workiz payment delivered twice (webhook retry, two automations) is one row.
-  (t) => [uniqueIndex("job_payments_external_unique").on(t.jobUuid, t.externalId).where(sql`${t.externalId} is not null`)],
+  (t) => [
+    uniqueIndex("job_payments_external_unique").on(t.jobUuid, t.externalId).where(sql`${t.externalId} is not null`),
+    uniqueIndex("job_payments_provider_id_unique").on(t.externalId).where(sql`${t.externalId} is not null`),
+  ],
 )
 
 /**
@@ -334,6 +340,9 @@ export const webhookEvents = pgTable(
     error: text("error"),
     receivedAt: timestamp("received_at", { withTimezone: true }).notNull().defaultNow(),
     processedAt: timestamp("processed_at", { withTimezone: true }),
+    nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }).defaultNow(),
+    lockedUntil: timestamp("locked_until", { withTimezone: true }),
+    lockToken: text("lock_token"),
   },
   (t) => [uniqueIndex("webhook_events_key_unique").on(t.eventKey)],
 )
@@ -375,6 +384,13 @@ export const ownerNotifications = pgTable(
     channel: text("channel").notNull().default("workiz_tag_sms"),
     destinationLabel: text("destination_label"),
     destinationMasked: text("destination_masked"),
+    destinationId: text("destination_id"),
+    requestedAt: timestamp("requested_at", { withTimezone: true }),
+    requestedBy: text("requested_by"),
+    leaseToken: text("lease_token"),
+    leaseUntil: timestamp("lease_until", { withTimezone: true }),
+    requiresReview: boolean("requires_review").notNull().default(false),
+    providerMessageId: text("provider_message_id"),
     attempts: integer("attempts").notNull().default(0),
     nextAttemptAt: timestamp("next_attempt_at", { withTimezone: true }),
     lastAttemptAt: timestamp("last_attempt_at", { withTimezone: true }),
@@ -388,6 +404,21 @@ export const ownerNotifications = pgTable(
   },
   (t) => [uniqueIndex("owner_notifications_job_unique").on(t.jobUuid)],
 )
+
+export const ownerNotificationAttempts = pgTable("owner_notification_attempts", {
+  id: text("id").primaryKey(),
+  notificationId: integer("notification_id").notNull(),
+  jobUuid: text("job_uuid").notNull(),
+  snapshotHash: text("snapshot_hash").notNull(),
+  destinationId: text("destination_id").notNull(),
+  destinationMasked: text("destination_masked").notNull(),
+  status: text("status").notNull().default("preparing"),
+  startedAt: timestamp("started_at", { withTimezone: true }).notNull().defaultNow(),
+  requestStartedAt: timestamp("request_started_at", { withTimezone: true }),
+  finishedAt: timestamp("finished_at", { withTimezone: true }),
+  providerResponse: jsonb("provider_response"),
+  error: text("error"),
+})
 
 export const appSettings = pgTable("app_settings", {
   key: text("key").primaryKey(),

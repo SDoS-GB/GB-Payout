@@ -209,7 +209,7 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings, source
     if (tipAmount > 0 && tipAmount < amount) {
       // Workiz can attach a tip to a payment; split it so service and tip are tracked separately.
       out.push({ ...base, amount: round2(amount - tipAmount), isTip: false })
-      out.push({ ...base, amount: round2(tipAmount), isTip: true })
+      out.push({ ...base, id: id ? `${id}:tip` : null, amount: round2(tipAmount), isTip: true })
       continue
     }
     out.push({ ...base, amount, isTip: isTipFlag })
@@ -220,6 +220,7 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings, source
 export type NormalizeOptions = {
   /** Payment records from outside the job payload (invoice webhooks, admin confirmations). */
   externalPayments?: NormalizedPayment[]
+  paymentIssues?: string[]
 }
 
 /**
@@ -229,7 +230,7 @@ export type NormalizeOptions = {
  */
 export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalog: ColorSealCatalog, opts: NormalizeOptions = {}): NormalizedJob {
   const r = raw as Record<string, unknown>
-  const warnings: string[] = []
+  const warnings: string[] = [...(opts.paymentIssues ?? [])]
 
   const uuid = str(pick(r, "UUID", "uuid", "Uuid"))
   if (!uuid) throw new Error("Workiz job is missing UUID")
@@ -380,7 +381,7 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
 
       // A payment whose method text we cannot classify is kept on the non-card side only
       // provisionally; the warning holds the payout until an admin confirms card or not.
-      const unknown = servicePayments.filter((p) => p.methodKnown === false)
+      const unknown = payments.filter((p) => p.methodKnown === false)
       if (unknown.length) {
         const methods = Array.from(new Set(unknown.map((p) => p.method))).join(", ")
         const sum = round2(unknown.reduce((s, p) => s + p.amount, 0))
@@ -419,14 +420,14 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
       paidEvidence = "balance"
       nonCardServiceAmount = jobTotal
       warnings.push(
-        `${PAYMENT_METHOD_UNKNOWN_PREFIX}: payment details unavailable from Workiz — its job API reports only the balance ($${Math.max(0, amountDue).toFixed(2)} due of $${invoiceTotal.toFixed(2)}), not the payment type, so card vs cash/check/Zelle cannot be determined. Create a Workiz invoice (its webhook reports the type) or confirm the payment in the payout details; amount is provisional as non-card until then`,
+        `${PAYMENT_METHOD_UNKNOWN_PREFIX}: payment details unavailable from Workiz — its job API reports only the balance ($${Math.max(0, amountDue).toFixed(2)} due of $${invoiceTotal.toFixed(2)}), not the payment type, so card vs cash/check/Zelle cannot be determined. A linked invoice/estimate payment event or a verified Workiz payment export is required; an explicitly labelled manual recovery is available. Creating an invoice alone does not recover past payments. Amount remains provisional until the payment methods are known`,
       )
     } else if (jobTotal > 0) {
       nonCardServiceAmount = jobTotal
       warnings.push(`${PAYMENT_METHOD_UNKNOWN_PREFIX}: payment details unavailable — Workiz returned neither payment records nor a balance for this job; amount is provisional as non-card until confirmed`)
     }
 
-    if (!fullyPaid && statusSaysPaid) {
+    if (!fullyPaid && statusSaysPaid && (amountDue === null || amountDue <= 0.005)) {
       fullyPaid = true
       paidEvidence = "invoice-status"
     }
