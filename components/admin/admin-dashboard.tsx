@@ -4,22 +4,21 @@ import { useCallback, useEffect, useMemo, useRef, useState, useTransition } from
 import { useRouter, useSearchParams } from "next/navigation"
 import type { AdminDashboardData } from "@/app/actions/admin"
 import { signOutSession } from "@/app/actions/session"
-import { DEFAULT_PAYOUT_QUERY, type PayoutQuery } from "@/lib/payout/presentation"
 import { adminHref, adminPageTitle, parseAdminLocation, type AdminLocation } from "@/lib/admin/navigation"
 import { AdminMenu, type MenuCounts } from "./admin-menu"
 import { LastUpdatedLine, RefreshButton, useSyncRefresh } from "./refresh-control"
 import { NotificationBell } from "./notification-bell"
 import { DueTab } from "./due-tab"
 import { PaidHistoryTab } from "./paid-history-tab"
-import { PayoutsTab } from "./payouts-tab"
 import { ReviewTab } from "./review-tab"
-import { WaitingTab } from "./waiting-tab"
 import { SettingsTab } from "./settings-tab"
 
 /**
- * One route, several pages. The current page lives in the URL (see lib/admin/navigation.ts) and
- * is switched with the History API, so Back/Forward and bookmarks work without reloading the
- * data the server already sent.
+ * One route, four pages: Due (default), Paid history, Review and Settings. The current page
+ * lives in the URL (see lib/admin/navigation.ts) and is switched with the History API, so
+ * Back/Forward and bookmarks work without reloading the data the server already sent.
+ * Unfinished and unpaid jobs are tracked as pending payouts behind the scenes and surface on
+ * Due once they qualify; they have no page of their own.
  */
 export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: AdminDashboardData; webhookUrl: string; cronConfigured: boolean }) {
   const router = useRouter()
@@ -30,9 +29,7 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
 
   const [signingOut, startSignOut] = useTransition()
   const [focusToken, setFocusToken] = useState(0)
-  const [payoutsQuery, setPayoutsQuery] = useState<PayoutQuery>(DEFAULT_PAYOUT_QUERY)
-  const [reviewQuery, setReviewQuery] = useState<PayoutQuery>({ ...DEFAULT_PAYOUT_QUERY, status: "hold" })
-  const [waitingQuery, setWaitingQuery] = useState<PayoutQuery>({ ...DEFAULT_PAYOUT_QUERY, status: "pending" })
+  const [reviewSearch, setReviewSearch] = useState("")
   const previousView = useRef(location.view)
 
   const navigate = useCallback((loc: Partial<AdminLocation>) => {
@@ -58,22 +55,18 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
 
   const unmappedPeople = data.mappings.filter((m) => m.profileId == null && !m.excluded)
   const dueJobs = data.due.technicians.reduce((n, t) => n + t.count, 0)
-  const statusCount = useCallback((status: string) => data.statusCounts.filter((c) => c.status === status).reduce((s, c) => s + c.count, 0), [data.statusCounts])
-  const holdCount = statusCount("hold")
-  const pendingCount = statusCount("pending")
   const openingMissing = !data.opening.openingInitializedAt
 
   const counts: MenuCounts = {
     due: dueJobs,
-    review: holdCount + data.sourceChanges.length,
-    waiting: pendingCount,
+    review: data.review.open,
     settings: unmappedPeople.length + (openingMissing ? 1 : 0),
   }
 
   // A notification about one held job opens Review already filtered to that job.
   const openReviewJob = useCallback(
     (search: string) => {
-      setReviewQuery({ ...DEFAULT_PAYOUT_QUERY, status: "hold", search })
+      setReviewSearch(search)
       navigate({ view: "review" })
     },
     [navigate],
@@ -123,31 +116,16 @@ export function AdminDashboard({ data, webhookUrl, cronConfigured }: { data: Adm
             onBackToDue={() => navigate({ view: "due" })}
           />
         )}
-        {location.view === "payouts" && (
-          <PayoutsTab
-            initialPage={null}
-            profiles={data.profiles}
-            query={payoutsQuery}
-            onQueryChange={setPayoutsQuery}
-            focusToken={0}
-            timezone={timezone}
-            onGoToDue={(profileId) => navigate({ view: "due", techId: profileId })}
-            onOpenBatch={(batchId) => navigate({ view: "history", batchId })}
-          />
-        )}
         {location.view === "review" && (
           <ReviewTab
-            sourceChanges={data.sourceChanges}
+            review={data.review}
             unmappedCount={unmappedPeople.length}
-            profiles={data.profiles}
-            query={reviewQuery}
-            onQueryChange={setReviewQuery}
+            search={reviewSearch}
+            onSearchChange={setReviewSearch}
             timezone={timezone}
             onNavigate={navigate}
+            onOpenBatch={(batchId) => navigate({ view: "history", batchId: batchId || null })}
           />
-        )}
-        {location.view === "waiting" && (
-          <WaitingTab waiting={data.waiting} profiles={data.profiles} query={waitingQuery} onQueryChange={setWaitingQuery} timezone={timezone} onNavigate={navigate} />
         )}
         {location.view === "settings" && (
           <SettingsTab

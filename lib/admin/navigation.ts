@@ -5,18 +5,23 @@
  * parse the same way.
  */
 
-export const ADMIN_VIEWS = ["due", "history", "payouts", "review", "waiting", "settings"] as const
+/**
+ * The four owner-facing pages. Unfinished and unpaid jobs are still tracked internally as
+ * pending payouts so they can become Due later; they simply have no page of their own.
+ */
+export const ADMIN_VIEWS = ["due", "history", "review", "settings"] as const
 export type AdminView = (typeof ADMIN_VIEWS)[number]
 
-export const SETTINGS_SECTIONS = ["team", "technicians", "workiz", "sync", "activity", "opening"] as const
+/** Old bookmarks for pages that no longer exist land on the closest remaining page. */
+const RETIRED_VIEWS: Record<string, AdminView> = { payouts: "review", waiting: "review" }
+
+export const SETTINGS_SECTIONS = ["technicians", "team", "workiz", "sync", "activity", "opening"] as const
 export type SettingsSection = (typeof SETTINGS_SECTIONS)[number]
 
 export const ADMIN_VIEW_LABELS: Record<AdminView, string> = {
   due: "Due",
   history: "Paid history",
-  payouts: "All payouts",
   review: "Review",
-  waiting: "Waiting",
   settings: "Settings",
 }
 
@@ -41,7 +46,7 @@ export type AdminLocation = {
   teamFilter: "all" | "unmapped"
 }
 
-export const DEFAULT_ADMIN_LOCATION: AdminLocation = { view: "due", section: "team", batchId: null, techId: null, teamFilter: "all" }
+export const DEFAULT_ADMIN_LOCATION: AdminLocation = { view: "due", section: "technicians", batchId: null, techId: null, teamFilter: "all" }
 
 type ParamSource = URLSearchParams | Record<string, string | string[] | undefined> | null | undefined
 
@@ -61,10 +66,11 @@ const positiveInt = (v: string | null): number | null => {
 /** Unknown or malformed values fall back to the default, so an old bookmark never breaks the page. */
 export function parseAdminLocation(params: ParamSource): AdminLocation {
   const rawView = read(params, "view")
-  const view = (ADMIN_VIEWS as readonly string[]).includes(rawView ?? "") ? (rawView as AdminView) : DEFAULT_ADMIN_LOCATION.view
+  const view = (ADMIN_VIEWS as readonly string[]).includes(rawView ?? "") ? (rawView as AdminView) : (RETIRED_VIEWS[rawView ?? ""] ?? DEFAULT_ADMIN_LOCATION.view)
   const rawSection = read(params, "section")
-  const section = (SETTINGS_SECTIONS as readonly string[]).includes(rawSection ?? "") ? (rawSection as SettingsSection) : DEFAULT_ADMIN_LOCATION.section
   const teamFilter = read(params, "team") === "unmapped" ? "unmapped" : "all"
+  // `?team=unmapped` alone is a Team-mapping link (the bell and Review emit it without a section).
+  const section = (SETTINGS_SECTIONS as readonly string[]).includes(rawSection ?? "") ? (rawSection as SettingsSection) : teamFilter === "unmapped" ? "team" : DEFAULT_ADMIN_LOCATION.section
   return { view, section, batchId: positiveInt(read(params, "batch")), techId: positiveInt(read(params, "tech")), teamFilter }
 }
 
@@ -73,8 +79,9 @@ export function adminHref(loc: Partial<AdminLocation>): string {
   const full: AdminLocation = { ...DEFAULT_ADMIN_LOCATION, ...loc }
   const q = new URLSearchParams()
   if (full.view !== "due") q.set("view", full.view)
-  if (full.view === "settings" && full.section !== DEFAULT_ADMIN_LOCATION.section) q.set("section", full.section)
-  if (full.view === "settings" && full.section === "team" && full.teamFilter === "unmapped") q.set("team", "unmapped")
+  const unmappedTeam = full.view === "settings" && full.section === "team" && full.teamFilter === "unmapped"
+  if (full.view === "settings" && full.section !== DEFAULT_ADMIN_LOCATION.section && !unmappedTeam) q.set("section", full.section)
+  if (unmappedTeam) q.set("team", "unmapped")
   if (full.view === "history" && full.batchId) q.set("batch", String(full.batchId))
   if (full.view === "due" && full.techId) q.set("tech", String(full.techId))
   const s = q.toString()

@@ -6,6 +6,7 @@ import {
   holdIssueLabel,
   holdNoticeKey,
   isValidNoticeKey,
+  isWaitingHold,
   keysOf,
   sourceChangeNoticeKey,
   withoutDismissed,
@@ -154,5 +155,27 @@ describe("clearing helpers", () => {
     expect(isValidNoticeKey("hold:")).toBe(false)
     expect(isValidNoticeKey(42)).toBe(false)
     expect(isValidNoticeKey(`hold:${"x".repeat(300)}`)).toBe(false)
+  })
+
+  it("keeps customer-unpaid holds out of Review and the bell; every other hold reason stays", () => {
+    expect(isWaitingHold("Job is not fully paid")).toBe(true)
+    expect(isWaitingHold("  job is not fully paid ")).toBe(true)
+    expect(isWaitingHold("Payment method unknown: payment details unavailable from Workiz")).toBe(false)
+    expect(isWaitingHold("Job has unmapped team members (271865)")).toBe(false)
+    expect(isWaitingHold("Unrecorded tip likely: Workiz's total is above the itemized total")).toBe(false)
+    expect(isWaitingHold(null)).toBe(false)
+  })
+
+  it("CLEAR from Review dismisses by the same key the bell uses, and a paid job coming due later is a different key", () => {
+    const unpaidKey = holdNoticeKey("JOB-Q", "Job is not fully paid")
+    const methodKey = holdNoticeKey("JOB-Q", "Payment method unknown: payment details unavailable")
+    expect(unpaidKey).not.toBe(methodKey)
+    // Once the customer pays, the method question is a new issue and is not hidden by an old clear.
+    const dismissed = new Set([unpaidKey])
+    const notices = buildAdminNotices(
+      { holds: [{ payoutId: 1, jobUuid: "JOB-Q", serialId: "1", clientName: "Q", profileName: "Arthur", holdReason: "Payment method unknown: payment details unavailable", updatedAt: null }], sourceChanges: [], unmapped: [], openingMissing: false },
+      dismissed,
+    )
+    expect(notices.map((n) => n.keys)).toEqual([[methodKey]])
   })
 })

@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest"
-import { DEFAULT_ADMIN_LOCATION, adminHref, parseAdminLocation } from "@/lib/admin/navigation"
+import { ADMIN_VIEWS, DEFAULT_ADMIN_LOCATION, adminHref, parseAdminLocation } from "@/lib/admin/navigation"
 
 describe("parseAdminLocation", () => {
   it("defaults to Due for a bare /admin and for junk", () => {
@@ -11,7 +11,14 @@ describe("parseAdminLocation", () => {
     expect(parseAdminLocation(new URLSearchParams("view=history&batch=42"))).toMatchObject({ view: "history", batchId: 42 })
     expect(parseAdminLocation(new URLSearchParams("view=settings&section=opening"))).toMatchObject({ view: "settings", section: "opening" })
     expect(parseAdminLocation(new URLSearchParams("view=settings&team=unmapped"))).toMatchObject({ view: "settings", section: "team", teamFilter: "unmapped" })
+    expect(parseAdminLocation(new URLSearchParams("view=settings"))).toMatchObject({ view: "settings", section: "technicians" })
     expect(parseAdminLocation({ view: "due", tech: "7" })).toMatchObject({ view: "due", techId: 7 })
+  })
+
+  it("only exposes Due, Paid history, Review and Settings; retired pages land on Review", () => {
+    expect(ADMIN_VIEWS).toEqual(["due", "history", "review", "settings"])
+    expect(parseAdminLocation(new URLSearchParams("view=payouts")).view).toBe("review")
+    expect(parseAdminLocation(new URLSearchParams("view=waiting")).view).toBe("review")
   })
 })
 
@@ -23,7 +30,8 @@ describe("adminHref", () => {
     expect(adminHref({ view: "settings", section: "sync" })).toBe("/admin?view=settings&section=sync")
     for (const loc of [
       { view: "review" as const },
-      { view: "waiting" as const },
+      { view: "history" as const },
+      { view: "settings" as const, section: "team" as const },
       { view: "due" as const, techId: 3 },
       { view: "settings" as const, section: "activity" as const },
     ]) {

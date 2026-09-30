@@ -9,15 +9,13 @@ import { ADMIN_VIEW_LABELS, adminHref, type AdminLocation, type AdminView } from
 
 export type MenuCounts = Partial<Record<AdminView, number>>
 
-const ORDER: AdminView[] = ["due", "history", "payouts", "review", "waiting", "settings"]
+const ORDER: AdminView[] = ["due", "history", "review", "settings"]
 
 const HINTS: Record<AdminView, string> = {
   due: "Pay technicians",
   history: "Payments recorded, undo, export",
-  payouts: "Every payout record",
-  review: "Holds and paid jobs that changed",
-  waiting: "Not finished or not paid yet",
-  settings: "Team, Workiz, sync, opening balance",
+  review: "Jobs that need your call",
+  settings: "Technicians, team, Workiz, diagnostics",
 }
 
 /**
