@@ -13,7 +13,7 @@ import {
   workizTeamMappings,
 } from "@/lib/db/schema"
 import { dismissNoticeKeys, listDismissedNoticeKeys } from "@/lib/admin/notice-dismissals"
-import { MAX_NOTICE_KEYS_PER_CLEAR, NOTICE_ACCOUNT, buildAdminNotices, type AdminNotice, type HeldPayoutInput, type UnmappedInput } from "@/lib/admin/notices"
+import { MAX_NOTICE_KEYS_PER_CLEAR, NOTICE_ACCOUNT, buildAdminNotices, holdNoticeKey, isWaitingHold, sourceChangeNoticeKey, type AdminNotice, type HeldPayoutInput, type UnmappedInput } from "@/lib/admin/notices"
 import { TECH_PAYMENT_METHODS, isoDateInZone, round2, validateBatchForm, type SelectionItem, type StaleItem } from "@/lib/payout/batch-rules"
 import { getBatch, listBatches, recordPaymentBatch, reverseBatch, type BatchFilter, type BatchSummary } from "@/lib/payout/batches"
 import { isOpeningReviewHold, releaseBlocker } from "@/lib/payout/engine"
@@ -29,7 +29,7 @@ import {
 import { parseMarkerTokens, workTypeMatches } from "@/lib/payout/segments"
 import { getWebhookUrl } from "@/lib/public-origin"
 import { generateToken, hashSecret } from "@/lib/security/crypto"
-import { requireAdmin } from "@/lib/security/session"
+import { requireAdmin, revokeOtherAdminSessions } from "@/lib/security/session"
 import {
   DEFAULT_WORKIZ_SETTINGS,
   getPayoutSettings,
@@ -541,6 +541,9 @@ export async function changeAdminPassword(current: string, next: string): Promis
     const admin = await getAdminSettings()
     if (admin.passwordHash && !verifySecret(current, admin.passwordHash)) throw new Error("Current password is incorrect")
     await saveAdminSettings({ passwordHash: hashSecret(next) }, "admin")
+    // A new password revokes every other admin session (other phones, old browsers); this one stays signed in.
+    const revoked = await revokeOtherAdminSessions()
+    await logSyncEvent("admin:password", { ok: true, summary: `Admin password changed; ${revoked} other admin session${revoked === 1 ? "" : "s"} signed out` })
     return { ok: true }
   } catch (err) {
     return fail(err)
@@ -740,29 +743,69 @@ async function heldPayoutRows(limit = 500): Promise<HeldPayoutInput[]> {
     .where(eq(payouts.status, "hold"))
     .orderBy(desc(payouts.updatedAt), desc(payouts.id))
     .limit(limit)
-  return rows.map((r) => ({ ...r, profileName: r.profileName ?? "Unknown" }))
+  return rows.filter((r) => !isWaitingHold(r.holdReason)).map((r) => ({ ...r, profileName: r.profileName ?? "Unknown" }))
 }
 
 /**
  * The bell's list: current facts minus what this admin already cleared. Built on every
  * dashboard load, so a Refresh, a scheduled sync or another device all show the same thing.
  */
-async function loadAdminNotices(input: { sourceChanges: SourceChangeRow[]; unmapped: UnmappedInput[]; openingMissing: boolean }): Promise<AdminNotice[]> {
-  const [holds, dismissed] = await Promise.all([heldPayoutRows(), listDismissedNoticeKeys(NOTICE_ACCOUNT)])
-  return buildAdminNotices({ holds, sourceChanges: input.sourceChanges, unmapped: input.unmapped, openingMissing: input.openingMissing }, dismissed)
+async function loadAdminNotices(input: { sourceChanges: SourceChangeRow[]; unmapped: UnmappedInput[]; openingMissing: boolean; dismissed: ReadonlySet<string> }): Promise<AdminNotice[]> {
+  const holds = await heldPayoutRows()
+  return buildAdminNotices({ holds, sourceChanges: input.sourceChanges, unmapped: input.unmapped, openingMissing: input.openingMissing }, input.dismissed)
+}
+
+/** A held payout on the Review page, carrying the same durable key the bell uses for it. */
+export type ReviewHold = PayoutRecord & { noticeKey: string; cleared: boolean }
+export type ReviewChange = SourceChangeRow & { noticeKey: string; cleared: boolean }
+export type ReviewBoard = {
+  /** Every held payout (cleared ones included, flagged) so CLEAR can name all of them, not just one page. */
+  holds: ReviewHold[]
+  changes: ReviewChange[]
+  /** Uncleared items: what the menu badge and the page header count. */
+  open: number
+  clearedCount: number
+  /** True when more holds exist than were loaded; CLEAR then clears the loaded set and asks for another pass. */
+  truncated: boolean
+}
+
+const REVIEW_HOLD_LIMIT = 500
+
+/**
+ * The Review page's read model. Holds and paid-job changes share identity with the bell
+ * (`lib/admin/notices.ts`), so clearing on one surface clears the other, and a cleared issue
+ * stays hidden until the job produces a genuinely different issue key.
+ */
+async function loadReviewBoard(sourceChanges: SourceChangeRow[], dismissed: ReadonlySet<string>): Promise<ReviewBoard> {
+  const all = await payoutRecords(eq(payouts.status, "hold"), { limit: REVIEW_HOLD_LIMIT + 1 })
+  // Customer-unpaid holds are waiting on the customer, not the owner; they stay internal.
+  const rows = all.filter((r) => !isWaitingHold(r.holdReason))
+  const truncated = all.length > REVIEW_HOLD_LIMIT
+  const holds: ReviewHold[] = rows.slice(0, REVIEW_HOLD_LIMIT).map((r) => {
+    const noticeKey = holdNoticeKey(r.jobUuid, r.holdReason)
+    return { ...r, noticeKey, cleared: dismissed.has(noticeKey) }
+  })
+  const changes: ReviewChange[] = sourceChanges.map((c) => {
+    const noticeKey = sourceChangeNoticeKey(c.jobUuid, c.newHash)
+    return { ...c, noticeKey, cleared: dismissed.has(noticeKey) }
+  })
+  const open = holds.filter((h) => !h.cleared).length + changes.filter((c) => !c.cleared).length
+  return { holds, changes, open, clearedCount: holds.length + changes.length - open, truncated }
 }
 
 /**
- * CLEAR in the bell panel: dismiss exactly the notifications the owner was looking at. This
- * hides them for good on every device; it never marks anything paid, releases a hold,
- * acknowledges a source change, records an opening balance or touches Workiz.
+ * CLEAR (bell panel or Review page): dismiss exactly the notifications the owner was looking
+ * at. This hides them for good on every device; it never marks anything paid, releases a hold,
+ * acknowledges a source change, records an opening balance or touches Workiz. Items that
+ * arrive after the list was rendered are not in `keys` and therefore stay visible.
  */
-export async function dismissAdminNotices(keys: string[]): Promise<Result<{ recorded: number; requested: number }>> {
+export async function dismissAdminNotices(keys: string[], origin: "bell" | "review" = "bell"): Promise<Result<{ recorded: number; requested: number }>> {
   try {
     await requireAdmin()
     const res = await dismissNoticeKeys(NOTICE_ACCOUNT, keys, "admin")
     if (!res.ok) return res
-    await logSyncEvent("notice:dismiss", { ok: true, summary: `Cleared ${res.requested} notification${res.requested === 1 ? "" : "s"} from the bell (${res.recorded} new)`, details: { keys: Array.from(new Set(keys)).slice(0, MAX_NOTICE_KEYS_PER_CLEAR) } })
+    const where = origin === "review" ? "the Review page" : "the bell"
+    await logSyncEvent("notice:dismiss", { ok: true, summary: `Cleared ${res.requested} item${res.requested === 1 ? "" : "s"} from ${where} (${res.recorded} new)`, details: { origin, keys: Array.from(new Set(keys)).slice(0, MAX_NOTICE_KEYS_PER_CLEAR) } })
     revalidatePath("/admin")
     return { ok: true, data: { recorded: res.recorded, requested: res.requested } }
   } catch (err) {
@@ -968,51 +1011,20 @@ export async function loadDueBoard(): Promise<DueBoard> {
   return { technicians, loadedAt: new Date().toISOString() }
 }
 
-/** Individual payout-record counts per technician and status, over every payout ever stored. */
-async function payoutStatusCounts() {
-  return db
-    .select({
-      profileId: payouts.profileId,
-      status: payouts.status,
-      count: sql<number>`count(*)`.mapWith(Number),
-      total: sql<number>`coalesce(sum(${payouts.totalPayout}), 0)`.mapWith(Number),
-    })
-    .from(payouts)
-    .groupBy(payouts.profileId, payouts.status)
-}
-
-export type WaitingSummary = {
-  /** Job finished, customer still owes money. */
-  customerUnpaid: number
-  /** Job not finished in Workiz yet. */
-  notFinished: number
-  /** Workiz payment method unknown ("Other" or no payment records): owner classifies. */
-  methodReview: number
-  /** Pre-cutoff work first seen after the initialization: confirm previously paid or release. */
-  openingReview: number
-  /** Every other hold: unmapped team members, tip allocation, discounts, calculation checks. */
-  otherHolds: number
-}
-
-/** Why open payouts are not Due yet, bucketed so payment-method review stays apart from technical problems. */
-async function waitingSummary(): Promise<WaitingSummary> {
-  const settings = await getWorkizSettings()
+/**
+ * Jobs that are not finished or not fully paid keep their `pending` payout rows and are
+ * re-evaluated by every sync; they become Due on their own once Workiz reports them Done and
+ * paid. Counts of them are available to diagnostics (`openPayoutCounts`) but have no page.
+ */
+export async function openPayoutCounts(): Promise<{ pending: number; hold: number; ready: number }> {
+  await requireAdmin()
   const rows = await db
-    .select({ status: payouts.status, holdReason: payouts.holdReason, jobStatus: workizJobs.status, fullyPaid: workizJobs.fullyPaid })
+    .select({ status: payouts.status, count: sql<number>`count(*)`.mapWith(Number) })
     .from(payouts)
-    .leftJoin(workizJobs, eq(payouts.jobUuid, workizJobs.uuid))
-    .where(inArray(payouts.status, ["pending", "hold"]))
-  const out: WaitingSummary = { customerUnpaid: 0, notFinished: 0, methodReview: 0, openingReview: 0, otherHolds: 0 }
-  for (const r of rows) {
-    const payable = Boolean(r.jobStatus) && settings.payableStatuses.some((s) => s.toLowerCase() === String(r.jobStatus).toLowerCase())
-    if (r.status === "hold") {
-      if (isOpeningReviewHold(r.holdReason)) out.openingReview++
-      else if (/payment method|unknown method|method unknown/i.test(r.holdReason ?? "")) out.methodReview++
-      else out.otherHolds++
-    } else if (!payable) out.notFinished++
-    else if (!r.fullyPaid) out.customerUnpaid++
-    else out.otherHolds++
-  }
+    .where(inArray(payouts.status, ["pending", "hold", "ready"]))
+    .groupBy(payouts.status)
+  const out = { pending: 0, hold: 0, ready: 0 }
+  for (const r of rows) if (r.status in out) out[r.status as keyof typeof out] = r.count
   return out
 }
 
@@ -1043,19 +1055,18 @@ async function unmappedTeamImpact(teamIds: string[]) {
 
 export async function loadAdminDashboard() {
   await requireAdmin()
-  const [profiles, mappings, catalog, workiz, payoutSettings, events, statusCounts, due, batches, legacyPaid, waiting, sourceChanges, sync, lastWebhook, webhookLog, webhookCounts] = await Promise.all([
+  const [profiles, mappings, catalog, workiz, payoutSettings, events, due, batches, legacyPaid, sourceChanges, dismissed, sync, lastWebhook, webhookLog, webhookCounts] = await Promise.all([
     listProfiles(),
     db.select().from(workizTeamMappings).orderBy(desc(workizTeamMappings.updatedAt)),
     db.select().from(colorSealItems).orderBy(colorSealItems.productId),
     getWorkizSettings(),
     getPayoutSettings(),
     db.select().from(syncEvents).orderBy(desc(syncEvents.createdAt)).limit(40),
-    payoutStatusCounts(),
     loadDueBoard(),
     listBatches({ includeReversed: true, kind: "all", limit: 300 }),
     legacyPaidRows(),
-    waitingSummary(),
     openSourceChanges(),
+    listDismissedNoticeKeys(NOTICE_ACCOUNT),
     syncPanel(),
     latestWorkizWebhook(),
     recentWebhookEvents(25),
@@ -1064,13 +1075,15 @@ export async function loadAdminDashboard() {
 
   const unmappedPeople = mappings.filter((m) => m.profileId == null && !m.excluded)
   const unmappedIds = unmappedPeople.map((m) => m.workizTeamId)
-  const [unmappedImpact, notices] = await Promise.all([
+  const [unmappedImpact, notices, review] = await Promise.all([
     unmappedTeamImpact(unmappedIds),
-    loadAdminNotices({ sourceChanges, unmapped: unmappedPeople.map((m) => ({ workizTeamId: m.workizTeamId, workizName: m.workizName })), openingMissing: !payoutSettings.openingInitializedAt }),
+    loadAdminNotices({ sourceChanges, unmapped: unmappedPeople.map((m) => ({ workizTeamId: m.workizTeamId, workizName: m.workizName })), openingMissing: !payoutSettings.openingInitializedAt, dismissed }),
+    loadReviewBoard(sourceChanges, dismissed),
   ])
 
   return {
     notices,
+    review,
     profiles: profiles.map((p) => ({ ...p, pinHash: undefined })),
     mappings,
     unmappedImpact,
@@ -1096,12 +1109,9 @@ export async function loadAdminDashboard() {
     },
     opening: payoutSettings,
     events,
-    statusCounts,
     due,
     batches,
     legacyPaid,
-    waiting,
-    sourceChanges,
     sync,
     paymentMethods: TECH_PAYMENT_METHODS,
   }

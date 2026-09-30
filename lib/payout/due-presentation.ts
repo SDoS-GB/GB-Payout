@@ -128,6 +128,84 @@ export function jobMoneySummary(job: JobMoneyInput): JobMoneySummary {
   }
 }
 
+export type PayoutMathInput = {
+  /** Stored payout row fields (strings from numeric columns are fine). */
+  jobTotal: string | number
+  colorSealTotal: string | number
+  nonColorRate: string | number
+  colorRate: string | number
+  tipShare: string | number
+  nonColorPayout: string | number
+  colorPayout: string | number
+  tipPayout: string | number
+  totalPayout: string | number
+  cardTipAmount: string | number
+  nonCardTipAmount: string | number
+  breakdown: unknown
+  /** Invoice-wide payment facts from the job snapshot. */
+  job: { cardServiceAmount: string | number | null; nonCardServiceAmount: string | number | null; jobTotal: string | number | null } | null
+}
+
+export type PayoutMath = {
+  /** This technician's eligible service amount after discounts (their segment). */
+  serviceBase: number
+  colorBase: number
+  regularBase: number
+  /** Card-paid share of the invoice's service subtotal, 0..1. */
+  cardShare: number
+  /** Card dollars the fee is charged on (service, invoice-wide). */
+  cardPaid: number
+  /** Percentage points of the 3.5% actually applied to service dollars (cardShare x 3.5). */
+  effectiveFeePercent: number
+  /** Dollars withheld from THIS payout by the card fee (service commission + card tip share). */
+  feeWithheld: number
+  regularRate: number
+  colorRate: number
+  tipShare: number
+  regularPayout: number
+  colorPayout: number
+  tipPayout: number
+  totalPayout: number
+  hasColor: boolean
+  hasTip: boolean
+  hasCard: boolean
+}
+
+/** Read the saved calculation back for display; no arithmetic beyond formatting-safe rounding. */
+export function payoutMath(p: PayoutMathInput): PayoutMath {
+  const b = (p.breakdown && typeof p.breakdown === "object" ? p.breakdown : {}) as Record<string, unknown>
+  const invoiceFee = (b.invoiceFee && typeof b.invoiceFee === "object" ? b.invoiceFee : null) as { cardShare?: number; cardPaid?: number } | null
+  const serviceBase = round2(num(p.jobTotal))
+  const colorBase = round2(num(p.colorSealTotal))
+  const jobCard = num(p.job?.cardServiceAmount)
+  const jobServices = num(p.job?.jobTotal)
+  const cardShare = typeof invoiceFee?.cardShare === "number" ? invoiceFee.cardShare : typeof b.cardServiceShare === "number" ? (b.cardServiceShare as number) : jobServices > 0 ? Math.min(1, jobCard / jobServices) : 0
+  const cardPaid = typeof invoiceFee?.cardPaid === "number" ? round2(invoiceFee.cardPaid) : round2(jobCard)
+  const feeWithheld = typeof b.cardFeeAdjustment === "number" ? Math.round((b.cardFeeAdjustment as number) * 100) / 100 : 0
+  const tipTotal = round2(num(p.cardTipAmount) + num(p.nonCardTipAmount))
+  return {
+    serviceBase,
+    colorBase,
+    regularBase: round2(serviceBase - colorBase),
+    cardShare,
+    cardPaid,
+    effectiveFeePercent: Math.round(cardShare * 3.5 * 1000) / 1000,
+    feeWithheld,
+    regularRate: num(p.nonColorRate),
+    colorRate: num(p.colorRate),
+    tipShare: num(p.tipShare),
+    regularPayout: round2(num(p.nonColorPayout)),
+    colorPayout: round2(num(p.colorPayout)),
+    tipPayout: round2(num(p.tipPayout)),
+    totalPayout: round2(num(p.totalPayout)),
+    hasColor: colorBase > 0,
+    hasTip: tipTotal > 0 || num(p.tipPayout) > 0,
+    hasCard: cardShare > 0 || num(p.cardTipAmount) > 0,
+  }
+}
+
+export const percent = (fraction: number, digits = 0) => `${(fraction * 100).toFixed(digits).replace(/\.0+$/, "")}%`
+
 /** Short qualifier printed next to "Job total" so the figure is never mistaken for the service subtotal. */
 export function jobTotalQualifier(s: JobMoneySummary): string {
   if (s.basis === "services-plus-tax") return s.includesTax ? "services after discount + tax" : "services after discount"

@@ -1,16 +1,13 @@
-import { and, eq, gt, lt } from "drizzle-orm"
+import { and, eq, gt, lt, ne } from "drizzle-orm"
 import { cookies } from "next/headers"
 import { db } from "@/lib/db"
 import { appSessions, technicianProfiles, type TechnicianProfile } from "@/lib/db/schema"
 import { generateToken, sha256 } from "./crypto"
+import { isSessionLive, sessionExpiry, type SessionKind } from "./session-policy"
 
 export const SESSION_COOKIE = "gb_session"
 
-const TECH_SESSION_SHORT_MS = 12 * 60 * 60 * 1000 // 12 hours
-const TECH_SESSION_LONG_MS = 30 * 24 * 60 * 60 * 1000 // 30 days ("stay logged in")
-const ADMIN_SESSION_MS = 8 * 60 * 60 * 1000 // 8 hours
-
-export type SessionKind = "technician" | "admin"
+export type { SessionKind } from "./session-policy"
 
 export type CurrentSession =
   | { kind: "technician"; profile: TechnicianProfile; expiresAt: Date }
@@ -24,14 +21,15 @@ async function setSessionCookie(token: string, expiresAt: Date) {
     sameSite: "none",
     secure: true,
     path: "/",
+    // Cookie and database row share one expiry (see session-policy.ts), so neither layer logs
+    // the admin out before the other: 180 days for the admin, technician rules unchanged.
     expires: expiresAt,
   })
 }
 
 export async function createSession(kind: SessionKind, profileId: number | null, remember = false): Promise<void> {
   const token = generateToken()
-  const ttl = kind === "admin" ? ADMIN_SESSION_MS : remember ? TECH_SESSION_LONG_MS : TECH_SESSION_SHORT_MS
-  const expiresAt = new Date(Date.now() + ttl)
+  const expiresAt = sessionExpiry(kind, remember, new Date())
 
   await db.insert(appSessions).values({ tokenHash: sha256(token), kind, profileId, expiresAt })
   await setSessionCookie(token, expiresAt)
@@ -40,6 +38,7 @@ export async function createSession(kind: SessionKind, profileId: number | null,
   await db.delete(appSessions).where(lt(appSessions.expiresAt, new Date()))
 }
 
+/** Explicit Sign Out: the row goes first, so the token is dead even if the cookie lingers. */
 export async function destroySession(): Promise<void> {
   const jar = await cookies()
   const token = jar.get(SESSION_COOKIE)?.value
@@ -49,18 +48,34 @@ export async function destroySession(): Promise<void> {
   jar.delete(SESSION_COOKIE)
 }
 
+/**
+ * Security revocation after a password change: every admin session except the one making the
+ * change is deleted, so an old phone or browser must sign in with the new password.
+ */
+export async function revokeOtherAdminSessions(): Promise<number> {
+  const jar = await cookies()
+  const token = jar.get(SESSION_COOKIE)?.value
+  const keep = token ? sha256(token) : null
+  const deleted = await db
+    .delete(appSessions)
+    .where(keep ? and(eq(appSessions.kind, "admin"), ne(appSessions.tokenHash, keep)) : eq(appSessions.kind, "admin"))
+    .returning({ id: appSessions.id })
+  return deleted.length
+}
+
 export async function getCurrentSession(): Promise<CurrentSession | null> {
   const jar = await cookies()
   const token = jar.get(SESSION_COOKIE)?.value
   if (!token) return null
 
+  const now = new Date()
   const rows = await db
     .select()
     .from(appSessions)
-    .where(and(eq(appSessions.tokenHash, sha256(token)), gt(appSessions.expiresAt, new Date())))
+    .where(and(eq(appSessions.tokenHash, sha256(token)), gt(appSessions.expiresAt, now)))
     .limit(1)
   const session = rows[0]
-  if (!session) return null
+  if (!session || !isSessionLive(session.expiresAt, now)) return null
 
   if (session.kind === "admin") {
     return { kind: "admin", expiresAt: session.expiresAt }

@@ -8,6 +8,7 @@ import { SETTINGS_SECTIONS, SETTINGS_SECTION_LABELS, adminHref, type AdminLocati
 import { ActivityTab } from "./activity-tab"
 import { OpeningBalanceCard } from "./opening-balance-card"
 import { ProfilesTab } from "./profiles-tab"
+import { ResyncJobCard } from "./resync-job-card"
 import { NavLink } from "./review-tab"
 import { SyncStatusStrip } from "./sync-status-strip"
 import { TeamMappingTab } from "./team-mapping-tab"
@@ -87,14 +88,15 @@ export function SettingsTab({ data, section, teamFilter, focusToken, webhookUrl,
                 replays any parked webhook events. Paid and voided payouts are never rewritten.
               </p>
               <p className="text-muted-foreground">
-                Every run is logged under{" "}
+                Jobs that are not finished or not fully paid yet are tracked in the background and appear on Due as soon as they qualify. Every run is logged under{" "}
                 <NavLink loc={{ view: "settings", section: "activity" }} onNavigate={onNavigate}>
                   Activity
                 </NavLink>
-                ; a single job can be re-synced by UUID from All payouts.
+                .
               </p>
             </CardContent>
           </Card>
+          <ResyncJobCard />
         </div>
       )}
       {section === "activity" && <ActivityTab events={data.events} />}

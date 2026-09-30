@@ -12,7 +12,7 @@ import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { DEFAULT_TECH_PAYMENT_METHOD, isoDateInZone } from "@/lib/payout/batch-rules"
-import { customerPaymentMethod, groupCustomerPayments, jobMoneySummary, jobTotalQualifier } from "@/lib/payout/due-presentation"
+import { customerPaymentMethod, groupCustomerPayments, jobMoneySummary, jobTotalQualifier, payoutMath, percent } from "@/lib/payout/due-presentation"
 import { initialSelection, reconcileSelection, selectedJobs as pickSelected, selectedTotal, setAllTicked, setTicked, type DueSelectableJob, type DueSelection } from "@/lib/payout/due-selection"
 import { PAYMENT_DETAILS_UNAVAILABLE, workizJobUrl } from "@/lib/payout/presentation"
 import { PayoutDetailSheet } from "./payout-detail-sheet"
@@ -437,6 +437,7 @@ function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: {
     : null
   const payments = groupCustomerPayments(job?.payments)
   const techTip = Number(p.tipPayout ?? 0)
+  const math = payoutMath({ ...p, job: job ? { cardServiceAmount: job.cardServiceAmount, nonCardServiceAmount: job.nonCardServiceAmount, jobTotal: job.jobTotal } : null })
   const completed = p.completion?.state === "completed" ? p.completion.at : null
   const completedLabel = completed ? `Completed ${zonedDate(completed, timezone)}` : "No completion date from Workiz"
 
@@ -510,12 +511,16 @@ function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: {
                 Job total <span className="text-xs">· {jobTotalQualifier(summary)}</span>
               </dt>
               <dd className="text-right font-medium tabular-nums">{money(summary.jobTotal)}</dd>
+              <dt className="text-muted-foreground">Discount</dt>
+              <dd className="text-right tabular-nums">{summary.discount > 0 ? `−${money(summary.discount)}` : "—"}</dd>
+              <dt className="text-muted-foreground">
+                Services after discount{math.serviceBase !== summary.servicesAfterDiscount ? <span className="text-xs"> · {techName}&apos;s part</span> : null}
+              </dt>
+              <dd className="text-right tabular-nums">{money(math.serviceBase)}</dd>
               <dt className="text-muted-foreground">
                 Color sealing <span className="text-xs">· after discount</span>
               </dt>
-              <dd className="text-right tabular-nums">{summary.colorSealAfterDiscount > 0 ? money(summary.colorSealAfterDiscount) : "—"}</dd>
-              <dt className="text-muted-foreground">Discount</dt>
-              <dd className="text-right tabular-nums">{summary.discount > 0 ? `−${money(summary.discount)}` : "—"}</dd>
+              <dd className="text-right tabular-nums">{math.hasColor ? money(math.colorBase) : "—"}</dd>
               <dt className="text-muted-foreground">
                 Tip <span className="text-xs">· customer total{techTip > 0 ? `, ${money(techTip)} of it to ${techName}` : ""}</span>
               </dt>
@@ -546,6 +551,27 @@ function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: {
                 ))}
               </ul>
             )}
+          </div>
+
+          <div className="flex flex-col gap-1">
+            <p className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{techName}&apos;s payout</p>
+            <dl className="grid grid-cols-[minmax(0,1fr)_auto] gap-x-4 gap-y-1 text-sm">
+              <dt className="text-muted-foreground">
+                Card fee{" "}
+                <span className="text-xs">{math.hasCard ? `· 3.5% on ${money(math.cardPaid)} paid by card (${percent(math.cardShare, 1)} of services)` : "· no card payments"}</span>
+              </dt>
+              <dd className="text-right tabular-nums">{math.feeWithheld > 0 ? `−${money(math.feeWithheld)}` : "—"}</dd>
+              <dt className="text-muted-foreground">
+                Rates <span className="text-xs">· {percent(math.regularRate)} regular{math.hasColor ? `, ${percent(math.colorRate)} color sealing` : ""}{math.hasTip ? `, ${percent(math.tipShare)} of tip` : ""}</span>
+              </dt>
+              <dd className="text-right tabular-nums">
+                {money(math.regularPayout)}
+                {math.hasColor ? ` + ${money(math.colorPayout)}` : ""}
+                {math.hasTip && math.tipPayout > 0 ? ` + ${money(math.tipPayout)}` : ""}
+              </dd>
+              <dt className="font-medium text-foreground">Pays {techName}</dt>
+              <dd className="text-right font-semibold tabular-nums text-foreground">{money(p.amount)}</dd>
+            </dl>
           </div>
 
           <div>

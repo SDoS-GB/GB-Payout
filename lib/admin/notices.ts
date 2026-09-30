@@ -79,6 +79,15 @@ export type NoticeInputs = {
 
 const NOTHING_OWED = /nothing is owed on this row/i
 
+/**
+ * A finished job the customer has not fully paid yet is held by the engine, but there is
+ * nothing for the owner to decide: the next sync releases it once Workiz shows it paid. Such
+ * rows are tracked internally and kept out of Review and the bell.
+ */
+export function isWaitingHold(holdReason: string | null | undefined): boolean {
+  return /^Job is not fully paid\b/i.test((holdReason ?? "").trim())
+}
+
 /** The hold reason's category as a stable slug: text before the first punctuation, minus quotes and numbers. */
 export function holdIssueKey(reason: string | null | undefined): string {
   const text = (reason ?? "").trim()
