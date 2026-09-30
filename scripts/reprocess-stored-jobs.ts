@@ -8,7 +8,7 @@
  *
  * Paid and void payouts are never rewritten (the engine flags source changes instead).
  */
-import { inArray } from "drizzle-orm"
+import { eq, inArray } from "drizzle-orm"
 import { db } from "@/lib/db"
 import { payouts, technicianProfiles } from "@/lib/db/schema"
 import { reevaluateStoredJob } from "@/lib/workiz/sync"
@@ -32,7 +32,7 @@ async function main() {
   const rows = await db
     .select({ id: payouts.id, jobUuid: payouts.jobUuid, name: technicianProfiles.name, status: payouts.status, total: payouts.totalPayout, hold: payouts.holdReason })
     .from(payouts)
-    .leftJoin(technicianProfiles, inArray(technicianProfiles.id, [payouts.profileId]))
+    .leftJoin(technicianProfiles, eq(technicianProfiles.id, payouts.profileId))
     .where(inArray(payouts.jobUuid, uuids))
     .orderBy(payouts.jobUuid, payouts.id)
   for (const r of rows) console.log(`payout #${r.id} ${r.jobUuid} ${r.name ?? "?"} ${r.status} $${Number(r.total).toFixed(2)}${r.hold ? ` — ${r.hold.slice(0, 90)}` : ""}`)
