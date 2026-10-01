@@ -274,25 +274,46 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   }
   jobTotal = round2(Math.max(0, jobTotal))
 
-  // JobTotalPrice should be the service total plus anything Workiz adds on top (tax, tip lines).
-  // What is left over is `invoiceSurplus`; finalize() decides whether recorded tips explain it.
+  const amountDueRaw = pick(r, "JobAmountDue", "AmountDue", "amount_due")
+  const amountDue = amountDueRaw !== undefined ? round2(num(amountDueRaw)) : null
+
+  // Recorded tips (admin-entered or a Workiz payment's Tip) that are not invoice lines. Workiz folds
+  // its Tip field into JobTotalPrice, so such a tip must come off the total BEFORE any discount is
+  // inferred from it (job #924889: a 5% discount and a $92.65 tip netted to a $20.34 "discount").
+  // A tip handed over on top of the invoice is not inside the total: whatever the records exceed the
+  // money Workiz applied to the invoice (total − balance) by is tip paid on top.
+  const tipsInsideInvoice = (() => {
+    if (tipItemsTotal > 0 || invoiceTotal === null || invoiceTotal <= 0) return 0
+    const recordedTips = round2(payments.filter((p) => p.isTip).reduce((s, p) => s + p.amount, 0))
+    if (recordedTips <= 0) return 0
+    const paymentsTotal = round2(payments.reduce((s, p) => s + p.amount, 0))
+    const appliedToInvoice = amountDue !== null ? round2(invoiceTotal - Math.max(0, amountDue)) : invoiceTotal
+    const overApplied = round2(paymentsTotal - appliedToInvoice)
+    const tipsOnTop = overApplied > MONEY_TOLERANCE ? Math.min(recordedTips, overApplied) : 0
+    return round2(recordedTips - tipsOnTop)
+  })()
+
+  // JobTotalPrice should be the service total plus anything Workiz adds on top (tax, tip lines,
+  // recorded tips inside it). What is left over is `invoiceSurplus`, most likely an unrecorded tip.
   let itemizedTotal = 0
   let invoiceSurplus = 0
   if (invoiceTotal !== null && jobTotal > 0) {
     itemizedTotal = round2(jobTotal + tipItemsTotal + (taxAmount ?? 0))
-    const diff = round2(invoiceTotal - itemizedTotal)
+    const diff = round2(invoiceTotal - tipsInsideInvoice - itemizedTotal)
     if (diff > MONEY_TOLERANCE) {
       invoiceSurplus = diff
     } else if (diff < -MONEY_TOLERANCE) {
       // Live job #924820: SubTotal 475, no discount line, JobTotalPrice 425. Workiz applied a
-      // job-level discount or write-off it does not itemize. Commission is owed on what the
-      // customer was actually charged, so the shortfall is treated as one more whole-job
-      // discount, and the payout is held until an admin confirms it was a discount, not a write-off.
+      // job-level discount or write-off it does not itemize (its percentage discounts never reach
+      // the API). Commission is owed on what the customer was actually charged for service, so the
+      // shortfall is one more whole-job discount, spread over the line items in proportion below,
+      // and the payout is held until an admin confirms it was a discount, not a write-off.
       const shortfall = -diff
       discountAmount = round2(discountAmount + shortfall)
       jobTotal = round2(Math.max(0, jobTotal - shortfall))
+      const tipNote = tipsInsideInvoice > 0 ? ` after the recorded $${tipsInsideInvoice.toFixed(2)} tip inside it` : ""
       warnings.push(
-        `${UNITEMIZED_DISCOUNT_PREFIX}: Workiz invoice total $${invoiceTotal.toFixed(2)} is $${shortfall.toFixed(2)} less than the itemized service total $${itemizedTotal.toFixed(2)}; treated as a whole-job discount, confirm it is not a write-off`,
+        `${UNITEMIZED_DISCOUNT_PREFIX}: Workiz invoice total $${invoiceTotal.toFixed(2)}${tipNote} is $${shortfall.toFixed(2)} less than the itemized service total $${itemizedTotal.toFixed(2)}; treated as a whole-job discount spread proportionally over the line items, confirm it is not a write-off`,
       )
     }
   }
@@ -300,13 +321,12 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   if (jobTotal === 0) warnings.push("Job total is zero")
 
   // --- Color seal ------------------------------------------------------------
+  // Every whole-job discount (itemized line or inferred) is spread over the service lines in
+  // proportion to their price, so each line's per-item rate applies to what was really charged for it.
+  const netRatio = positiveItemsGross > 0 ? Math.min(1, jobTotal / positiveItemsGross) : 1
+  for (const item of lineItems) item.netTotal = item.total > 0 ? round2(item.total * netRatio) : 0
   const colorGross = round2(lineItems.filter((i) => i.isColorSeal && i.total > 0).reduce((s, i) => s + i.total, 0))
-  let colorSealTotal = 0
-  if (colorGross > 0) {
-    // Whole-job discounts are applied proportionally so the color portion stays inside jobTotal.
-    const ratio = positiveItemsGross > 0 ? Math.min(1, jobTotal / positiveItemsGross) : 1
-    colorSealTotal = round2(colorGross * ratio)
-  }
+  const colorSealTotal = colorGross > 0 ? round2(colorGross * netRatio) : 0
   if (lineItems.length === 0) {
     warnings.push("Workiz returned no line items; color-sealing split could not be determined")
   }
@@ -323,9 +343,6 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
   let nonCardServiceAmount = round2(servicePayments.filter((p) => !p.isCard).reduce((s, p) => s + p.amount, 0))
   const cardTipAmount = round2(tipPayments.filter((p) => p.isCard).reduce((s, p) => s + p.amount, 0) + 0)
   let nonCardTipAmount = round2(tipPayments.filter((p) => !p.isCard).reduce((s, p) => s + p.amount, 0))
-
-  const amountDueRaw = pick(r, "JobAmountDue", "AmountDue", "amount_due")
-  const amountDue = amountDueRaw !== undefined ? round2(num(amountDueRaw)) : null
 
   // A tip that is an invoice line but has no payment record of its own takes the method of the
   // payment(s) that covered the invoice. One method: unambiguous. Several methods: the tip's
@@ -360,11 +377,10 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
     // The invoice the customer owes: Workiz's own figure when present, else service + known tax.
     const invoiceDue = invoiceTotal !== null && invoiceTotal > 0 ? invoiceTotal : round2(jobTotal + (taxAmount ?? 0))
     // A tip sits inside Workiz's total either as an invoice line (already in itemizedTotal) or as
-    // the Tip field Workiz folds into JobTotalPrice without itemizing it; that second kind is the
-    // surplus, and recorded tips explain it up to its amount. A tip beyond both was paid on top of
-    // the invoice (handed to the technician) and never counts toward the balance.
-    const tipInsideTotal = tipItemsTotal > 0 ? tipPaid : round2(Math.min(tipPaid, invoiceSurplus))
-    const unitemizedSurplus = round2(Math.max(0, invoiceSurplus - (tipItemsTotal > 0 ? 0 : tipInsideTotal)))
+    // the Tip field Workiz folds into JobTotalPrice without itemizing it (`tipsInsideInvoice`). A
+    // tip beyond both was paid on top of the invoice and never counts toward the balance.
+    const tipInsideTotal = tipItemsTotal > 0 ? tipPaid : tipsInsideInvoice
+    const unitemizedSurplus = invoiceSurplus
 
     const invoiceStatus = str(pick(r, "InvoiceStatus", "invoice_status", "PaymentStatus", "payment_status"))
     const statusSaysPaid = invoiceStatus ? /paid/i.test(invoiceStatus) && !/un|partial|not/i.test(invoiceStatus) : false

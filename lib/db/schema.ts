@@ -437,6 +437,8 @@ export type NormalizedLineItem = {
   unitPrice: number
   /** Extended amount (unit price x quantity). Negative for discount lines. */
   total: number
+  /** Service revenue of this line after its proportional share of whole-job discounts; 0 for discount lines. */
+  netTotal?: number
   isColorSeal: boolean
   /** True for Workiz discount lines, which arrive with a positive price and `Type: "DISCOUNT_TYPE"`. */
   isDiscount?: boolean
