@@ -1,6 +1,6 @@
 "use client"
 
-import { useEffect, useLayoutEffect, useRef, useState, useTransition } from "react"
+import { useCallback, useEffect, useLayoutEffect, useRef, useState, useTransition } from "react"
 import { useRouter } from "next/navigation"
 import { CheckCircle2, ChevronDown, ExternalLink, Info, Undo2, X } from "lucide-react"
 import type { AdminDashboardData, DueTechnician, PayoutRecord, RecordPaidOutcome } from "@/app/actions/admin"
@@ -13,7 +13,7 @@ import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
 import { DEFAULT_TECH_PAYMENT_METHOD, isoDateInZone } from "@/lib/payout/batch-rules"
 import { customerPaymentMethod, groupCustomerPayments, jobMoneySummary, jobTotalQualifier, payoutMath, percent } from "@/lib/payout/due-presentation"
-import { initialSelection, reconcileSelection, selectedJobs as pickSelected, selectedTotal, setAllTicked, setTicked, type DueSelectableJob, type DueSelection } from "@/lib/payout/due-selection"
+import { dueTotals, initialSelection, reconcileSelection, selectedJobs as pickSelected, selectedTotal, setAllTicked, setTicked, type DueSelectableJob, type DueSelection } from "@/lib/payout/due-selection"
 import { PAYMENT_DETAILS_UNAVAILABLE, workizJobUrl } from "@/lib/payout/presentation"
 import { PayoutDetailSheet } from "./payout-detail-sheet"
 import { InlineMessage, money, zonedDate, zonedDateTime } from "./shared"
@@ -50,6 +50,29 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
   const listRef = useRef<HTMLElement>(null)
   // The card that should keep its place on screen while a paid card leaves the list.
   const anchorRef = useRef<{ profileId: number; top: number } | null>(null)
+
+  // Which jobs are ticked, per technician. It lives here so the page total and each
+  // technician's total are read from the same selection the PAID button records.
+  const [selections, setSelections] = useState<ReadonlyMap<number, DueSelection>>(() => new Map())
+  const selectionOf = (t: DueTechnician) => selections.get(t.profileId) ?? initialSelection(t.jobs.map(selectable))
+  const setSelection = useCallback((profileId: number, next: DueSelection) => setSelections((prev) => new Map(prev).set(profileId, next)), [])
+
+  // Remember what each technician's jobs looked like when they were first shown, so a later
+  // refresh can tell a changed amount from an unchanged one. A technician who has nothing due
+  // any more is forgotten and starts fresh (all ticked) if work comes back.
+  useEffect(() => {
+    setSelections((prev) => {
+      const present = new Set(due.technicians.map((t) => t.profileId))
+      const missing = due.technicians.filter((t) => !prev.has(t.profileId))
+      if (missing.length === 0 && Array.from(prev.keys()).every((id) => present.has(id))) return prev
+      const next = new Map(Array.from(prev).filter(([id]) => present.has(id)))
+      for (const t of missing) next.set(t.profileId, initialSelection(t.jobs.map(selectable)))
+      return next
+    })
+  }, [due.technicians])
+
+  const totals = dueTotals(due.technicians.map((t) => ({ jobs: t.jobs.map(selectable), selection: selectionOf(t) })))
+  const onlyTechnician = due.technicians.length === 1 ? due.technicians[0] : null
 
   const allJobs = due.technicians.flatMap((t) => t.jobs)
   const detail = detailId != null ? allJobs.find((j) => j.id === detailId) ?? null : null
@@ -89,7 +112,21 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
     })
 
   return (
-    <div className="flex flex-col gap-4">
+    <div className={`flex flex-col gap-4 ${receipt ? "pb-28 sm:pb-0" : ""}`}>
+      {due.technicians.length > 0 && (
+        <section aria-label="Total due" className="flex flex-col items-start gap-0.5">
+          <h2 className="text-xs font-medium uppercase tracking-wide text-muted-foreground">{onlyTechnician ? `Total due to ${onlyTechnician.name}` : "Total due"}</h2>
+          <p className="text-4xl font-semibold leading-tight tabular-nums text-primary sm:text-5xl" aria-live="polite">
+            {money(totals.selectedTotal)}
+          </p>
+          <p className="text-sm text-muted-foreground" aria-live="polite">
+            {totals.selectedCount} of {totals.jobCount} {totals.jobCount === 1 ? "job" : "jobs"} selected
+            {!onlyTechnician && ` · ${due.technicians.length} technicians`}
+            {totals.selectedCount < totals.jobCount && ` · ${money(totals.dueTotal)} due in all`}
+          </p>
+        </section>
+      )}
+
       {message && <InlineMessage tone={message.tone}>{message.text}</InlineMessage>}
 
       {due.technicians.length === 0 ? (
@@ -106,6 +143,9 @@ export function DueTab({ due, paymentMethods, timezone, focusProfileId, focusTok
             <TechnicianCard
               key={t.profileId}
               tech={t}
+              selection={selectionOf(t)}
+              onSelectionChange={setSelection}
+              showTotal={!onlyTechnician}
               timezone={timezone}
               paymentMethods={paymentMethods}
               focused={focusProfileId === t.profileId}
@@ -145,10 +185,15 @@ const selectable = (p: PayoutRecord): DueSelectableJob => ({ id: p.id, amount: p
 
 /**
  * One technician: every due job as a compact row (ticked by default), the total of the ticked
- * rows at the top, and the PAID action for exactly those rows. Every new batch starts on Zelle.
+ * rows at the top left, and the PAID action for exactly those rows. Every new batch starts on
+ * Zelle. When this is the only technician with work due, the page total above already is this
+ * technician's total, so the card does not print the same figure a second time.
  */
 function TechnicianCard({
   tech,
+  selection,
+  onSelectionChange,
+  showTotal,
   timezone,
   paymentMethods,
   focused,
@@ -157,6 +202,9 @@ function TechnicianCard({
   onOpenDetail,
 }: {
   tech: DueTechnician
+  selection: DueSelection
+  onSelectionChange: (profileId: number, next: DueSelection) => void
+  showTotal: boolean
   timezone: string
   paymentMethods: readonly string[]
   focused: boolean
@@ -168,8 +216,9 @@ function TechnicianCard({
   const ref = useRef<HTMLDivElement>(null)
   const [pending, startTransition] = useTransition()
   const jobs = tech.jobs.map(selectable)
-  const [selection, setSelection] = useState<DueSelection>(() => initialSelection(jobs))
+  // Always the latest selection, including one committed earlier in the same event.
   const selectionRef = useRef(selection)
+  selectionRef.current = selection
   const [method, setMethod] = useState<string>(DEFAULT_TECH_PAYMENT_METHOD)
   const [paidOn, setPaidOn] = useState(() => isoDateInZone(new Date(), timezone))
   const [reference, setReference] = useState("")
@@ -181,7 +230,7 @@ function TechnicianCard({
 
   const commit = (next: DueSelection) => {
     selectionRef.current = next
-    setSelection(next)
+    onSelectionChange(tech.profileId, next)
     keyRef.current = newKey()
   }
 
@@ -251,25 +300,23 @@ function TechnicianCard({
 
   return (
     <div ref={ref} data-tech-id={tech.profileId} className={`flex scroll-mt-28 flex-col rounded-lg border bg-card shadow-sm ${focused ? "ring-2 ring-primary/40" : ""}`}>
-      <div className="flex flex-col gap-2 p-4 pb-3">
-        <div className="flex items-start justify-between gap-3">
-          <div className="flex min-w-0 flex-col gap-0.5">
-            <h2 className="truncate text-xl font-semibold">{tech.name}</h2>
-            <p className="text-sm text-muted-foreground" aria-live="polite">
-              {selectedCount} of {tech.count} {jobWord} selected
+      <div className="flex items-start justify-between gap-3 p-4 pb-3">
+        <div className="flex min-w-0 flex-col items-start gap-0.5">
+          <h2 className="max-w-full truncate text-xl font-semibold">{tech.name}</h2>
+          {showTotal && (
+            <p className="text-2xl font-semibold tabular-nums text-primary" aria-live="polite">
+              <span className="sr-only">To pay {tech.name}: </span>
+              {money(total)}
             </p>
-          </div>
-          <div className="flex shrink-0 flex-col items-end">
-            <span className="text-xs font-medium uppercase tracking-wide text-muted-foreground">To pay</span>
-            <span className="text-2xl font-semibold tabular-nums text-primary">{money(total)}</span>
-          </div>
+          )}
+          <p className="text-sm text-muted-foreground" aria-live="polite">
+            {selectedCount} of {tech.count} {jobWord} selected
+          </p>
         </div>
         {tech.jobs.length > 1 && (
-          <div className="flex justify-end">
-            <Button type="button" variant="ghost" size="sm" onClick={toggleAll} disabled={pending} className="-mr-2 min-h-10">
-              {allSelected ? "Clear all" : "Select all"}
-            </Button>
-          </div>
+          <Button type="button" variant="ghost" size="sm" onClick={toggleAll} disabled={pending} className="-mr-2 min-h-10 shrink-0">
+            {allSelected ? "Clear all" : "Select all"}
+          </Button>
         )}
       </div>
 
@@ -288,7 +335,7 @@ function TechnicianCard({
       >
         <div className="flex flex-wrap items-center justify-between gap-3">
           <p className="text-sm text-muted-foreground" aria-live="polite">
-            {selectedCount === 0 ? "Tick a job above to pay" : `Pay ${money(total)} with`}
+            {selectedCount === 0 ? "Tick a job above to pay" : `Pay the ${selectedCount === 1 ? "selected job" : `${selectedCount} selected jobs`} with`}
           </p>
           <div className="flex items-center gap-2">
             <Select value={method} onValueChange={setMethod} disabled={pending}>
@@ -443,9 +490,14 @@ function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: {
 
   return (
     <li className={checked ? "bg-accent/30" : ""}>
-      <div className="grid grid-cols-[auto_minmax(0,1fr)_auto] items-start gap-x-1 py-1 pl-1 pr-1 sm:pl-2 sm:pr-2">
+      <div className="grid grid-cols-[auto_auto_minmax(0,1fr)_auto] items-start gap-x-1 py-1 pl-1 pr-1 sm:pl-2 sm:pr-2">
         <label htmlFor={checkboxId} className="flex h-11 w-11 cursor-pointer items-center justify-center">
           <Checkbox id={checkboxId} checked={checked} disabled={disabled} onCheckedChange={(v) => onCheck(Boolean(v))} aria-label={`Pay ${techName} for ${customer}${serial ? ` (job #${serial})` : ""}`} className="h-5 w-5" />
+        </label>
+
+        <label htmlFor={checkboxId} className="min-w-[5.25rem] cursor-pointer pr-2 pt-2.5 text-left text-base font-semibold tabular-nums">
+          <span className="sr-only">Payout to {techName}: </span>
+          {money(p.amount)}
         </label>
 
         <div className="flex min-w-0 flex-col gap-0.5 py-2.5">
@@ -470,10 +522,6 @@ function JobRow({ p, techName, timezone, checked, disabled, onCheck, onMore }: {
         </div>
 
         <div className="flex items-start">
-          <span className="pt-2.5 text-base font-medium tabular-nums text-muted-foreground">
-            <span className="sr-only">Payout to {techName}: </span>
-            {money(p.amount)}
-          </span>
           <button
             type="button"
             onClick={() => setOpen((v) => !v)}

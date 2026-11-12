@@ -2,7 +2,7 @@ import type { NormalizedLineItem, NormalizedPayment, PaymentSource } from "@/lib
 import type { WorkizSettings } from "@/lib/settings"
 import { DEFAULT_BUSINESS_TIMEZONE } from "@/lib/payout/presentation"
 import type { WorkizRawJob } from "./client"
-import { classifyPaymentMethod, mergePayments } from "./payments"
+import { mergePayments, paymentOutcome, resolvePaymentMethod, type ReversedPayment } from "./payments"
 import { parseWorkizDate } from "./time"
 
 /**
@@ -122,6 +122,7 @@ export const PAYMENT_METHOD_UNKNOWN_PREFIX = "Payment method unknown"
 export const UNITEMIZED_DISCOUNT_PREFIX = "Unitemized discount"
 export const UNITEMIZED_SURPLUS_PREFIX = "Unrecorded tip likely"
 export const TIP_METHOD_UNCLEAR_PREFIX = "Tip payment method unclear"
+export const PAYMENT_REVERSED_PREFIX = "Payment refunded or reversed"
 
 /** Tolerance for money that must agree to the cent after independent rounding. */
 const MONEY_TOLERANCE = 0.05
@@ -191,20 +192,22 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings, source
     const r = entry as Record<string, unknown>
     const amount = round2(num(pick(r, "Amount", "amount", "Total", "total", "PaymentAmount")))
     if (amount === 0) continue
+    // A declined, refunded or charged-back record is not money the business holds.
+    if (paymentOutcome(r) !== "received") continue
     const id = str(pick(r, "id", "Id", "ID", "PaymentId", "payment_id"))
     // The same payment echoed twice (webhook + refetch) must not double the paid total.
     if (id) {
       if (seen.has(id)) continue
       seen.add(id)
     }
-    const method = str(pick(r, "Method", "method", "PaymentMethod", "payment_method", "Type", "type")) ?? "Unknown"
-    const tipAmount = num(pick(r, "Tip", "tip", "TipAmount", "tip_amount"))
     // A manual cash/check/Zelle entry has no processor id or settlement status; the method text
     // alone decides the side. Unrecognised text is kept, flagged, and held — never assumed cash.
-    const cls = classifyPaymentMethod(method, settings.cardMethodKeywords)
+    const cls = resolvePaymentMethod(r, settings.cardMethodKeywords)
+    const method = cls.original || "Unknown"
+    const tipAmount = num(pick(r, "Tip", "tip", "TipAmount", "tip_amount"))
     const isTipFlag = Boolean(pick(r, "IsTip", "is_tip")) || hasKeywordWord(str(pick(r, "Note", "note", "Description")) ?? "", settings.tipKeywords)
     const paidAt = str(pick(r, "Date", "date", "PaymentDate", "payment_date", "CreatedAt", "created_at"))
-    const base = { id, method, isCard: cls.isCard, methodKnown: cls.known, source, date: paidAt }
+    const base = { id, method, methodLabel: cls.label, isCard: cls.isCard, methodKnown: cls.known, source, date: paidAt }
 
     if (tipAmount > 0 && tipAmount < amount) {
       // Workiz can attach a tip to a payment; split it so service and tip are tracked separately.
@@ -218,8 +221,10 @@ export function normalizePayments(raw: unknown, settings: WorkizSettings, source
 }
 
 export type NormalizeOptions = {
-  /** Payment records from outside the job payload (invoice webhooks, admin confirmations). */
+  /** Payment records from outside the job payload (webhooks, admin confirmations). */
   externalPayments?: NormalizedPayment[]
+  /** Workiz records for money that was refunded or charged back; never counted, always reviewed. */
+  reversedPayments?: ReversedPayment[]
 }
 
 /**
@@ -445,6 +450,13 @@ export function normalizeJob(raw: WorkizRawJob, settings: WorkizSettings, catalo
     if (!fullyPaid && statusSaysPaid) {
       fullyPaid = true
       paidEvidence = "invoice-status"
+    }
+
+    const reversed = opts.reversedPayments ?? []
+    if (reversed.length) {
+      const sum = round2(reversed.reduce((s, p) => s + p.amount, 0))
+      const described = Array.from(new Set(reversed.map((p) => [p.method, p.status].filter(Boolean).join(", ")))).join("; ")
+      warnings.push(`${PAYMENT_REVERSED_PREFIX}: Workiz reports $${sum.toFixed(2)} that did not stay with the business (${described}); it is not counted as a payment, confirm the remaining payments before release`)
     }
 
     if (unitemizedSurplus > MONEY_TOLERANCE && invoiceTotal !== null) {

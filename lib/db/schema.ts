@@ -446,12 +446,15 @@ export type NormalizedLineItem = {
 }
 
 /** Where a payment record came from. Absent on rows saved before provenance was tracked (all were job payloads). */
-export type PaymentSource = "workiz-job" | "invoice-webhook" | "estimate-webhook" | "manual"
+export type PaymentSource = "workiz-job" | "invoice-webhook" | "estimate-webhook" | "job-webhook" | "manual"
 
 export type NormalizedPayment = {
   id: string | null
   amount: number
+  /** The method exactly as Workiz (or the admin) recorded it, e.g. "charge"; kept for troubleshooting. */
   method: string
+  /** How `method` was read, e.g. "Credit Card". Absent on rows saved before it was stored. */
+  methodLabel?: string
   isCard: boolean
   isTip: boolean
   date: string | null

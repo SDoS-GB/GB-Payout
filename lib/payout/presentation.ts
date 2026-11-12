@@ -1,5 +1,5 @@
 import type { NormalizedPayment } from "@/lib/db/schema"
-import { classifyPaymentMethod } from "@/lib/workiz/payments"
+import { CREDIT_CARD_LABEL, classifyPaymentMethod, normalizeMethodText } from "@/lib/workiz/payment-method"
 
 /**
  * Pure, side-effect-free helpers shared by the admin read models and the
@@ -57,9 +57,21 @@ export function completionState(input: {
   return { state: "completed", at: input.lastStatusUpdate.toISOString() }
 }
 
+/** The method as the app reads it: every Workiz card label ("charge", "Credit", "Credit charge") is "Credit Card". */
 export function paymentMethodLabel(method: string | null | undefined, isCard?: boolean): string {
-  if (isCard) return "Card"
+  if (isCard) return CREDIT_CARD_LABEL
   return classifyPaymentMethod(method).label
+}
+
+/**
+ * The text Workiz actually sent, when it reads differently from the label shown: "charge"
+ * beside "Credit Card". Null for admin confirmations (the admin chose the label) and when
+ * showing it would only repeat the label.
+ */
+export function originalPaymentMethod(payment: Pick<NormalizedPayment, "method" | "isCard" | "source">): string | null {
+  const original = payment.method?.trim()
+  if (!original || payment.source === "manual") return null
+  return normalizeMethodText(original) === normalizeMethodText(paymentMethodLabel(original, payment.isCard)) ? null : original
 }
 
 /** What the admin sees when a job has no payment records: Workiz's API never lists payments, so this is "unavailable", never "unpaid". */
@@ -79,6 +91,10 @@ export function paymentSourceLabel(payment: Pick<NormalizedPayment, "source" | "
   switch (payment.source) {
     case "invoice-webhook":
       return "From Workiz invoice webhook"
+    case "estimate-webhook":
+      return "From Workiz estimate webhook"
+    case "job-webhook":
+      return "From Workiz job webhook"
     case "manual":
       return `Confirmed by ${payment.recordedBy ?? "admin"} from the Workiz Payments tab`
     default:
@@ -89,6 +105,25 @@ export function paymentSourceLabel(payment: Pick<NormalizedPayment, "source" | "
 /** True when at least one record came from Workiz itself rather than an admin. */
 export function hasWorkizPaymentRecords(payments: NormalizedPayment[] | null | undefined): boolean {
   return (payments ?? []).some((p) => p.source !== "manual")
+}
+
+const PAYMENT_REVIEW_REASON = /payment method unknown|tip payment method unclear|unrecorded tip likely|payment refunded or reversed/i
+
+/**
+ * Whether the "Confirm payments from Workiz" form belongs on a payout: the technician has not
+ * been paid, and either an admin confirmation exists (it can be corrected or cleared) or the
+ * payments Workiz reported still leave a question only a person can answer: none at all, a
+ * method that is not recognised, a tip that cannot be placed.
+ */
+export function paymentConfirmationNeeded(input: { status: string; holdReason: string | null; hasJob: boolean; payments: NormalizedPayment[] | null | undefined }): boolean {
+  if (!input.hasJob) return false
+  if (input.status !== "pending" && input.status !== "hold" && input.status !== "ready") return false
+  const payments = input.payments ?? []
+  if (payments.some((p) => p.source === "manual")) return true
+  if (input.status === "ready") return false
+  if (payments.length === 0) return true
+  if (payments.some((p) => p.methodKnown === false || p.tipAmbiguous)) return true
+  return PAYMENT_REVIEW_REASON.test(input.holdReason ?? "")
 }
 
 export type StatusExplanation = {

@@ -1,4 +1,8 @@
 import type { JobPaymentRow, NormalizedPayment, PaymentSource } from "@/lib/db/schema"
+import { MANUAL_PAYMENT_METHODS, classifyPaymentMethod, paymentOutcome, resolvePaymentMethod, type ManualPaymentMethod } from "./payment-method"
+
+export { CREDIT_CARD_LABEL, MANUAL_PAYMENT_METHODS, classifyPaymentMethod, manualMethodFor, normalizeMethodText, paymentOutcome, resolvePaymentMethod } from "./payment-method"
+export type { ManualPaymentMethod, PaymentMethodClass, PaymentOutcome } from "./payment-method"
 
 /**
  * Payment records and how the customer paid, independent of the job payload.
@@ -11,12 +15,15 @@ import type { JobPaymentRow, NormalizedPayment, PaymentSource } from "@/lib/db/s
  *   - The undocumented `invoice/get/{id}` exists but needs an invoice id we cannot list, and
  *     payments logged on the job's Payments tab (cash/check/Zelle, the common case here)
  *     belong to no invoice at all.
- *   - Workiz's *invoice* webhook payload carries `payments: [{ id, type, amount, tipAmount }]`
- *     (help-center article 39192462158993). Job webhooks do not.
  *
- * So the payment type can only reach the app through an invoice webhook or an admin
- * confirming what the Workiz Payments tab shows. Both are stored in `job_payments` and
- * merged into the job on every sync. Nothing here guesses a method.
+ * Verified 2026-11-12 against stored live webhook events: invoice, estimate AND job webhooks
+ * carry `payments: [{ id, type, amount, tipAmount, status, date, … }]` next to the document's
+ * own `subTotal`, `tipAmount`, `totalPrice` and `amountDue`. The same payment keeps its
+ * "PAY-…" id in every event that repeats it.
+ *
+ * So the payment type reaches the app through a webhook or an admin confirming what the
+ * Workiz Payments tab shows. Both are stored in `job_payments` and merged into the job on
+ * every sync. Nothing here guesses a method.
  */
 
 export type ExternalPaymentInput = {
@@ -40,65 +47,66 @@ export type ExternalPaymentInput = {
   raw?: unknown
 }
 
-export type DocumentKind = "invoice" | "estimate"
+export type DocumentKind = "invoice" | "estimate" | "job"
+
+const DOCUMENT_SOURCE: Record<DocumentKind, PaymentSource> = { invoice: "invoice-webhook", estimate: "estimate-webhook", job: "job-webhook" }
+
+/** The document's own money fields, when the event carried them (live events do). */
+export type DocumentTotals = {
+  subTotal?: number | null
+  discountAmount?: number | null
+  taxAmount?: number | null
+  serviceFeeAmount?: number | null
+  /** The document-level tip Workiz reports beside `totalPrice`. */
+  tipAmount?: number | null
+}
+
+const MONEY_MATCH = 0.011
+const near = (a: number, b: number) => Math.abs(a - b) <= MONEY_MATCH
 
 /**
- * Whether the `amount` on a Workiz payment record already contains its `tipAmount`.
- * Workiz's article shows `{ amount: 100, tipAmount: 10 }` without saying; the live account
- * has only tipless payments so far. Decided per event from the document's own totals:
- *   - sum(amount) == totalPrice − amountDue        → amounts EXCLUDE tips ("separate")
- *   - sum(amount) − sum(tip) == totalPrice − amountDue → amounts INCLUDE tips ("included")
+ * Whether Workiz's `totalPrice` already contains the tip. Live events (#924916: subTotal
+ * 1464.49 + tip 153.77 = totalPrice 1618.26) show that it does; this checks the event's own
+ * arithmetic instead of assuming it. Null when the event did not carry the fields to tell.
+ */
+function totalContainsTip(totalPrice: number, doc: DocumentTotals): boolean | null {
+  if (doc.subTotal === null || doc.subTotal === undefined || doc.tipAmount === null || doc.tipAmount === undefined) return null
+  const extras = (doc.taxAmount ?? 0) + (doc.serviceFeeAmount ?? 0)
+  // `subTotal` is before discounts on jobs; accept either reading of it.
+  const bases = [round2(doc.subTotal + extras), round2(doc.subTotal - (doc.discountAmount ?? 0) + extras)]
+  if (doc.tipAmount > 0 && bases.some((base) => near(totalPrice, round2(base + (doc.tipAmount as number))))) return true
+  if (bases.some((base) => near(totalPrice, base))) return false
+  return null
+}
+
+/**
+ * Whether the `amount` on a Workiz payment record already contains its `tipAmount`, decided per
+ * event from the document's own totals (`collected` = totalPrice − amountDue):
+ *   - the total contains the tip (live events):
+ *       sum(amount) == collected              → amounts INCLUDE tips ("included")
+ *       sum(amount) + sum(tip) == collected   → amounts EXCLUDE tips ("separate")
+ *   - the total does not contain the tip, or the event cannot say (older events):
+ *       sum(amount) == collected              → amounts EXCLUDE tips ("separate")
+ *       sum(amount) − sum(tip) == collected   → amounts INCLUDE tips ("included")
  * Anything else (or no totals) is "unknown"; with a non-zero tip that holds the job for review
  * instead of guessing the tip in or out of the card-fee base.
  */
 export type TipInclusion = "separate" | "included" | "unknown"
 
-export function inferTipInclusion(payments: ReadonlyArray<Pick<ExternalPaymentInput, "amount" | "tipAmount">>, totalPrice: number | null, amountDue: number | null): TipInclusion {
-  const tips = payments.reduce((s, p) => s + p.tipAmount, 0)
+export function inferTipInclusion(payments: ReadonlyArray<Pick<ExternalPaymentInput, "amount" | "tipAmount">>, totalPrice: number | null, amountDue: number | null, doc: DocumentTotals = {}): TipInclusion {
+  const tips = round2(payments.reduce((s, p) => s + p.tipAmount, 0))
   if (tips <= 0) return "separate"
   if (totalPrice === null || amountDue === null) return "unknown"
   const collected = round2(totalPrice - amountDue)
   const gross = round2(payments.reduce((s, p) => s + p.amount, 0))
-  if (Math.abs(gross - collected) <= 0.011) return "separate"
-  if (Math.abs(round2(gross - tips) - collected) <= 0.011) return "included"
+  if (totalContainsTip(totalPrice, doc) === true) {
+    if (near(gross, collected)) return "included"
+    if (near(round2(gross + tips), collected)) return "separate"
+    return "unknown"
+  }
+  if (near(gross, collected)) return "separate"
+  if (near(round2(gross - tips), collected)) return "included"
   return "unknown"
-}
-
-export type PaymentMethodClass = {
-  /** Display label: Cash, Check, Zelle, Venmo, Cash App, Bank transfer, Card, Financing. */
-  label: string
-  isCard: boolean
-  /** False when the text is not a method we can place on the card / non-card side. */
-  known: boolean
-}
-
-/**
- * Methods Workiz lets a user log: the `addPayment` enum (cash / credit / check), Workiz Pay
- * card + ACH, and the offline list from "Collecting cash and other offline payments"
- * (Cash, Check, Credit (offline), Bank transfer, Cash App, Venmo, Zelle). Order matters:
- * "Cash App" must win over "Cash". Anything else is unknown and holds the payout.
- */
-const KNOWN_METHODS: ReadonlyArray<readonly [RegExp, string, boolean]> = [
-  [/credit|card|visa|master|amex|discover|stripe|workiz\s*pay|^cc$/i, "Card", true],
-  [/cash\s*app/i, "Cash App", false],
-  [/check|cheque/i, "Check", false],
-  [/cash/i, "Cash", false],
-  [/zelle/i, "Zelle", false],
-  [/venmo/i, "Venmo", false],
-  [/ach|bank|wire/i, "Bank transfer", false],
-]
-
-/** Methods an admin may confirm by hand; mirrors what the Workiz Payments tab can show. */
-export const MANUAL_PAYMENT_METHODS = ["Cash", "Check", "Zelle", "Venmo", "Cash App", "Bank transfer", "Card"] as const
-export type ManualPaymentMethod = (typeof MANUAL_PAYMENT_METHODS)[number]
-
-export function classifyPaymentMethod(method: string | null | undefined, cardKeywords: readonly string[] = []): PaymentMethodClass {
-  const m = (method ?? "").trim()
-  if (!m) return { label: "Unknown method", isCard: false, known: false }
-  const lower = m.toLowerCase()
-  if (cardKeywords.some((k) => k.trim() && lower.includes(k.trim().toLowerCase()))) return { label: "Card", isCard: true, known: true }
-  for (const [re, label, isCard] of KNOWN_METHODS) if (re.test(m)) return { label, isCard, known: true }
-  return { label: m.charAt(0).toUpperCase() + m.slice(1), isCard: false, known: false }
 }
 
 const num = (v: unknown): number => {
@@ -137,17 +145,22 @@ export type InvoiceWebhookPayments = {
 export type DocumentWebhookPayments = InvoiceWebhookPayments
 
 /**
- * Pull the payment records out of an `invoice_*` or `estimate_*` webhook `data` object. Returns
- * null when the payload has no `payments` array at all (so "not included" stays distinct from
- * "empty"). Estimates are how deposits reach us: a client paying a deposit online pays it on the
- * estimate, weeks before the job is done, and that record never appears on the job payload.
+ * Pull the payment records out of a webhook `data` object: an invoice, an estimate, or the job
+ * itself (live `job_status_*` events repeat the job's payments). Returns null when the payload
+ * has no `payments` array at all (so "not included" stays distinct from "empty"). Estimates are
+ * how deposits reach us: a client paying a deposit online pays it on the estimate, weeks before
+ * the job is done.
+ *
+ * Every record is kept with the method exactly as Workiz sent it; failed and refunded records
+ * are kept too (for troubleshooting) and left out when the job is calculated.
  */
 export function extractDocumentPayments(data: Record<string, unknown> | null | undefined, receivedAt?: string | null, kind: DocumentKind = "invoice"): InvoiceWebhookPayments | null {
   if (!data) return null
   const list = pick(data, "payments", "Payments")
   if (!Array.isArray(list)) return null
-  const documentId = str(pick(data, "id", "invoiceId", "invoice_id", "estimateId", "estimate_id"))
-  const source: PaymentSource = kind === "estimate" ? "estimate-webhook" : "invoice-webhook"
+  // A job's own id is not a document id; only invoices and estimates have one worth keeping.
+  const documentId = kind === "job" ? null : str(pick(data, "id", "invoiceId", "invoice_id", "estimateId", "estimate_id"))
+  const source = DOCUMENT_SOURCE[kind]
   const payments: ExternalPaymentInput[] = []
   for (const entry of list) {
     if (!entry || typeof entry !== "object") continue
@@ -155,32 +168,47 @@ export function extractDocumentPayments(data: Record<string, unknown> | null | u
     const amount = round2(num(pick(r, "amount", "Amount", "total", "Total")))
     if (amount <= 0) continue
     const explicitDate = str(pick(r, "date", "Date", "paidAt", "paid_at", "createdAt", "created_at", "created", "timestamp"))
+    const tipAmount = round2(Math.max(0, num(pick(r, "tipAmount", "tip_amount", "tip", "Tip"))))
+    const method = resolvePaymentMethod(r).original
+    const id = str(pick(r, "id", "Id", "ID", "paymentId", "payment_id"))
     payments.push({
-      externalId: str(pick(r, "id", "Id", "ID", "paymentId", "payment_id")),
+      // Without Workiz's id, a record that states its own date is still the same record every
+      // time it is repeated; one with neither cannot be told apart from a second payment.
+      externalId: id ?? (explicitDate ? `no-id:${explicitDate}|${amount.toFixed(2)}|${tipAmount.toFixed(2)}` : null),
       source,
-      method: str(pick(r, "type", "Type", "method", "Method", "paymentMethod", "payment_method")) ?? "",
+      method,
       amount,
-      tipAmount: round2(Math.max(0, num(pick(r, "tipAmount", "tip_amount", "tip", "Tip")))),
+      tipAmount,
       paidAt: explicitDate ?? receivedAt ?? null,
       paidAtFromPayload: explicitDate !== null,
       invoiceId: documentId,
-      reference: str(pick(r, "reference", "Reference", "confirmation")),
+      reference: str(pick(r, "reference", "Reference", "confirmation", "confirmationCode")),
       recordedBy: null,
       raw: r,
     })
   }
-  // Invoices report `totalPrice`; estimates report `total`. Both report `amountDue` when they know it.
-  const total = pick(data, "totalPrice", "total_price", "total", "Total")
-  const due = pick(data, "amountDue", "amount_due")
-  const invoiceTotal = total === undefined ? null : round2(num(total))
-  const amountDue = due === undefined ? null : round2(num(due))
+  // Invoices and jobs report `totalPrice`; estimates report `total`. All report `amountDue` when they know it.
+  const optional = (...keys: string[]) => {
+    const value = pick(data, ...keys)
+    return value === undefined ? null : round2(num(value))
+  }
+  const invoiceTotal = optional("totalPrice", "total_price", "total", "Total")
+  const amountDue = optional("amountDue", "amount_due")
+  // Refunded or failed records are not money collected, so they take no part in the totals check.
+  const received = payments.filter((p) => paymentOutcome(p.raw as Record<string, unknown>) === "received")
   return {
     kind,
     invoiceId: documentId,
-    jobId: str(pick(data, "jobId", "job_id", "jobID")),
+    jobId: kind === "job" ? null : str(pick(data, "jobId", "job_id", "jobID")),
     invoiceTotal,
     amountDue,
-    tipInclusion: inferTipInclusion(payments, invoiceTotal, amountDue),
+    tipInclusion: inferTipInclusion(received, invoiceTotal, amountDue, {
+      subTotal: optional("subTotal", "sub_total"),
+      discountAmount: optional("discountAmount", "discount_amount"),
+      taxAmount: optional("taxAmount", "tax_amount"),
+      serviceFeeAmount: optional("serviceFeeAmount", "service_fee_amount"),
+      tipAmount: optional("tipAmount", "tip_amount"),
+    }),
     payments,
   }
 }
@@ -202,34 +230,115 @@ export function tipInclusionOfRow(raw: unknown): TipInclusion {
   return v === "included" || v === "unknown" ? v : "separate"
 }
 
-export function externalRowsToPayments(rows: ReadonlyArray<Pick<JobPaymentRow, "id" | "externalId" | "source" | "method" | "amount" | "tipAmount" | "paidAt" | "recordedBy"> & Partial<Pick<JobPaymentRow, "raw">>>, cardKeywords: readonly string[]): NormalizedPayment[] {
-  const out: NormalizedPayment[] = []
-  const seen = new Set<string>()
+export type StoredPaymentRow = Pick<JobPaymentRow, "id" | "externalId" | "source" | "method" | "amount" | "tipAmount" | "paidAt" | "recordedBy"> & Partial<Pick<JobPaymentRow, "raw" | "paidAtFromPayload">>
+
+/** A Workiz record for money that came in and went back; never counted as a payment. */
+export type ReversedPayment = { amount: number; method: string; status: string | null }
+
+export type PaymentEvidence = {
+  /** The payments the job is calculated from: each one counted once. */
+  payments: NormalizedPayment[]
+  reversed: ReversedPayment[]
+  /** Workiz records left out because an admin's confirmation already covers the same money. */
+  supersededByConfirmation: number
+}
+
+type Candidate = { row: StoredPaymentRow; id: string; amount: number; tip: number; inclusion: TipInclusion }
+
+/** What the customer handed over in this transaction, tip included, as the Payments tab shows it. */
+const chargedAmount = (c: Candidate) => (c.inclusion === "separate" ? round2(c.amount + c.tip) : c.amount)
+
+/**
+ * Decide which stored records are the job's payments.
+ *   1. A failed charge is not a payment; a refunded or charged-back one is reported, not counted.
+ *   2. One Workiz payment is one record however many events repeated it: the same id, or the
+ *      same amount, tip and Workiz timestamp under a different id.
+ *   3. An admin's confirmation is a transcription of the same Payments tab. When it accounts
+ *      for at least as much money as the Workiz records, those records describe money already
+ *      counted; otherwise only the Workiz records it matches to the cent are left out.
+ */
+export function selectPaymentEvidence(rows: ReadonlyArray<StoredPaymentRow>, cardKeywords: readonly string[]): PaymentEvidence {
+  const reversed: ReversedPayment[] = []
+  const manual: Candidate[] = []
+  let workiz: Candidate[] = []
+  const seenIds = new Set<string>()
+  const seenTransactions = new Set<string>()
+
   for (const row of rows) {
     const amount = round2(num(row.amount))
     if (amount <= 0) continue
+    const isManual = row.source === "manual"
+    const record = row.raw && typeof row.raw === "object" ? (row.raw as Record<string, unknown>) : null
+    if (!isManual) {
+      const outcome = paymentOutcome(record)
+      if (outcome === "failed") continue
+      if (outcome === "reversed") {
+        reversed.push({ amount, method: row.method, status: str(record?.status) })
+        continue
+      }
+    }
     const id = row.externalId ?? `${row.source}:${row.id}`
-    if (seen.has(id)) continue
-    seen.add(id)
-    const cls = classifyPaymentMethod(row.method, cardKeywords)
-    const source = row.source as PaymentSource
-    const date = row.paidAt ? row.paidAt.toISOString() : null
-    const base = { id, method: row.method, isCard: cls.isCard, methodKnown: cls.known, source, date, recordedBy: row.recordedBy ?? null }
+    if (seenIds.has(id)) continue
+    seenIds.add(id)
     const tip = round2(num(row.tipAmount))
+    if (!isManual && row.paidAtFromPayload && row.paidAt) {
+      const transaction = `${row.paidAt.toISOString()}|${amount.toFixed(2)}|${tip.toFixed(2)}`
+      if (seenTransactions.has(transaction)) continue
+      seenTransactions.add(transaction)
+    }
+    const candidate: Candidate = { row, id, amount, tip, inclusion: tip > 0 ? tipInclusionOfRow(row.raw) : "separate" }
+    if (isManual) manual.push(candidate)
+    else workiz.push(candidate)
+  }
+
+  const reported = workiz.length
+  if (manual.length && workiz.length) {
+    const confirmed = round2(manual.reduce((s, c) => s + chargedAmount(c), 0))
+    const fromWorkiz = round2(workiz.reduce((s, c) => s + chargedAmount(c), 0))
+    if (confirmed + 0.05 >= fromWorkiz) {
+      workiz = []
+    } else {
+      const unmatched = [...workiz]
+      for (const entry of manual) {
+        const index = unmatched.findIndex((c) => Math.abs(chargedAmount(c) - chargedAmount(entry)) <= 0.005)
+        if (index >= 0) unmatched.splice(index, 1)
+      }
+      workiz = unmatched
+    }
+  }
+
+  const payments: NormalizedPayment[] = []
+  const ordered = [...workiz, ...manual].sort((a, b) => (a.row.paidAt?.getTime() ?? Number.MAX_SAFE_INTEGER) - (b.row.paidAt?.getTime() ?? Number.MAX_SAFE_INTEGER) || a.row.id - b.row.id)
+  for (const { row, id, amount, tip, inclusion } of ordered) {
+    const cls = classifyPaymentMethod(row.method, cardKeywords)
+    const base = {
+      id,
+      // `method` stays exactly what Workiz (or the admin) recorded; `methodLabel` is how it was read.
+      method: row.method,
+      methodLabel: cls.label,
+      isCard: cls.isCard,
+      methodKnown: cls.known,
+      source: row.source as PaymentSource,
+      date: row.paidAt ? row.paidAt.toISOString() : null,
+      recordedBy: row.recordedBy ?? null,
+    }
     if (tip <= 0) {
-      out.push({ ...base, amount, isTip: false })
+      payments.push({ ...base, amount, isTip: false })
       continue
     }
-    const inclusion = tipInclusionOfRow(row.raw)
     // "included": the amount already contains the tip, so the service part is the remainder
     //             (a payment that was entirely tip leaves no service row).
     // "separate": amount is the service payment and the tip is on top of it.
     // "unknown": kept as separate (the smaller card-fee base) but flagged so the payout is held.
     const service = inclusion === "included" ? round2(Math.max(0, amount - tip)) : amount
-    if (service > 0) out.push({ ...base, amount: service, isTip: false, tipAmbiguous: inclusion === "unknown" || undefined })
-    out.push({ ...base, id: `${id}:tip`, amount: tip, isTip: true, tipAmbiguous: inclusion === "unknown" || undefined })
+    if (service > 0) payments.push({ ...base, amount: service, isTip: false, tipAmbiguous: inclusion === "unknown" || undefined })
+    payments.push({ ...base, id: `${id}:tip`, amount: tip, isTip: true, tipAmbiguous: inclusion === "unknown" || undefined })
   }
-  return out
+  return { payments, reversed, supersededByConfirmation: reported - workiz.length }
+}
+
+export function externalRowsToPayments(rows: ReadonlyArray<StoredPaymentRow>, cardKeywords: readonly string[]): NormalizedPayment[] {
+  return selectPaymentEvidence(rows, cardKeywords).payments
 }
 
 /**
@@ -267,8 +376,11 @@ export function validateManualPayments(entries: ManualPaymentEntry[], invoiceTot
   if (entries.length === 0) return { ok: false, error: "Add at least one payment" }
   const cleaned: ManualPaymentEntry[] = []
   for (const e of entries) {
-    const method = (e.method ?? "").trim()
-    if (!MANUAL_PAYMENT_METHODS.includes(method as ManualPaymentMethod)) return { ok: false, error: `"${method || "blank"}" is not a payment method Workiz records; choose ${MANUAL_PAYMENT_METHODS.join(", ")}` }
+    const typed = (e.method ?? "").trim()
+    // "Charge", "Credit" and the older "Card" option are all stored as Credit Card.
+    const recognised = classifyPaymentMethod(typed)
+    if (!recognised.known || !MANUAL_PAYMENT_METHODS.includes(recognised.label as ManualPaymentMethod)) return { ok: false, error: `"${typed || "blank"}" is not a payment method Workiz records; choose ${MANUAL_PAYMENT_METHODS.join(", ")}` }
+    const method = recognised.label
     const amount = round2(num(e.amount))
     if (!(amount > 0)) return { ok: false, error: "Each payment amount must be greater than zero" }
     const tipAmount = round2(num(e.tipAmount ?? 0))

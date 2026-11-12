@@ -15,6 +15,8 @@ import {
   explainPayoutStatus,
   hasWorkizPaymentRecords,
   lineItemOwnership,
+  originalPaymentMethod,
+  paymentConfirmationNeeded,
   paymentMethodLabel,
   paymentMethodsSummary,
   paymentSourceLabel,
@@ -148,7 +150,15 @@ export function PayoutDetailSheet({
 }) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
-      <SheetContent side="right" className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl">
+      <SheetContent
+        side="right"
+        className="flex w-full flex-col gap-0 overflow-y-auto p-0 sm:max-w-2xl"
+        // The Method dropdown is a separate Radix layer; Escape must close it, not the panel
+        // (which would throw away what was typed into the payment form).
+        onEscapeKeyDown={(event) => {
+          if (document.querySelector('[role="listbox"]')) event.preventDefault()
+        }}
+      >
         {record && <PayoutDetail key={record.id} p={record} timezone={timezone} pending={pending} handlers={handlers} />}
       </SheetContent>
     </Sheet>
@@ -186,11 +196,12 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
   const methods = paymentMethodsSummary(job?.payments)
   const paymentDates = Array.from(new Set(payments.map((x) => (x.date ? zonedDate(x.date, timezone) : null)).filter(Boolean) as string[]))
   const manualPayments = payments.filter((x) => x.source === "manual")
+  const workizPayments = payments.filter((x) => x.source !== "manual")
   const fromWorkiz = hasWorkizPaymentRecords(payments)
   // Offer the confirmation form only where it is the missing piece: an unpaid-to-tech payout
-  // whose payment type Workiz did not supply (or that an admin already transcribed).
-  const unpaidToTech = p.status === "pending" || p.status === "hold" || p.status === "ready"
-  const canConfirmPayments = Boolean(job) && unpaidToTech && !fromWorkiz && (p.status !== "ready" || manualPayments.length > 0)
+  // whose payments Workiz did not fully supply (or that an admin already transcribed).
+  const canConfirmPayments = paymentConfirmationNeeded({ status: p.status, holdReason: p.holdReason, hasJob: Boolean(job), payments })
+  const paymentSignature = (list: typeof payments) => list.map((x) => `${x.method}:${x.amount}:${x.isTip ? "tip" : "svc"}:${x.date ?? ""}`).join("|")
   const jobTotal = num(job?.jobTotal)
   const tax = job?.taxAmount == null ? null : num(job.taxAmount)
   // Workiz's own invoice figure (JobTotalPrice) includes tax/fees it does not itemize; fall back to service + known tax.
@@ -273,7 +284,21 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
         {notCalculated && <p className="text-xs text-muted-foreground">Workiz returned a zero service total for this job, so no commission could be calculated.</p>}
       </SheetHeader>
 
-      <div className="flex flex-col gap-6 p-5">
+      <div className="flex min-w-0 flex-col gap-6 p-4 sm:p-5">
+        {canConfirmPayments && (
+          <PaymentConfirmationForm
+            key={`${paymentSignature(manualPayments)}#${paymentSignature(workizPayments)}`}
+            jobUuid={p.jobUuid}
+            invoiceTotal={workizInvoiceTotal}
+            tipCandidate={unexplainedSurplus}
+            existing={manualPayments}
+            reported={workizPayments}
+            pending={pending}
+            onConfirm={paymentHandlers.onConfirmPayments}
+            onClear={paymentHandlers.onClearPayments}
+          />
+        )}
+
         {(mismatches.length > 0 || warnings.length > 0) && (
           <section aria-label="Warnings" className="flex flex-col gap-2 rounded-md border border-warning/50 bg-warning/10 p-3 text-sm">
             <p className="flex items-center gap-2 font-medium text-warning-foreground">
@@ -507,34 +532,51 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
 
         <Section title="Customer payments" hint="Job-level. These are what the customer paid the business, not what is owed to the technician.">
           {payments.length > 0 ? (
-            <div className="overflow-x-auto rounded-md border">
-              <Table>
-                <TableHeader>
-                  <TableRow>
-                    <TableHead>Date</TableHead>
-                    <TableHead>Method</TableHead>
-                    <TableHead>Type</TableHead>
-                    <TableHead className="text-right">Amount</TableHead>
-                    <TableHead>Status</TableHead>
-                  </TableRow>
-                </TableHeader>
-                <TableBody>
-                  {payments.map((pay, i) => (
-                    <TableRow key={`${pay.id ?? "pay"}-${i}`}>
-                      <TableCell className="text-sm">{pay.date ? zonedDateTime(pay.date, timezone) : <span className="text-muted-foreground">No date</span>}</TableCell>
-                      <TableCell className="whitespace-normal text-sm">
-                        {paymentMethodLabel(pay.method, pay.isCard)}
-                        {pay.method && paymentMethodLabel(pay.method, pay.isCard).toLowerCase() !== pay.method.toLowerCase() ? <span className="ml-1 text-xs text-muted-foreground">({pay.method})</span> : null}
-                        {pay.methodKnown === false && <span className="ml-1 text-xs text-destructive">not recognised</span>}
-                      </TableCell>
-                      <TableCell className="text-sm">{pay.isTip ? "Tip" : "Service"}</TableCell>
-                      <TableCell className="text-right tabular-nums">{money(pay.amount)}</TableCell>
-                      <TableCell className="whitespace-normal text-xs text-muted-foreground">{paymentSourceLabel(pay)}</TableCell>
+            <>
+              {/* Phones: one block per payment, nothing to scroll sideways. */}
+              <ul className="flex flex-col divide-y rounded-md border sm:hidden">
+                {payments.map((pay, i) => (
+                  <li key={`${pay.id ?? "pay"}-${i}`} className="flex flex-col gap-0.5 px-3 py-2 text-sm">
+                    <div className="flex items-baseline justify-between gap-3">
+                      <span className="min-w-0 font-medium">
+                        <PaymentMethodText pay={pay} />
+                      </span>
+                      <span className="shrink-0 tabular-nums">{money(pay.amount)}</span>
+                    </div>
+                    <span className="text-xs text-muted-foreground">
+                      {pay.isTip ? "Tip" : "Service"} · {pay.date ? zonedDateTime(pay.date, timezone) : "No date"}
+                    </span>
+                    <span className="text-xs text-muted-foreground">{paymentSourceLabel(pay)}</span>
+                  </li>
+                ))}
+              </ul>
+              <div className="hidden overflow-x-auto rounded-md border sm:block">
+                <Table>
+                  <TableHeader>
+                    <TableRow>
+                      <TableHead>Date</TableHead>
+                      <TableHead>Method</TableHead>
+                      <TableHead>Type</TableHead>
+                      <TableHead className="text-right">Amount</TableHead>
+                      <TableHead>Status</TableHead>
                     </TableRow>
-                  ))}
-                </TableBody>
-              </Table>
-            </div>
+                  </TableHeader>
+                  <TableBody>
+                    {payments.map((pay, i) => (
+                      <TableRow key={`${pay.id ?? "pay"}-${i}`}>
+                        <TableCell className="text-sm">{pay.date ? zonedDateTime(pay.date, timezone) : <span className="text-muted-foreground">No date</span>}</TableCell>
+                        <TableCell className="whitespace-normal text-sm">
+                          <PaymentMethodText pay={pay} />
+                        </TableCell>
+                        <TableCell className="text-sm">{pay.isTip ? "Tip" : "Service"}</TableCell>
+                        <TableCell className="text-right tabular-nums">{money(pay.amount)}</TableCell>
+                        <TableCell className="whitespace-normal text-xs text-muted-foreground">{paymentSourceLabel(pay)}</TableCell>
+                      </TableRow>
+                    ))}
+                  </TableBody>
+                </Table>
+              </div>
+            </>
           ) : (
             <div className="flex flex-col gap-1 text-sm">
               <p className="font-medium">{PAYMENT_DETAILS_UNAVAILABLE}</p>
@@ -544,18 +586,6 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
                   : "Workiz returned neither payment records nor a balance for this job."}
               </p>
             </div>
-          )}
-          {canConfirmPayments && (
-            <PaymentConfirmationForm
-              key={manualPayments.map((x) => `${x.method}:${x.amount}:${x.isTip ? "tip" : "svc"}:${x.date ?? ""}`).join("|")}
-              jobUuid={p.jobUuid}
-              invoiceTotal={workizInvoiceTotal}
-              tipCandidate={unexplainedSurplus}
-              existing={manualPayments}
-              pending={pending}
-              onConfirm={paymentHandlers.onConfirmPayments}
-              onClear={paymentHandlers.onClearPayments}
-            />
           )}
           <Facts
             rows={[
@@ -643,6 +673,18 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
         </Section>
       </div>
     </div>
+  )
+}
+
+/** "Credit Card" with what Workiz actually sent beside it, so a misread label can be traced. */
+function PaymentMethodText({ pay }: { pay: NonNullable<PayoutRecord["job"]>["payments"][number] }) {
+  const original = originalPaymentMethod(pay)
+  return (
+    <>
+      {paymentMethodLabel(pay.method, pay.isCard)}
+      {original && <span className="ml-1 text-xs font-normal text-muted-foreground">(Workiz: {original})</span>}
+      {pay.methodKnown === false && <span className="ml-1 text-xs font-normal text-warning-foreground">not recognised</span>}
+    </>
   )
 }
 

@@ -1,13 +1,14 @@
 import { and, eq, inArray, sql } from "drizzle-orm"
 import { db } from "@/lib/db"
-import { appSettings, colorSealItems, jobPayments, payouts, syncEvents, workizJobs, workizTeamMappings, type NormalizedPayment } from "@/lib/db/schema"
+import { appSettings, colorSealItems, jobPayments, payouts, syncEvents, webhookEvents, workizJobs, workizTeamMappings } from "@/lib/db/schema"
 import { upsertPayoutsForJob, type EngineResult } from "@/lib/payout/engine"
 import { getPayoutSettings, getWorkizSettings, type WorkizSettings } from "@/lib/settings"
 import { WorkizApiError, WorkizClient, type WorkizRawJob } from "./client"
 import { bumpWebhookEventAttempt, markWebhookEvent, pendingUnresolvedEvents, rememberJobIds, resolveJobUuid } from "./events"
 import { compareListing } from "./listing-diff"
 import { normalizeJob, type ColorSealCatalog, type NormalizedJob } from "./normalize"
-import { TIP_INCLUSION_RAW_KEY, externalRowsToPayments, type ExternalPaymentInput, type InvoiceWebhookPayments, type ManualPaymentEntry, type TipInclusion } from "./payments"
+import { TIP_INCLUSION_RAW_KEY, selectPaymentEvidence, tipInclusionOfRow, type ExternalPaymentInput, type InvoiceWebhookPayments, type ManualPaymentEntry, type PaymentEvidence, type TipInclusion } from "./payments"
+import { parseWorkizDate } from "./time"
 import { parseWebhookBody, type ParsedWebhook } from "./webhook"
 
 export type SyncSource = "rest" | "webhook"
@@ -102,32 +103,55 @@ export async function loadColorSealCatalog(): Promise<ColorSealCatalog> {
 
 // --- Payment records the job payload never carries -----------------------------
 
-/** Stored webhook and admin-confirmed payments for a job, in normalizer shape. */
-export async function loadExternalPayments(jobUuid: string, settings: WorkizSettings): Promise<NormalizedPayment[]> {
+/** Stored webhook and admin-confirmed payments for a job: each payment once, reversals set aside. */
+export async function loadExternalPayments(jobUuid: string, settings: WorkizSettings): Promise<PaymentEvidence> {
   const rows = await db.select().from(jobPayments).where(eq(jobPayments.jobUuid, jobUuid)).orderBy(jobPayments.paidAt, jobPayments.id)
-  return externalRowsToPayments(rows, settings.cardMethodKeywords)
+  return selectPaymentEvidence(rows, settings.cardMethodKeywords)
 }
 
+const sameInstant = (a: Date | null, b: Date | null) => (a?.getTime() ?? null) === (b?.getTime() ?? null)
+
 /**
- * Persist payments delivered by an invoice or estimate webhook. Keyed by Workiz's payment id
- * ("PAY-…"), so a retried or duplicated webhook updates the same row instead of doubling the
- * paid total. Live payloads carry no per-payment date, so `paidAt` is the arrival time of the
- * FIRST event that mentioned the payment and is never moved forward by a later re-delivery
- * (the Sep 15 deposit must still read Sep 15 when the Sep 23 invoice event repeats it).
- * Records without an id cannot be de-duplicated safely and are skipped with a log entry.
+ * Persist payments delivered by a Workiz webhook (invoice, estimate or job event). Keyed by
+ * Workiz's payment id ("PAY-…"), so a retried or repeated event updates the same row instead of
+ * doubling the paid total, and a record that already matches is left untouched. Workiz states a
+ * payment's own date as a wall-clock time in the business timezone; when an older payload has
+ * none, `paidAt` is the arrival time of the FIRST event that mentioned the payment and is never
+ * moved forward by a later re-delivery (the Sep 15 deposit must still read Sep 15 when the
+ * Sep 23 invoice event repeats it). Records with neither an id nor a date cannot be
+ * de-duplicated safely and are skipped with a log entry.
  */
-export async function recordExternalPayments(jobUuid: string, inputs: ExternalPaymentInput[], opts: { tipInclusion?: TipInclusion } = {}): Promise<{ stored: number; skipped: number }> {
+export async function recordExternalPayments(jobUuid: string, inputs: ExternalPaymentInput[], opts: { tipInclusion?: TipInclusion; timeZone?: string; quiet?: boolean } = {}): Promise<{ stored: number; skipped: number; unchanged: number }> {
   let stored = 0
   let skipped = 0
+  let unchanged = 0
+  if (inputs.length === 0) return { stored, skipped, unchanged }
+  const timeZone = opts.timeZone ?? (await getWorkizSettings()).businessTimezone
+  const tipInclusion = opts.tipInclusion ?? "separate"
+  const existing = new Map(
+    (await db.select().from(jobPayments).where(and(eq(jobPayments.jobUuid, jobUuid), sql`${jobPayments.externalId} is not null`))).map((row) => [row.externalId as string, row]),
+  )
   for (const p of inputs) {
     if (!p.externalId) {
       skipped++
       continue
     }
     const now = new Date()
-    let paidAt = p.paidAt ? new Date(p.paidAt) : null
-    if (paidAt && Number.isNaN(paidAt.getTime())) paidAt = null
-    const raw = { ...((p.raw as object) ?? {}), [TIP_INCLUSION_RAW_KEY]: opts.tipInclusion ?? "separate" }
+    const paidAt = p.paidAt ? (p.paidAtFromPayload ? parseWorkizDate(p.paidAt, timeZone) : parseWorkizDate(p.paidAt, "UTC")) : null
+    const raw = { ...((p.raw as object) ?? {}), [TIP_INCLUSION_RAW_KEY]: tipInclusion }
+    const current = existing.get(p.externalId)
+    if (
+      current &&
+      current.method === p.method &&
+      Number(current.amount) === p.amount &&
+      Number(current.tipAmount) === p.tipAmount &&
+      tipInclusionOfRow(current.raw) === tipInclusion &&
+      String((current.raw as { status?: unknown } | null)?.status ?? "") === String((raw as { status?: unknown }).status ?? "") &&
+      (!p.paidAtFromPayload || (current.paidAtFromPayload && sameInstant(current.paidAt, paidAt)))
+    ) {
+      unchanged++
+      continue
+    }
     const values = {
       jobUuid,
       externalId: p.externalId,
@@ -164,8 +188,38 @@ export async function recordExternalPayments(jobUuid: string, inputs: ExternalPa
       })
     stored++
   }
-  if (skipped) await logSyncEvent("payments", { jobUuid, ok: false, summary: `${skipped} webhook payment record(s) had no id and were not stored`, details: { skipped } })
-  return { stored, skipped }
+  if (skipped && !opts.quiet) await logSyncEvent("payments", { jobUuid, ok: false, summary: `${skipped} webhook payment record(s) had neither an id nor a date and were not stored`, details: { skipped } })
+  return { stored, skipped, unchanged }
+}
+
+/**
+ * Bring `job_payments` in line with every Workiz event stored for the job, oldest first, so the
+ * latest event has the last word. The events are the evidence; the payment rows are how it was
+ * read. Running this each time a job is processed means a job whose events arrived before the
+ * app could read them (job events' payments, the "charge" card label, tips inside the total)
+ * corrects itself on its next sync, and nothing is written when the rows already agree.
+ */
+export async function applyStoredPaymentEvidence(jobUuid: string, settings: WorkizSettings): Promise<{ events: number; stored: number }> {
+  const events = await db
+    .select({ id: webhookEvents.id, payload: webhookEvents.payload })
+    .from(webhookEvents)
+    .where(and(eq(webhookEvents.jobUuid, jobUuid), inArray(webhookEvents.kind, ["job", "invoice", "estimate"])))
+    .orderBy(webhookEvents.id)
+  let used = 0
+  let stored = 0
+  for (const event of events) {
+    const parsed = parseWebhookBody(event.payload)
+    if (!parsed.invoice || parsed.invoice.payments.length === 0) continue
+    // An event that names a different job is never applied to this one.
+    if (parsed.uuidCandidates.length > 0 && !parsed.uuidCandidates.includes(jobUuid)) continue
+    used++
+    const result = await recordExternalPayments(jobUuid, parsed.invoice.payments, { tipInclusion: parsed.invoice.tipInclusion, timeZone: settings.businessTimezone, quiet: true })
+    stored += result.stored
+  }
+  if (stored) {
+    await logSyncEvent("payments", { jobUuid, ok: true, summary: `Re-read ${used} stored Workiz event(s): ${stored} payment record(s) added or corrected`, details: { events: used, stored } })
+  }
+  return { events: used, stored }
 }
 
 /**
@@ -270,8 +324,9 @@ export async function processRawJob(raw: WorkizRawJob, source: SyncSource, ctx?:
   // The job payload has no payment records; merge whatever a webhook or an admin has
   // recorded for this job so a re-fetch never erases the known payment type.
   const uuid = typeof raw.UUID === "string" ? raw.UUID : null
-  const externalPayments = uuid ? await loadExternalPayments(uuid, settings) : []
-  const normalized = normalizeJob(raw, settings, catalog, { externalPayments })
+  if (uuid) await applyStoredPaymentEvidence(uuid, settings)
+  const evidence = uuid ? await loadExternalPayments(uuid, settings) : null
+  const normalized = normalizeJob(raw, settings, catalog, { externalPayments: evidence?.payments ?? [], reversedPayments: evidence?.reversed ?? [] })
   await saveJobSnapshot(normalized, raw, source)
   const engine = await upsertPayoutsForJob(normalized, settings, source, { openingCutoff })
 
@@ -341,7 +396,7 @@ export async function syncDocumentWebhook(args: { parsed: Pick<ParsedWebhook, "u
     let stored = 0
     let skipped = 0
     if (invoice) {
-      ;({ stored, skipped } = await recordExternalPayments(raw.UUID, invoice.payments, { tipInclusion: invoice.tipInclusion }))
+      ;({ stored, skipped } = await recordExternalPayments(raw.UUID, invoice.payments, { tipInclusion: invoice.tipInclusion, timeZone: settings.businessTimezone }))
       await logSyncEvent("payments", {
         jobUuid: raw.UUID,
         ok: true,

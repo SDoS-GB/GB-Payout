@@ -109,6 +109,36 @@ export function selectedTotal(selection: DueSelection, jobs: readonly DueSelecta
   return cents / 100
 }
 
+export type DueTotals = {
+  /** What the next PAID clicks would record: the ticked payouts of every technician. */
+  selectedTotal: number
+  selectedCount: number
+  /** Everything currently due, ticked or not. */
+  dueTotal: number
+  jobCount: number
+}
+
+/**
+ * The figure at the top of the Due page. It is the sum of the same per-technician selected
+ * totals the PAID buttons record, added in whole cents, so the page total and the technicians'
+ * totals can never disagree by a rounding cent.
+ */
+export function dueTotals(technicians: ReadonlyArray<{ jobs: readonly DueSelectableJob[]; selection: DueSelection }>): DueTotals {
+  let selectedCents = 0
+  let dueCents = 0
+  let selectedCount = 0
+  let jobCount = 0
+  for (const { jobs, selection } of technicians) {
+    selectedCents += Math.round(selectedTotal(selection, jobs) * 100)
+    for (const job of jobs) {
+      dueCents += Math.round(job.amount * 100)
+      jobCount++
+      if (selection.ticked.has(job.id)) selectedCount++
+    }
+  }
+  return { selectedTotal: selectedCents / 100, selectedCount, dueTotal: dueCents / 100, jobCount }
+}
+
 /** The records (any shape carrying the payout id) that are currently ticked, in list order. */
 export function selectedJobs<T extends { id: number }>(selection: DueSelection, jobs: readonly T[]): T[] {
   return jobs.filter((j) => selection.ticked.has(j.id))

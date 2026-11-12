@@ -89,7 +89,7 @@ describe("job #924886: what Workiz's job API actually returns", () => {
   it("after the admin confirms $50 cash from the Workiz Payments tab, the hold clears and Daniel's 20% is $10.00 with no card fee", () => {
     const external = externalRowsToPayments([manualRow("Cash", 50)], settings.cardMethodKeywords)
     expect(external).toEqual([
-      { id: "manual:1", amount: 50, method: "Cash", isCard: false, methodKnown: true, isTip: false, source: "manual", date: "2026-09-21T17:55:00.000Z", recordedBy: "admin" },
+      { id: "manual:1", amount: 50, method: "Cash", methodLabel: "Cash", isCard: false, methodKnown: true, isTip: false, source: "manual", date: "2026-09-21T17:55:00.000Z", recordedBy: "admin" },
     ])
     const job = normalizeJob(LIVE_924886, settings, noCatalog, { externalPayments: external })
     expect(job.paidEvidence).toBe("payments")
@@ -123,16 +123,16 @@ describe("payment classification: manual cash/check/Zelle need no card fields", 
     expect(classifyPaymentMethod("Cash App")).toEqual({ label: "Cash App", isCard: false, known: true })
     expect(classifyPaymentMethod("Venmo")).toEqual({ label: "Venmo", isCard: false, known: true })
     expect(classifyPaymentMethod("Bank transfer (offline)")).toEqual({ label: "Bank transfer", isCard: false, known: true })
-    expect(classifyPaymentMethod("credit")).toEqual({ label: "Card", isCard: true, known: true })
-    expect(classifyPaymentMethod("Credit Card")).toEqual({ label: "Card", isCard: true, known: true })
-    expect(classifyPaymentMethod("Credit (offline)")).toEqual({ label: "Card", isCard: true, known: true })
+    expect(classifyPaymentMethod("credit")).toEqual({ label: "Credit Card", isCard: true, known: true })
+    expect(classifyPaymentMethod("Credit Card")).toEqual({ label: "Credit Card", isCard: true, known: true })
+    expect(classifyPaymentMethod("Credit (offline)")).toEqual({ label: "Credit Card", isCard: true, known: true })
     expect(classifyPaymentMethod("Wisetack")).toEqual({ label: "Wisetack", isCard: false, known: false })
     expect(classifyPaymentMethod("")).toEqual({ label: "Unknown method", isCard: false, known: false })
   })
 
   it("accepts a Workiz payment record that has only id, type and amount", () => {
     const payments = normalizePayments([{ id: "PAY-1", type: "Cash", amount: 50 }], settings)
-    expect(payments).toEqual([{ id: "PAY-1", amount: 50, method: "Cash", isCard: false, methodKnown: true, isTip: false, source: "workiz-job", date: null }])
+    expect(payments).toEqual([{ id: "PAY-1", amount: 50, method: "Cash", methodLabel: "Cash", isCard: false, methodKnown: true, isTip: false, source: "workiz-job", date: null }])
   })
 
   it("keeps an unknown method visible and holds the payout instead of treating it as cash", () => {
@@ -166,7 +166,7 @@ describe("card fee follows the payment split ($50 regular work, 20% technician)"
     expect(job.nonCardServiceAmount).toBe(30)
     expect(job.fullyPaid).toBe(true)
     expect(gateReason(job, settings)).toBeNull()
-    expect(paymentMethodsSummary(job.payments)).toEqual({ label: "Card + Check", mixed: true, count: 2 })
+    expect(paymentMethodsSummary(job.payments)).toEqual({ label: "Credit Card + Check", mixed: true, count: 2 })
     expect(toCents(payoutFor(job).totalPayout)).toBe(9.86)
   })
 })
@@ -305,7 +305,7 @@ describe("invoice webhooks carry the payment type", () => {
     expect(inferTipInclusion([{ amount: 100, tipAmount: 0 }], null, null)).toBe("separate")
   })
 
-  it("job events never carry payments", () => {
+  it("a job event without a payments array reports none; live job events that carry one are read (see workiz-card-labels.test.ts)", () => {
     expect(parseWebhookBody({ trigger: { type: "job_status_changed" }, data: { uuid: "CC6YKK", amountDue: 0 } }).invoice).toBeNull()
   })
 })

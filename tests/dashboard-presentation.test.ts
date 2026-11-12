@@ -43,7 +43,7 @@ describe("paymentMethodsSummary", () => {
       { id: "1", amount: 500, method: "Credit Card", isCard: true, isTip: false, date: "2026-09-10" },
       { id: "2", amount: 962.02, method: "Check", isCard: false, isTip: false, date: "2026-09-24" },
     ])
-    expect(summary).toEqual({ label: "Card + Check", mixed: true, count: 2 })
+    expect(summary).toEqual({ label: "Credit Card + Check", mixed: true, count: 2 })
   })
   it("ignores tip payments when service payments exist and reports empty lists honestly", () => {
     expect(paymentMethodsSummary([{ id: "1", amount: 100, method: "Zelle", isCard: false, isTip: false, date: null }, { id: "2", amount: 20, method: "Cash", isCard: false, isTip: true, date: null }]).label).toBe("Zelle")

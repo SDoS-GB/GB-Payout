@@ -32,7 +32,7 @@ describe("buildPayoutNote", () => {
       PAYOUT_NOTE_HEADER,
       "Pay Arthur $9.65 (total)",
       "Job #924886 - Grout Cleaning - Jane Doe",
-      "Paid $50.00 by Card on Sep 21, 2:45 PM",
+      "Paid $50.00 by Credit Card on Sep 21, 2:45 PM",
     ])
   })
 
@@ -47,7 +47,7 @@ describe("buildPayoutNote", () => {
       PAYOUT_NOTE_HEADER,
       "Pay Arthur $12.06 (total and tip included)",
       "Job #924886 - Grout Cleaning - Jane Doe",
-      "Paid $50.00 by Card on Sep 21, 2:45 PM",
+      "Paid $50.00 by Credit Card on Sep 21, 2:45 PM",
       "Tip $5.00",
     ])
   })
@@ -107,7 +107,7 @@ describe("buildPayoutNote", () => {
         ],
       }),
     )
-    expect(note).toContain("Paid $100.00: $60.00 Card + $40.00 Cash on Sep 21, 11:00 AM")
+    expect(note).toContain("Paid $100.00: $60.00 Credit Card + $40.00 Cash on Sep 21, 11:00 AM")
   })
 
   it("adds a plain tip line, marks only the techs whose total includes tip, and omits the line when there is no tip", () => {

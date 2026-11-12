@@ -15,9 +15,10 @@ import { extractDocumentPayments, type DocumentKind, type InvoiceWebhookPayments
  * are resolved through it. The optional "Auth key" Workiz asks for is sent verbatim as
  * `Authorization: Bearer <key>`.
  *
- * Invoice and estimate events are the only payloads that name the payment type
- * (`data.payments: [{ id, type: "Cash", amount, tipAmount }]`, live: type "Credit charge");
- * the job payload and the REST API never do, so those records are kept, not just used as a hint.
+ * Webhook events are the only place Workiz names the payment type. Invoice and estimate events
+ * carry `data.payments: [{ id, type, amount, tipAmount, status, date, … }]`, and so do live job
+ * events (`job_status_done`, verified 2026-11-12); a card payment's type is "charge" or "Credit
+ * charge". The REST API never returns them, so the records are kept, not just used as a hint.
  */
 
 export type WebhookEventKind = "job" | "invoice" | "estimate" | "self_test" | "ignored" | "unknown"
@@ -35,7 +36,7 @@ export type ParsedWebhook = {
   documentId: string | null
   serialId: string | null
   status: string | null
-  /** Payment records from an invoice/estimate event; null when the payload had no `payments` array. */
+  /** Payment records from an invoice, estimate or job event; null when the payload had no `payments` array. */
   invoice: InvoiceWebhookPayments | null
   /** Stable key for de-duplicating Workiz retries of the same event. */
   eventKey: string
@@ -96,7 +97,7 @@ export function parseWebhookBody(body: unknown, query?: URLSearchParams): Parsed
   const jobIdField = str(data?.jobId) ?? str(data?.job_id) ?? str(data?.jobID)
   const jobInternalId = kind === "job" ? (dataId && INTERNAL_JOB_ID.test(dataId) ? dataId : null) : jobIdField && INTERNAL_JOB_ID.test(jobIdField) ? jobIdField : null
   const documentId = dataId
-  const documentKind: DocumentKind | null = kind === "invoice" ? "invoice" : kind === "estimate" ? "estimate" : null
+  const documentKind: DocumentKind | null = kind === "invoice" || kind === "estimate" || kind === "job" ? kind : null
 
   const parsed: Omit<ParsedWebhook, "eventKey"> = {
     triggerType,
