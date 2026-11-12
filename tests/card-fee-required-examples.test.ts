@@ -301,10 +301,10 @@ describe("Method recognition from Workiz payment text", () => {
     ["Cash", "Cash", false],
     ["Zelle", "Zelle", false],
     ["Cash App", "Cash App", false],
-    ["credit", "Card", true],
-    ["Credit Card", "Card", true],
-    ["Visa ****1234", "Card", true],
-    ["Workiz Pay", "Card", true],
+    ["credit", "Credit Card", true],
+    ["Credit Card", "Credit Card", true],
+    ["Visa ****1234", "Credit Card", true],
+    ["Workiz Pay", "Credit Card", true],
   ])("%s -> %s (card: %s)", (text, label, isCard) => {
     const cls = classifyPaymentMethod(text, settings.cardMethodKeywords)
     expect(cls.known).toBe(true)

@@ -1,16 +1,17 @@
 "use client"
 
-import { useState } from "react"
+import { useEffect, useId, useRef, useState } from "react"
 import { Plus, Trash2 } from "lucide-react"
 import type { NormalizedPayment } from "@/lib/db/schema"
 import { Button } from "@/components/ui/button"
 import { Input } from "@/components/ui/input"
 import { Label } from "@/components/ui/label"
 import { Select, SelectContent, SelectItem, SelectTrigger, SelectValue } from "@/components/ui/select"
+import { confirmationSeedRows } from "@/lib/payout/payment-confirmation"
 import { MANUAL_PAYMENT_METHODS, type ManualPaymentEntry } from "@/lib/workiz/payments"
 import { InlineMessage, money } from "./shared"
 
-type Row = { key: number; method: string; amount: string; tip: string; paidAt: string }
+type Row = { key: number; method: string; amount: string; tip: string; paidAt: string; workizMethod: string | null }
 
 const round2 = (n: number) => Math.round(n * 100) / 100
 const parse = (s: string) => Number.parseFloat(s) || 0
@@ -25,37 +26,47 @@ function toLocalInput(iso: string | null): string {
 }
 
 /**
- * Stored manual records are split into a service row and a `<id>:tip` row; the form shows
- * them the way Workiz does — one charge with the tip inside it.
+ * On a phone the keyboard covers the lower half of the screen without resizing the page, so a
+ * field focused near the bottom of the panel would sit underneath it. Whenever a text field in
+ * the form takes focus, or the visible area changes while one has it, bring that field to the
+ * middle of what is left.
  */
-function rowsFromExisting(existing: NormalizedPayment[]): Row[] {
-  const tips = existing.filter((p) => p.isTip)
-  const paired = new Set<number>()
-  const rows: Row[] = existing
-    .filter((p) => !p.isTip)
-    .map((p, i) => {
-      const tipIndex = tips.findIndex((t, j) => !paired.has(j) && p.id !== null && t.id === `${p.id}:tip`)
-      const tip = tipIndex >= 0 ? tips[tipIndex].amount : 0
-      if (tipIndex >= 0) paired.add(tipIndex)
-      return { key: i, method: p.method, amount: round2(p.amount + tip).toFixed(2), tip: tip > 0 ? tip.toFixed(2) : "", paidAt: toLocalInput(p.date) }
-    })
-  tips.forEach((t, j) => {
-    // A payment that was entirely tip has no service row of its own.
-    if (!paired.has(j)) rows.push({ key: rows.length, method: t.method, amount: t.amount.toFixed(2), tip: t.amount.toFixed(2), paidAt: toLocalInput(t.date) })
-  })
-  return rows
+function useKeepFocusedFieldVisible(container: React.RefObject<HTMLElement | null>) {
+  useEffect(() => {
+    const reveal = () => {
+      const active = document.activeElement
+      if (active instanceof HTMLElement && active.matches("input, textarea") && container.current?.contains(active)) {
+        active.scrollIntoView({ block: "center", behavior: "smooth" })
+      }
+    }
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const afterKeyboard = () => {
+      clearTimeout(timer)
+      timer = setTimeout(reveal, 250)
+    }
+    const node = container.current
+    node?.addEventListener("focusin", afterKeyboard)
+    window.visualViewport?.addEventListener("resize", reveal)
+    return () => {
+      clearTimeout(timer)
+      node?.removeEventListener("focusin", afterKeyboard)
+      window.visualViewport?.removeEventListener("resize", reveal)
+    }
+  }, [container])
 }
 
 /**
- * Transcribe the Workiz Payments tab for a job whose payment type the API will not return.
- * The rows must add up to the Workiz invoice total; the server re-validates and re-runs the
- * normal sync, so this never bypasses the completion/paid/mapping gates.
+ * Transcribe the Workiz Payments tab for a job whose payments need a person: the API returned
+ * none, or one whose method the app does not recognise. Each payment is its own block with the
+ * Method first. The rows must add up to the Workiz invoice total; the server re-validates and
+ * re-runs the normal sync, so this never bypasses the completion/paid/mapping gates.
  */
 export function PaymentConfirmationForm({
   jobUuid,
   invoiceTotal,
   tipCandidate,
   existing,
+  reported,
   pending,
   onConfirm,
   onClear,
@@ -67,23 +78,46 @@ export function PaymentConfirmationForm({
   tipCandidate: number
   /** Admin-confirmed records already stored for this job (service and tip rows). */
   existing: NormalizedPayment[]
+  /** Payments Workiz itself reported, used to fill the form in when nothing is confirmed yet. */
+  reported: NormalizedPayment[]
   pending: boolean
   onConfirm: (jobUuid: string, entries: ManualPaymentEntry[]) => void
   onClear: (jobUuid: string) => void
 }) {
-  const seed: Row[] = existing.length
-    ? rowsFromExisting(existing)
-    : [{ key: 0, method: "", amount: invoiceTotal !== null && invoiceTotal > 0 ? invoiceTotal.toFixed(2) : "", tip: tipCandidate > 0.005 ? tipCandidate.toFixed(2) : "", paidAt: "" }]
-  const [rows, setRows] = useState<Row[]>(seed)
-  const [nextKey, setNextKey] = useState(seed.length)
+  const headingId = useId()
+  const formRef = useRef<HTMLElement>(null)
+  useKeepFocusedFieldVisible(formRef)
 
+  const [rows, setRows] = useState<Row[]>(() => {
+    const seeded = confirmationSeedRows(existing, reported)
+    if (seeded.length === 0) {
+      return [{ key: 0, method: "", amount: invoiceTotal !== null && invoiceTotal > 0 ? invoiceTotal.toFixed(2) : "", tip: tipCandidate > 0.005 ? tipCandidate.toFixed(2) : "", paidAt: "", workizMethod: null }]
+    }
+    return seeded.map((r, i) => ({ key: i, method: r.method, amount: r.amount.toFixed(2), tip: r.tip > 0 ? r.tip.toFixed(2) : "", paidAt: toLocalInput(r.paidAt), workizMethod: r.workizMethod }))
+  })
+  const [nextKey, setNextKey] = useState(rows.length)
+  // Which row's Method dropdown is open. Controlled so Escape can close the dropdown itself:
+  // the review panel swallows that key while a dropdown is open so it does not close instead,
+  // and its focus trap can leave the key outside the dropdown, hence the document listener.
+  const [openMethod, setOpenMethod] = useState<number | null>(null)
+  useEffect(() => {
+    if (openMethod === null) return
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (event.key === "Escape") setOpenMethod(null)
+    }
+    document.addEventListener("keydown", onKeyDown)
+    return () => document.removeEventListener("keydown", onKeyDown)
+  }, [openMethod])
+
+  const prefilledFromWorkiz = existing.length === 0 && reported.length > 0
   const sum = round2(rows.reduce((s, r) => s + parse(r.amount), 0))
   const tipSum = round2(rows.reduce((s, r) => s + parse(r.tip), 0))
   const mismatch = invoiceTotal !== null && invoiceTotal > 0 && Math.abs(sum - invoiceTotal) > 0.05
   const tipTooLarge = rows.some((r) => parse(r.tip) > parse(r.amount) + 0.005)
-  const incomplete = rows.some((r) => !r.method || !(parse(r.amount) > 0) || parse(r.tip) < 0)
+  const missingMethod = rows.filter((r) => !r.method).length
+  const incomplete = missingMethod > 0 || rows.some((r) => !(parse(r.amount) > 0) || parse(r.tip) < 0)
   // Tips already stored count toward the candidate; only a remaining gap needs the admin's attention.
-  const recordedTip = round2(existing.filter((p) => p.isTip).reduce((s, p) => s + p.amount, 0))
+  const recordedTip = round2((existing.length ? existing : reported).filter((p) => p.isTip).reduce((s, p) => s + p.amount, 0))
   const expectedTip = round2(tipCandidate + recordedTip)
   const tipGap = expectedTip > 0.005 && Math.abs(tipSum - expectedTip) > 0.05
 
@@ -91,7 +125,7 @@ export function PaymentConfirmationForm({
   const remove = (key: number) => setRows((prev) => (prev.length > 1 ? prev.filter((r) => r.key !== key) : prev))
   const add = () => {
     const remaining = invoiceTotal !== null ? round2(Math.max(0, invoiceTotal - sum)) : 0
-    setRows((prev) => [...prev, { key: nextKey, method: "", amount: remaining > 0 ? remaining.toFixed(2) : "", tip: "", paidAt: "" }])
+    setRows((prev) => [...prev, { key: nextKey, method: "", amount: remaining > 0 ? remaining.toFixed(2) : "", tip: "", paidAt: "", workizMethod: null }])
     setNextKey((k) => k + 1)
   }
   const submit = () => {
@@ -105,80 +139,117 @@ export function PaymentConfirmationForm({
   }
 
   return (
-    <div className="flex flex-col gap-3 rounded-md border border-dashed p-3">
-      <div className="flex flex-col gap-0.5">
-        <p className="text-sm font-medium">Confirm payments from Workiz</p>
-        <p className="text-xs text-muted-foreground">
-          Open the job&apos;s Payments tab in Workiz and copy each payment here exactly as shown, tip included. Put the tip in the Tip column of the payment it was added to. Only card payments (and card tips) get the 3.5% deduction; cash, check and Zelle do not. Nothing is assumed — leave the method blank and the payout stays on hold.
+    <section ref={formRef} aria-labelledby={headingId} className="flex flex-col gap-4 rounded-lg border bg-card p-3 sm:p-4">
+      <div className="flex flex-col gap-1">
+        <h3 id={headingId} className="text-base font-semibold">
+          Confirm payments from Workiz
+        </h3>
+        <p className="text-sm leading-relaxed text-muted-foreground">
+          {prefilledFromWorkiz
+            ? "Filled in from what Workiz reported. Choose the method wherever it is blank, check the rest against the job's Payments tab in Workiz, then confirm."
+            : "Open the job's Payments tab in Workiz and copy each payment here as shown, tip included."}{" "}
+          Only credit card payments (and tips paid by card) get the 3.5% deduction; cash, check and Zelle do not. A blank method is never guessed: the payout stays on hold until you choose one.
         </p>
       </div>
 
-      <div className="flex flex-col gap-2">
-        {rows.map((row, i) => (
-          <div key={row.key} className="grid grid-cols-[minmax(0,1fr)_minmax(0,6.5rem)_minmax(0,5.5rem)_minmax(0,1fr)_auto] items-end gap-2">
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-method-${row.key}`} className="text-xs">
-                Method
-              </Label>
-              <Select value={row.method || undefined} onValueChange={(v) => update(row.key, { method: v })}>
-                <SelectTrigger id={`pay-method-${row.key}`} aria-label={`Payment ${i + 1} method`}>
-                  <SelectValue placeholder="Choose method" />
-                </SelectTrigger>
-                <SelectContent>
-                  {MANUAL_PAYMENT_METHODS.map((m) => (
-                    <SelectItem key={m} value={m}>
-                      {m}
-                    </SelectItem>
-                  ))}
-                </SelectContent>
-              </Select>
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-amount-${row.key}`} className="text-xs">
-                Amount
-              </Label>
-              <Input id={`pay-amount-${row.key}`} inputMode="decimal" value={row.amount} onChange={(e) => update(row.key, { amount: e.target.value })} className="tabular-nums" aria-label={`Payment ${i + 1} amount`} />
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-tip-${row.key}`} className="text-xs">
-                Tip included
-              </Label>
-              <Input
-                id={`pay-tip-${row.key}`}
-                inputMode="decimal"
-                placeholder="0.00"
-                value={row.tip}
-                onChange={(e) => update(row.key, { tip: e.target.value })}
-                className="tabular-nums"
-                aria-label={`Payment ${i + 1} tip included in the amount`}
-                aria-invalid={parse(row.tip) > parse(row.amount) + 0.005 || undefined}
-              />
-            </div>
-            <div className="flex flex-col gap-1">
-              <Label htmlFor={`pay-date-${row.key}`} className="text-xs">
-                Paid on (optional)
-              </Label>
-              <Input id={`pay-date-${row.key}`} type="datetime-local" value={row.paidAt} onChange={(e) => update(row.key, { paidAt: e.target.value })} aria-label={`Payment ${i + 1} date`} />
-            </div>
-            <Button type="button" size="icon" variant="ghost" onClick={() => remove(row.key)} disabled={rows.length === 1 || pending} aria-label={`Remove payment ${i + 1}`}>
-              <Trash2 className="size-4" />
-            </Button>
-          </div>
-        ))}
-      </div>
+      <ol className="flex flex-col gap-3">
+        {rows.map((row, i) => {
+          const tipInvalid = parse(row.tip) > parse(row.amount) + 0.005
+          return (
+            <li key={row.key} className="flex flex-col gap-3 rounded-md border bg-background p-3">
+              <div className="flex min-h-11 items-center justify-between gap-2">
+                <p className="text-sm font-medium text-muted-foreground">
+                  Payment {i + 1}
+                  {rows.length > 1 ? ` of ${rows.length}` : ""}
+                </p>
+                {rows.length > 1 && (
+                  <Button type="button" size="icon" variant="ghost" onClick={() => remove(row.key)} disabled={pending} aria-label={`Remove payment ${i + 1}`} className="h-11 w-11 shrink-0">
+                    <Trash2 className="size-4" aria-hidden="true" />
+                  </Button>
+                )}
+              </div>
 
-      <div className="flex flex-wrap items-center justify-between gap-2 text-xs text-muted-foreground">
-        <Button type="button" size="sm" variant="outline" onClick={add} disabled={pending}>
-          <Plus className="size-3.5" />
+              <div className="flex flex-col gap-1.5">
+                <Label htmlFor={`pay-method-${row.key}`} className="text-sm font-semibold">
+                  Method
+                </Label>
+                <Select
+                  value={row.method || undefined}
+                  onValueChange={(v) => update(row.key, { method: v })}
+                  open={openMethod === row.key}
+                  onOpenChange={(isOpen) => setOpenMethod(isOpen ? row.key : null)}
+                  disabled={pending}
+                >
+                  <SelectTrigger
+                    id={`pay-method-${row.key}`}
+                    aria-label={`Payment ${i + 1} method`}
+                    className="h-12 w-full border-2 border-highlight-border bg-highlight px-3 text-base font-semibold text-highlight-foreground data-[placeholder]:text-highlight-foreground data-[size=default]:h-12 dark:bg-highlight dark:hover:bg-highlight [&_svg]:!text-highlight-foreground [&_svg]:!opacity-100"
+                  >
+                    <SelectValue placeholder="Choose method" />
+                  </SelectTrigger>
+                  <SelectContent position="popper" side="bottom" align="start" collisionPadding={12} className="z-[60]">
+                    {MANUAL_PAYMENT_METHODS.map((m) => (
+                      <SelectItem key={m} value={m} className="min-h-11 text-base">
+                        {m}
+                      </SelectItem>
+                    ))}
+                  </SelectContent>
+                </Select>
+                {row.workizMethod && (
+                  <p className="break-words text-xs text-muted-foreground">
+                    Workiz recorded this as &ldquo;{row.workizMethod}&rdquo;{row.method ? "" : ", which is not a method the app recognises"}.
+                  </p>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 gap-3 min-[400px]:grid-cols-2 sm:grid-cols-[minmax(0,1fr)_minmax(0,1fr)_minmax(0,1.4fr)]">
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <Label htmlFor={`pay-amount-${row.key}`} className="text-sm">
+                    Amount
+                  </Label>
+                  <Input id={`pay-amount-${row.key}`} inputMode="decimal" value={row.amount} onChange={(e) => update(row.key, { amount: e.target.value })} disabled={pending} className="h-11 tabular-nums" aria-label={`Payment ${i + 1} amount`} />
+                </div>
+                <div className="flex min-w-0 flex-col gap-1.5">
+                  <Label htmlFor={`pay-tip-${row.key}`} className="text-sm">
+                    Tip included
+                  </Label>
+                  <Input
+                    id={`pay-tip-${row.key}`}
+                    inputMode="decimal"
+                    placeholder="0.00"
+                    value={row.tip}
+                    onChange={(e) => update(row.key, { tip: e.target.value })}
+                    disabled={pending}
+                    className="h-11 tabular-nums"
+                    aria-label={`Payment ${i + 1} tip included in the amount`}
+                    aria-invalid={tipInvalid || undefined}
+                  />
+                </div>
+                <div className="flex min-w-0 flex-col gap-1.5 min-[400px]:col-span-2 sm:col-span-1">
+                  <Label htmlFor={`pay-date-${row.key}`} className="text-sm">
+                    Payment date <span className="font-normal text-muted-foreground">(optional)</span>
+                  </Label>
+                  <Input id={`pay-date-${row.key}`} type="datetime-local" value={row.paidAt} onChange={(e) => update(row.key, { paidAt: e.target.value })} disabled={pending} className="h-11 min-w-0" aria-label={`Payment ${i + 1} date`} />
+                </div>
+              </div>
+            </li>
+          )
+        })}
+      </ol>
+
+      <div className="flex flex-col gap-2 sm:flex-row sm:items-center sm:justify-between">
+        <Button type="button" variant="outline" onClick={add} disabled={pending} className="h-11 self-start">
+          <Plus className="size-4" aria-hidden="true" />
           Add another payment
         </Button>
-        <span className="tabular-nums">
+        <p className="text-sm tabular-nums text-muted-foreground" aria-live="polite">
           Entered {money(sum)}
           {invoiceTotal !== null && invoiceTotal > 0 ? ` of ${money(invoiceTotal)} Workiz total` : ""}
           {tipSum > 0 ? ` · ${money(tipSum)} of it tip` : ""}
-        </span>
+        </p>
       </div>
 
+      {missingMethod > 0 && <InlineMessage tone="info">{missingMethod === 1 ? "Choose the method for the payment that has none." : `Choose the method for the ${missingMethod} payments that have none.`}</InlineMessage>}
       {mismatch && <InlineMessage tone="error">The payments must add up to the Workiz total. Enter every payment shown on the Workiz Payments tab, tip included.</InlineMessage>}
       {tipTooLarge && <InlineMessage tone="error">A tip cannot be larger than the payment it is part of. Enter the amount as Workiz shows it (tip included) and the tip portion beside it.</InlineMessage>}
       {!mismatch && tipGap && (
@@ -187,16 +258,16 @@ export function PaymentConfirmationForm({
         </InlineMessage>
       )}
 
-      <div className="flex flex-wrap gap-2">
-        <Button type="button" size="sm" onClick={submit} disabled={pending || incomplete || mismatch || tipTooLarge}>
+      <div className="flex flex-col gap-2 sm:flex-row sm:flex-wrap">
+        <Button type="button" onClick={submit} disabled={pending || incomplete || mismatch || tipTooLarge} className="h-11">
           {existing.length ? "Update confirmation & re-sync" : "Confirm payments & re-sync"}
         </Button>
         {existing.length > 0 && (
-          <Button type="button" size="sm" variant="ghost" onClick={() => onClear(jobUuid)} disabled={pending}>
+          <Button type="button" variant="ghost" onClick={() => onClear(jobUuid)} disabled={pending} className="h-11">
             Clear confirmation
           </Button>
         )}
       </div>
-    </div>
+    </section>
   )
 }

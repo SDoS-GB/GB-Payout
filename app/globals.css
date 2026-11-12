@@ -32,6 +32,10 @@
   --success-foreground: #2f5a5e;
   --warning: #f58466;
   --warning-foreground: #8f3418;
+  /* The one field the owner must not miss (payment method): yellow with near-black text. */
+  --highlight: #ffe45c;
+  --highlight-foreground: #1f1a00;
+  --highlight-border: #b89600;
   --border: #c6dadc;
   --input: #c6dadc;
   --ring: #73afb7;
@@ -72,6 +76,9 @@
   --success-foreground: #a9d3d8;
   --warning: #f58466;
   --warning-foreground: #ffb59e;
+  --highlight: #ffe45c;
+  --highlight-foreground: #1f1a00;
+  --highlight-border: #ffe45c;
   --border: #27474b;
   --input: #27474b;
   --ring: #73afb7;
@@ -113,6 +120,9 @@
   --color-success-foreground: var(--success-foreground);
   --color-warning: var(--warning);
   --color-warning-foreground: var(--warning-foreground);
+  --color-highlight: var(--highlight);
+  --color-highlight-foreground: var(--highlight-foreground);
+  --color-highlight-border: var(--highlight-border);
   --color-border: var(--border);
   --color-input: var(--input);
   --color-ring: var(--ring);
