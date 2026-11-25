@@ -515,7 +515,7 @@ function PayoutDetail({ p, timezone, pending, handlers }: { p: PayoutRecord; tim
                 ? [
                     "Tip recipients",
                     tips.recipients?.length
-                      ? `${tips.recipients.map((r) => r.name).join(", ")} · ${pct(tips.share ?? 0)} each${tips.excluded?.length ? ` · ${tips.excluded.map((e) => e.name).join(", ")}: none` : ""}`
+                      ? `${tips.recipients.map((r) => r.name).join(", ")} · ${tips.recipients.length === 1 ? `${pct(tips.share ?? 0)} of the tip` : `${pct(tips.share ?? 0)} each`}${tips.excluded?.length ? ` · ${tips.excluded.map((e) => e.name).join(", ")}: none` : ""}`
                       : tips.needsReview ?? "Nobody eligible · needs review",
                   ]
                 : null,

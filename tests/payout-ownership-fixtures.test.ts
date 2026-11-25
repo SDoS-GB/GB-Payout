@@ -312,6 +312,132 @@ describe("Fixture 3: shared job ($600 regular + $200 crew color + $200 *T* items
     expect(plan.segmentFor.get(ARTHUR.id)!.jobTotal).toBe(800)
   })
 
+  it("a sole mapped Tim on a Workiz `T`-tagged job receives 100% of a card tip after the 3.5% fee, not his 80% service rate", () => {
+    const job = normalizeJob(
+      {
+        UUID: "FIX-TIM-TAG-CARD-TIP",
+        Status: "Done",
+        JobType: "Work",
+        Tags: ["  t  "],
+        Team: [TEAM.tim],
+        SubTotal: 1000,
+        JobTotalPrice: 1100,
+        JobAmountDue: 0,
+        LineItems: [{ Name: "Shower restoration", Price: 1000, Quantity: 1, Type: "service" }],
+        Payments: [
+          { id: "tim-service", Amount: 1000, Method: "Check" },
+          { id: "tim-card-tip", Amount: 100, Method: "Charge", IsTip: true },
+        ],
+      },
+      settings,
+      noCatalog,
+    )
+    // `onJob` consists only of the profile matched from Workiz's Team id mapping.
+    const plan = planSegments(job, [TIM], ROSTER)
+    expect(job.tags).toEqual(["  t  "])
+    expect(plan.tips.recipients).toEqual([{ id: TIM.id, name: "Tim" }])
+    expect(plan.tips.share).toBe(1)
+    expect(plan.tipShareFor.get(TIM.id)).toBe(1)
+    expect(plan.tips.needsReview).toBeNull()
+    const payout = payoutFor(job, plan, TIM)
+    expect(payout.tipPayout).toBe(96.5)
+    expect(payout.basePayout).toBe(800)
+    expect(payout.totalPayout).toBe(896.5)
+    expect(payout.cardTipPayout).toBe(96.5)
+    expect(payout.nonCardTipPayout).toBe(0)
+  })
+
+  it.each(["Cash", "Check", "Zelle"])("a sole mapped Tim on a T-tagged job receives the full $100 %s tip", (method) => {
+    const job = normalizeJob(
+      {
+        UUID: `FIX-TIM-TAG-${method}`,
+        Status: "Done",
+        JobType: "Work",
+        Tags: ["T"],
+        Team: [TEAM.tim],
+        SubTotal: 1000,
+        JobTotalPrice: 1100,
+        JobAmountDue: 0,
+        LineItems: [{ Name: "Shower restoration", Price: 1000, Quantity: 1, Type: "service" }],
+        Payments: [
+          { id: "tim-service", Amount: 1000, Method: "Check" },
+          { id: "tim-tip", Amount: 100, Method: method, IsTip: true },
+        ],
+      },
+      settings,
+      noCatalog,
+    )
+    const plan = planSegments(job, [TIM], ROSTER)
+    expect(plan.tipShareFor.get(TIM.id)).toBe(1)
+    const payout = payoutFor(job, plan, TIM)
+    expect(payout.tipPayout).toBe(100)
+    expect(payout.basePayout).toBe(800)
+    expect(payout.totalPayout).toBe(900)
+  })
+
+  it("a mixed card/check tip for sole Tim uses the existing fee only on the card-funded portion", () => {
+    const job = normalizeJob(
+      {
+        UUID: "FIX-TIM-TAG-MIXED-TIP",
+        Status: "Done",
+        JobType: "Work",
+        Tags: ["T"],
+        Team: [TEAM.tim],
+        SubTotal: 1000,
+        JobTotalPrice: 1100,
+        JobAmountDue: 0,
+        LineItems: [{ Name: "Shower restoration", Price: 1000, Quantity: 1, Type: "service" }],
+        Payments: [
+          { id: "tim-service", Amount: 1000, Method: "Check" },
+          { id: "tim-card-tip", Amount: 50, Method: "Charge", IsTip: true },
+          { id: "tim-check-tip", Amount: 50, Method: "Check", IsTip: true },
+        ],
+      },
+      settings,
+      noCatalog,
+    )
+    const plan = planSegments(job, [TIM], ROSTER)
+    const payout = payoutFor(job, plan, TIM)
+    expect(job.cardTipAmount).toBe(50)
+    expect(job.nonCardTipAmount).toBe(50)
+    expect(payout.cardTipPayout).toBe(48.25)
+    expect(payout.nonCardTipPayout).toBe(50)
+    expect(payout.tipPayout).toBe(98.25)
+  })
+
+  it("a T-tag does not change crew sharing when Tim is assigned with regular technicians", () => {
+    const job = shared({ Tags: ["T"] })
+    const plan = planSegments(job, [ARTHUR, VIKTOR, TIM], ROSTER)
+    expect(plan.tips.recipients.map((r) => r.name)).toEqual(["Arthur", "Viktor"])
+    expect(plan.tips.share).toBe(0.5)
+    expect(plan.tipShareFor.get(TIM.id)).toBe(0)
+    expect(payoutFor(job, plan, TIM).tipPayout).toBe(0)
+    expect(payoutFor(job, plan, ARTHUR).tipPayout).toBe(50)
+    expect(payoutFor(job, plan, VIKTOR).tipPayout).toBe(50)
+  })
+
+  it("without the exact T tag, a solo Tim tip is still held for review", () => {
+    const job = shared({ Team: [TEAM.tim], Tags: ["Team T-shirt"] })
+    const plan = planSegments(job, [TIM], ROSTER)
+    expect(plan.tipShareFor.get(TIM.id)).toBe(0)
+    expect(plan.tips.needsReview).toMatch(/Tip allocation needs review/)
+  })
+
+  it("a T tag does not qualify Tim unless his Workiz team ID maps to the assigned profile", () => {
+    const job = shared({ Team: [TEAM.tim], Tags: ["T"] })
+    const plan = planSegments(job, [TIM], ROSTER, { mappedProfileIds: [] })
+    expect(plan.tipShareFor.get(TIM.id)).toBe(0)
+    expect(plan.tips.needsReview).toMatch(/Tip allocation needs review/)
+  })
+
+  it("another Workiz team member prevents the Tim-only rule, even if that member is unmapped", () => {
+    const normalized = shared({ Team: [TEAM.tim], Tags: ["T"] })
+    const job = { ...normalized, teamIds: [...normalized.teamIds, "unmapped-workiz-id"] }
+    const plan = planSegments(job, [TIM], ROSTER, { mappedProfileIds: [TIM.id] })
+    expect(plan.tipShareFor.get(TIM.id)).toBe(0)
+    expect(plan.tips.needsReview).toMatch(/Tip allocation needs review/)
+  })
+
   it("Denis pairs with Vadim on the crew portion: Vadim 25%/25%, Denis 20%/25%, tip halved between them only", () => {
     const job = shared({ Team: [TEAM.vadim, TEAM.tim] })
     const withPairing = (t: Tech) => ({ ...t, active: true, worksWithProfileId: t.id === DENIS.id ? VADIM.id : null })

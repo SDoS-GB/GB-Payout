@@ -1,4 +1,5 @@
 import type { NormalizedLineItem } from "@/lib/db/schema"
+import { hasTag } from "@/lib/workiz/tags"
 
 /**
  * Decides who owns which service dollars on one Workiz job, in this order:
@@ -14,7 +15,8 @@ import type { NormalizedLineItem } from "@/lib/db/schema"
  *
  * Tips are separate: the business-held tip is split equally among the regular
  * technicians on the job; a dedicated technician (marker or Work Type owner)
- * never shares it, and a tip with no regular technician to receive it is flagged.
+ * never shares it, except a sole mapped Tim on a job tagged `T`, who receives
+ * the whole net tip. A tip with no eligible technician to receive it is flagged.
  *
  * Every line item lands in exactly one segment and the segments always add back
  * up to the job's post-discount service total. Pure: no I/O, no rounding beyond
@@ -30,6 +32,10 @@ export type OwnershipReason = "crew" | "marker" | "work-type"
 export type SegmentableJob = {
   /** Workiz `JobType` (shown as "Work Type" / "Job type" in Workiz). */
   jobType?: string | null
+  /** Workiz job tags; used to apply the sole-Tim tip rule only when the exact `T` tag exists. */
+  tags?: string[]
+  /** The original Workiz assignment list; excludes payouts synthesized by Work Type or companion rules. */
+  teamIds?: string[]
   jobTotal: number
   colorSealTotal: number
   discountAmount: number
@@ -436,6 +442,25 @@ const money = (n: number) => `$${n.toFixed(2)}`
 /** A technician who is paid on his own work only and never shares tips. */
 const isDedicated = (p: PlannableProfile) => Boolean(markerOf(p) || normalizeWorkType(p.ownedWorkType))
 
+/** Only the mapped Tim profile, alone on a job that explicitly carries Workiz's `T` tag. */
+function tipRecipients(
+  job: SegmentableJob,
+  onJob: PlannableProfile[],
+  regular: PlannableProfile[],
+  mappedProfileIds: ReadonlySet<number>,
+): PlannableProfile[] {
+  const sole = onJob.length === 1 ? onJob[0] : null
+  if (
+    sole &&
+    mappedProfileIds.size === 1 &&
+    mappedProfileIds.has(sole.id) &&
+    (job.teamIds === undefined || job.teamIds.length === 1) &&
+    sole.name.trim().toLowerCase() === "tim" &&
+    hasTag(job.tags ?? [], "T")
+  ) return onJob
+  return regular
+}
+
 /** Active profiles whose owned Work Type matches the job's. */
 export function workTypeOwners<P extends PlannableProfile>(jobType: string | null | undefined, roster: readonly P[]): P[] {
   if (!normalizeWorkType(jobType)) return []
@@ -459,7 +484,9 @@ function allocateTips(job: SegmentableJob, onJob: PlannableProfile[], regular: P
  * Decide who is paid on what.
  *
  * - Work Type owned by a technician: that technician is paid on the whole job;
- *   the regular crew gets no service commission but still splits any tip.
+ *   the regular crew gets no service commission but still splits any tip. When
+ *   Tim is the only mapped technician and the job carries the `T` tag, Tim gets
+ *   the entire tip instead of a no-recipient hold.
  * - Regular crew + a marked technician on the same job: the marked technician is
  *   paid on his marked items only, the crew on everything else (and all tips).
  * - A technician working alone, or a crew with nobody marked: the whole job, as
@@ -468,12 +495,20 @@ function allocateTips(job: SegmentableJob, onJob: PlannableProfile[], regular: P
  * `roster` is every active profile, so items marked for someone who is not
  * assigned to the job, or a Work Type whose owner is missing, can be flagged.
  */
-export function planSegments<P extends PlannableProfile>(job: SegmentableJob, onJob: P[], roster: readonly MarkerOwner[]): SegmentPlan {
+export function planSegments<P extends PlannableProfile>(
+  job: SegmentableJob,
+  onJob: P[],
+  roster: readonly MarkerOwner[],
+  options: { mappedProfileIds?: readonly number[] } = {},
+): SegmentPlan {
   const warnings: string[] = []
   const segmentFor = new Map<number, JobSegment>()
   const splitCountFor = new Map<number, number>()
   const tipShareFor = new Map<number, number>()
   const onJobIds = new Set(onJob.map((p) => p.id))
+  // In pure planner fixtures every onJob profile represents an assigned technician; the
+  // production engine passes exact IDs resolved through Workiz's team mapping.
+  const mappedProfileIds = new Set(options.mappedProfileIds ?? onJob.map((p) => p.id))
 
   // Items whose marker is only in the Description are never trusted, but they are a data problem worth a look.
   for (const owner of roster) {
@@ -520,9 +555,8 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
         splitCountFor.set(p.id, Math.max(1, regular.length))
       }
     }
-    const tips = allocateTips(job, onJob, regular, (p) => (p.id === owner.id ? "work-type" : "marker"))
-    for (const p of regular) tipShareFor.set(p.id, tips.share)
-    for (const p of otherDedicated) tipShareFor.set(p.id, 0)
+    const tips = allocateTips(job, onJob, tipRecipients(job, onJob, regular, mappedProfileIds), (p) => (p.id === owner.id ? "work-type" : "marker"))
+    for (const p of onJob) tipShareFor.set(p.id, tips.recipients.some((r) => r.id === p.id) ? tips.share : 0)
     if (tips.needsReview) warnings.push(tips.needsReview)
 
     const segments = [ownerSegment, crewSegment]
@@ -554,9 +588,9 @@ export function planSegments<P extends PlannableProfile>(job: SegmentableJob, on
     }
   }
 
-  const tips = allocateTips(job, onJob, regular, () => "marker")
+  const tips = allocateTips(job, onJob, tipRecipients(job, onJob, regular, mappedProfileIds), () => "marker")
   if (tips.needsReview) warnings.push(tips.needsReview)
-  for (const p of onJob) tipShareFor.set(p.id, regular.some((r) => r.id === p.id) ? tips.share : 0)
+  for (const p of onJob) tipShareFor.set(p.id, tips.recipients.some((r) => r.id === p.id) ? tips.share : 0)
 
   if (dedicated.length === 0 || crew.length === 0) {
     const segmentation = segmentJob(job, [])

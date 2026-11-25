@@ -300,7 +300,7 @@ export async function upsertPayoutsForJob(
   const companionPrimary = new Map(companions.map((c) => [c.companion.id, { id: c.primary.id, name: c.primary.name }]))
   for (const c of companions) result.notes.push(`${describeCompanion(c)}; added to this job although Workiz does not list them`)
 
-  const plan = planSegments(job, profiles, roster)
+  const plan = planSegments(job, profiles, roster, { mappedProfileIds: assigned.map((profile) => profile.id) })
   const fee = invoiceCardFee(job)
   const workTypeSegment = plan.segmentation.segments.find((s) => s.ownership === "work-type") ?? null
   const ownerProfile = workTypeSegment ? (owners[0] ?? null) : null
@@ -318,7 +318,9 @@ export async function upsertPayoutsForJob(
   if (plan.tips.total > 0) {
     result.notes.push(
       plan.tips.recipients.length
-        ? `Tip ${money(plan.tips.total)} split among ${plan.tips.recipients.map((r) => r.name).join(", ")} (${(plan.tips.share * 100).toFixed(plan.tips.share * 100 % 1 === 0 ? 0 : 2)}% each)${plan.tips.excluded.length ? `; ${plan.tips.excluded.map((e) => e.name).join(", ")} receive${plan.tips.excluded.length === 1 ? "s" : ""} no tip` : ""}`
+        ? plan.tips.recipients.length === 1
+          ? `Tip ${money(plan.tips.total)} goes to ${plan.tips.recipients[0].name} (100%)${plan.tips.excluded.length ? `; ${plan.tips.excluded.map((e) => e.name).join(", ")} receive${plan.tips.excluded.length === 1 ? "s" : ""} no tip` : ""}`
+          : `Tip ${money(plan.tips.total)} split among ${plan.tips.recipients.map((r) => r.name).join(", ")} (${(plan.tips.share * 100).toFixed(plan.tips.share * 100 % 1 === 0 ? 0 : 2)}% each)${plan.tips.excluded.length ? `; ${plan.tips.excluded.map((e) => e.name).join(", ")} receive${plan.tips.excluded.length === 1 ? "s" : ""} no tip` : ""}`
         : `Tip ${money(plan.tips.total)} has no eligible regular technician`,
     )
   }
